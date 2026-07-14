@@ -24,4 +24,5 @@ lcz4r_cache/
 .DS_Store
 
 # security-sensitive, never commit
-PyPI-Recovery-Codes*.txt
+*Recovery-Codes*.txt
+*.pypirc
