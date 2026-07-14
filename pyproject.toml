@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "LCZ4py"
+version = "0.1.0"
+description = "Python port of LCZ4r — tools for downloading, processing, and visualizing Local Climate Zone (LCZ) maps (Stewart & Oke 2012)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Max Anjos", email = "max.anjos@ufrn.br" }]
+
+dependencies = [
+    "rasterio>=1.3.9",
+    "geopandas>=0.14.0",
+    "pyogrio>=0.7.0",
+    "shapely>=2.0.0",
+    "polars>=0.20.0",
+    "pyarrow>=14.0.0",
+    "numpy>=1.26.0",
+    "plotly>=5.18.0",
+    "scipy>=1.11.0",
+    "httpx>=0.26.0",
+    "aiohttp>=3.9.0",
+    "asyncio-throttle>=1.0.2",
+]
+
+[project.optional-dependencies]
+viz = ["datashader>=0.16.0", "holoviews>=1.18.0", "colorcet>=3.1.0", "contextily>=1.5.0"]
+geoarrow = ["geoarrow-c>=0.1.0", "geoarrow-pyarrow>=0.1.0", "geoarrow-pandas>=0.1.0"]
+duckdb = ["duckdb>=1.0.0"]
+zonal = ["exactextract>=0.3.0"]
+interp = ["pykrige>=1.7.0", "scikit-learn>=1.3.0"]
+ucp = ["xarray>=2023.1.0", "rioxarray>=0.15.0", "diskcache>=5.6.0", "dask>=2023.1.0"]
+lst = ["pystac-client>=0.8.0", "planetary-computer>=1.0.0", "h5netcdf>=1.3.0", "h5py>=3.10.0"]
+era5-global = ["cdsapi>=0.7.0"]
+all = [
+    "LCZ4py[viz,geoarrow,duckdb,zonal,interp,ucp,lst,era5-global]",
+]
+
+[tool.setuptools.packages.find]
+include = ["LCZ4py*"]

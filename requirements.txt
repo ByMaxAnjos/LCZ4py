@@ -1,0 +1,62 @@
+# requirements_advanced.txt
+# Core spatial
+rasterio>=1.3.9
+geopandas>=0.14.0
+pyogrio>=0.7.0
+shapely>=2.0.0
+
+# High-performance data
+polars>=0.20.0
+pyarrow>=14.0.0
+numpy>=1.26.0
+
+# Interactive visualization
+plotly>=5.18.0
+datashader>=0.16.0
+holoviews>=1.18.0
+colorcet>=3.1.0
+
+# GeoArrow ecosystem
+geoarrow-c>=0.1.0
+geoarrow-pyarrow>=0.1.0
+geoarrow-pandas>=0.1.0
+
+# DuckDB Spatial
+duckdb>=1.0.0
+
+# Fast zonal statistics
+exactextract>=0.3.0
+
+# Spatial interpolation (kriging with LCZ external drift)
+pykrige>=1.7.0
+
+# Machine-learning interpolation (lcz_interp_map_plus)
+scikit-learn>=1.3.0
+
+# Urban Canopy Parameters (lcz_get_ucp)
+xarray>=2023.1.0
+rioxarray>=0.15.0
+diskcache>=5.6.0
+dask>=2023.1.0
+
+# Async/parallel
+httpx>=0.26.0
+aiohttp>=3.9.0
+asyncio-throttle>=1.0.2
+
+# Land Surface Temperature (lcz_get_lst) — Microsoft Planetary Computer
+pystac-client>=0.8.0
+planetary-computer>=1.0.0
+scipy>=1.11.0
+h5netcdf>=1.3.0
+h5py>=3.10.0
+
+# Optional GPU
+# cupy-cuda12x>=13.0.0
+
+# Basemap tiles for grid/mesh plots (plot_grid_only)
+contextily>=1.5.0
+
+# Global ERA5-Land via Copernicus CDS (lcz_grid_era5_global) — optional,
+# only needed outside Latin America / when a CDS API key is available
+cdsapi>=0.7.0
