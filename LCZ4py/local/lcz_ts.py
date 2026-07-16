@@ -10,7 +10,6 @@ Handles large datasets efficiently:
 
 from __future__ import annotations
 import datetime as _dt_mod
-import logging
 import os
 from typing import Optional, Union
 
@@ -36,8 +35,7 @@ from LCZ4py._internal.lcz_ts_utils import (
 )
 from LCZ4py.general.lcz_plot_parameters import _palette_to_plotly_colorscale
 from LCZ4py._internal.i18n_messages import lcz_msg
-
-logger = logging.getLogger(__name__)
+from LCZ4py._internal.lcz_theme import finalize_export
 
 
 def _station_colors(stations, palette_name: str) -> list[str]:
@@ -224,6 +222,7 @@ def lcz_ts(
     iplot: bool = True,
     isave: bool = False,
     save_extension: str = "html",
+    style: str = "default",
     palette: str = "VanGogh2",
     ylab: Optional[str] = None,
     xlab: Optional[str] = None,
@@ -264,6 +263,10 @@ def lcz_ts(
         Save the figure to ``LCZ4r_output/``.
     save_extension : str
         ``"html"`` (interactive) or ``"png"``/``"pdf"`` (static).
+    style : str
+        Publication style preset: "default", "nature", "science", or
+        "generic_bw". Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != "html".
     palette : str
         MetBrewer palette name for line colours.
     ylab, xlab : str, optional
@@ -372,14 +375,8 @@ def lcz_ts(
             font=dict(size=10, color="gray"),
         )
 
-    if isave:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        path = os.path.join(OUTPUT_DIR, f"lcz4r_ts_plot.{save_extension}")
-        if save_extension == "html":
-            fig.write_html(path, include_plotlyjs="cdn")
-        else:
-            fig.write_image(path, scale=2)
-        logger.info(lcz_msg("save_output_path", lang, path=os.path.abspath(path)))
+    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                           filename="lcz4r_ts_plot", lang=lang)
 
     return fig
 

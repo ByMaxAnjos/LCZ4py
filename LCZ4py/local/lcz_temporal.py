@@ -32,6 +32,7 @@ from LCZ4py._internal.lcz_ts_utils import (
 )
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, get_lcz_names
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,7 @@ def lcz_dtr(
     sp_res: float = 100.0,
     tp_res: str = "day",
     by: Optional[str] = None,
+    style: str = "default",
     lang: str = "en",
     year=None,
     month=None,
@@ -244,6 +246,10 @@ def lcz_dtr(
         Temporal resolution — ``"day"`` (default).
     by : str, optional
         Split the analysis into faceted subplots by temporal group.
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
     lang : str
         Language for labels — ``"en"``, ``"pt"``, ``"es"``, or ``"zh"``.
     year, month, day, hour : int or sequence, optional
@@ -352,6 +358,8 @@ def lcz_dtr(
             font=dict(size=11, color="#555555"),
         )
 
+    fig = finalize_export(fig, style=style, lang=lang)
+
     return DTRResult(df=daily, plot=fig)
 
 
@@ -368,6 +376,7 @@ def lcz_degree_hours(
     degree_type: str = "cooling",
     sp_res: float = 100.0,
     by: Optional[str] = None,
+    style: str = "default",
     lang: str = "en",
     year=None,
     month=None,
@@ -402,6 +411,10 @@ def lcz_degree_hours(
         Spatial resolution in metres (informational, unused internally).
     by : str, optional
         Split the analysis into faceted subplots by temporal group.
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
     lang : str
         Language for labels — ``"en"``, ``"pt"``, ``"es"``, or ``"zh"``.
     year, month, day, hour : int or sequence, optional
@@ -550,6 +563,8 @@ def lcz_degree_hours(
             x=mid_natural, y=1.08, showarrow=False,
             font=dict(size=11, color="#555555"),
         )
+
+    fig = finalize_export(fig, style=style, lang=lang)
 
     return DegreeHoursResult(df=daily, total=total, plot=fig)
 

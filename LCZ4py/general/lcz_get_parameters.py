@@ -353,7 +353,7 @@ def lcz_get_parameters(
                 if val < 1 or val > 17:
                     continue
                 records.append({"lcz": val, "geometry": shape(geom)})
-            gdf = gpd.GeoDataFrame(records, crs=crs)
+            gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
             gdf = gdf.dissolve(by="lcz").reset_index()
 
         # Attach parameters via fast Polars join
@@ -364,7 +364,7 @@ def lcz_get_parameters(
         gdf_pl = pl.from_pandas(gdf.drop(columns=["geometry"]))
         gdf_joined = gdf_pl.join(df_params, on="lcz", how="left").to_pandas()
         gdf_joined["geometry"] = gdf.set_index("lcz").loc[gdf_joined["lcz"]]["geometry"].values
-        gdf = gpd.GeoDataFrame(gdf_joined, crs=crs)
+        gdf = gpd.GeoDataFrame(gdf_joined, geometry="geometry", crs=crs)
 
         # Generate GeoArrow
         geoarrow_table = None

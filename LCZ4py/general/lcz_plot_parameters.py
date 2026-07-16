@@ -50,31 +50,17 @@ from LCZ4py._internal.lcz_parameters_data import (
     PARAM_PALETTE_DEFAULT, PARAM_PALETTE_INCLUSIVE,
     LCZ_NAMES, LCZ_COLORS, LCZ_COLORBLIND,
 )
+from LCZ4py._internal.lcz_theme import (
+    finalize_export, add_map_furniture, METBREWER_PALETTES as _METBREWER_PALETTES,
+)
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
 
 
 # ── MetBrewer palettes as Plotly colorscales ──────────────────────────────────
-
-_METBREWER_PALETTES: dict[str, list[str]] = {
-    "Archambault": ["#88a0dc", "#381a61", "#7c4b73", "#ed68ed", "#fcffa4"],
-    "Greek":       ["#3b1c3a", "#6a2263", "#9b2c77", "#d0577e", "#ed8a87"],
-    "VanGogh1":    ["#1c3a5e", "#4a6f9a", "#88aac2", "#cde0e8", "#f7f3e7"],
-    "VanGogh2":    ["#2a3f5c", "#566985", "#8e9cad", "#c3cbd2", "#f0e9d6"],
-    "VanGogh3":    ["#3a4a4a", "#6c7b7b", "#9ea9a9", "#cdd2cd", "#f0e8d8"],
-    "Hokusai2":    ["#264653", "#2a9d8f", "#8ab17d", "#e9c46a", "#f4a261"],
-    "Hokusai3":    ["#1d3557", "#457b9d", "#a8dadc", "#f1faee", "#e63946"],
-    "Pissarro":    ["#2c4e6e", "#5b7c99", "#a3b9c4", "#e0dccd", "#f1e9d2"],
-    "Tam":         ["#40004b", "#762a83", "#9970ab", "#c2a5cf", "#e7d4e8"],
-    "Renoir":      ["#2c1d3a", "#5a3d5e", "#8d5b8a", "#c98bb0", "#fcd5ce"],
-    "Manet":       ["#2c2c4a", "#5b5b75", "#8c8ca1", "#bcbccf", "#ece5d4"],
-    "Demuth":      ["#2d2d3e", "#5b5b6e", "#8d8d9a", "#bdbdc1", "#e8e0d2"],
-    "Troy":        ["#3a2f4a", "#665375", "#9582a1", "#c4b9cc", "#e8e0d2"],
-    "Ingres":      ["#1c1c2e", "#3a3a55", "#5b5b75", "#8888a0", "#bcbccf"],
-    "Cassatt1":    ["#a37b6a", "#c89e88", "#e1c1a8", "#ecd5b5", "#f0d5a8"],
-    "Cassatt2":    ["#3d405b", "#5d6b87", "#9bb1c8", "#cbd5dc", "#ece5d4"],
-}
+# _METBREWER_PALETTES now lives in LCZ4py._internal.lcz_theme (imported above
+# as METBREWER_PALETTES) — kept the local alias so nothing below has to change.
 
 
 @lru_cache(maxsize=32)
@@ -419,8 +405,10 @@ def _finalize_figure(
     caption: Optional[str],
     isave: bool,
     save_extension: str,
+    style: str = "default",
+    lang: str = "en",
 ) -> go.Figure:
-    """Apply shared title/caption annotations and optionally save a figure."""
+    """Apply shared title/caption annotations, then delegate export to lcz_theme."""
     if title:
         fig.update_layout(title=dict(text=f"{title}<br><sup>{subtitle or ''}</sup>"))
     if caption:
@@ -432,18 +420,10 @@ def _finalize_figure(
             font=dict(size=10, color="gray"),
         )
 
-    if isave:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        save_path = os.path.join(OUTPUT_DIR, f"{name}.{save_extension}")
-
-        if save_extension == "html":
-            fig.write_html(save_path, include_plotlyjs="cdn")
-        else:
-            fig.write_image(save_path, width=1200, height=900, scale=2)
-
-        logger.info("Saved: %s", os.path.abspath(save_path))
-
-    return fig
+    return finalize_export(
+        fig, style=style, isave=isave, save_extension=save_extension,
+        filename=name, lang=lang,
+    )
 
 
 def _plot_from_dataset(
@@ -458,6 +438,10 @@ def _plot_from_dataset(
     subtitle: Optional[str],
     caption: Optional[str],
     renderer: Literal["plotly", "datashader", "auto"],
+    style: str = "default",
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
+    lang: str = "en",
 ) -> Union[go.Figure, list[go.Figure]]:
     """Plot parameters straight from an lcz_get_ucp ``combined_rasters`` Dataset.
 
@@ -487,7 +471,11 @@ def _plot_from_dataset(
             renderer == "auto" and use_datashader and arr.size > 4_000_000
         )
         fig = _plot_one_interactive(arr, profile, name, inclusive, use_datashader=use_ds)
-        figures.append(_finalize_figure(fig, name, title, subtitle, caption, isave, save_extension))
+        if transform is not None:
+            h, w = arr.shape
+            bounds = (transform.c, transform.f + h * transform.e, transform.c + w * transform.a, transform.f)
+            add_map_furniture(fig, bounds=bounds, crs=crs, add_scalebar=add_scalebar, add_north_arrow=add_north_arrow)
+        figures.append(_finalize_figure(fig, name, title, subtitle, caption, isave, save_extension, style=style, lang=lang))
 
     return figures if len(figures) > 1 else figures[0]
 
@@ -543,12 +531,15 @@ def lcz_plot_parameters(
     inclusive: bool = False,
     isave: bool = False,
     save_extension: str = "html",
+    style: str = "default",
     max_pixels: int = 10_000_000,
     use_datashader: bool = True,
     title: Optional[str] = None,
     subtitle: Optional[str] = None,
     caption: Optional[str] = None,
     renderer: Literal["plotly", "datashader", "auto"] = "auto",
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
     lang: str = "en",
 ) -> Union[go.Figure, list[go.Figure], dict[str, go.Figure]]:
     """Plot LCZ parameter rasters with interactive Plotly visualizations.
@@ -608,7 +599,11 @@ def lcz_plot_parameters(
     isave : bool
         Save each rendered figure.
     save_extension : str
-        "html" for interactive, "png"/"pdf" for static.
+        "html" for interactive, "png"/"pdf"/"svg"/"tiff" for static.
+    style : str
+        Publication style preset: "default", "nature", "science", or
+        "generic_bw". Controls font, figure size (mm), DPI, and palette
+        used when ``isave`` and ``save_extension`` != "html".
     max_pixels : int
         Down-sample threshold. Ignored for ``chart_type != "map"``.
     use_datashader : bool
@@ -617,6 +612,9 @@ def lcz_plot_parameters(
         Figure annotations.
     renderer : {"plotly", "datashader", "auto"}
         Rendering backend. Ignored for ``chart_type != "map"``.
+    add_scalebar, add_north_arrow : bool
+        Add a scale bar / north arrow to the rendered map. Only applies to
+        ``chart_type="map"`` (skipped silently for geographic CRSs).
     lang : str
         Message language ("en"/"pt"/"es"/"zh"). Only used for
         ``chart_type != "map"``.
@@ -680,6 +678,7 @@ def lcz_plot_parameters(
             x, iselect=iselect, all_params=all_params, inclusive=inclusive,
             isave=isave, save_extension=save_extension, use_datashader=use_datashader,
             title=title, subtitle=subtitle, caption=caption, renderer=renderer,
+            style=style, add_scalebar=add_scalebar, add_north_arrow=add_north_arrow, lang=lang,
         )
 
     # Determine which bands to render
@@ -718,7 +717,15 @@ def lcz_plot_parameters(
             arr, profile, name, inclusive, use_datashader=use_ds
         )
 
-        figures.append(_finalize_figure(fig, name, title, subtitle, caption, isave, save_extension))
+        transform = profile.get("transform")
+        if transform is not None:
+            h, w = arr.shape
+            bounds = (transform.c, transform.f + h * transform.e, transform.c + w * transform.a, transform.f)
+            add_map_furniture(fig, bounds=bounds, crs=profile.get("crs"),
+                               add_scalebar=add_scalebar, add_north_arrow=add_north_arrow)
+
+        figures.append(_finalize_figure(fig, name, title, subtitle, caption, isave, save_extension,
+                                         style=style, lang=lang))
 
     return figures if len(figures) > 1 else figures[0]
 

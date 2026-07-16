@@ -75,6 +75,7 @@ from LCZ4py.general.lcz_cal_area import _attach_metadata
 from LCZ4py.general.lcz_get_lst import LCZLSTResult
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
@@ -584,16 +585,16 @@ _METHODS = {
 }
 
 
-def _save_result(name: str, result: LCZUHISurfaceResult, save_extension: str) -> None:
+def _save_result(
+    name: str, result: LCZUHISurfaceResult, save_extension: str,
+    style: str = "default", lang: str = "en",
+) -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     figs = result.fig if isinstance(result.fig, dict) else ({"_": result.fig} if result.fig else {})
     for key, f in figs.items():
         suffix = "" if key == "_" else f"_{key}"
-        path = os.path.join(OUTPUT_DIR, f"lcz4r_uhi_surface_{name}{suffix}.{save_extension}")
-        if save_extension == "html":
-            f.write_html(path, include_plotlyjs="cdn")
-        else:
-            f.write_image(path, width=1200, height=800, scale=2)
+        finalize_export(f, style=style, isave=True, save_extension=save_extension,
+                         filename=f"lcz4r_uhi_surface_{name}{suffix}", lang=lang)
     if result.df is not None and not result.df.is_empty():
         result.df.write_csv(os.path.join(OUTPUT_DIR, f"lcz4r_uhi_surface_{name}.csv"))
 
@@ -614,6 +615,7 @@ def lcz_uhi_surface(
     iplot: bool = True,
     isave: bool = False,
     save_extension: str = "html",
+    style: str = "default",
     inclusive: bool = False,
     title: Optional[str] = None,
     caption: Optional[str] = None,
@@ -674,6 +676,10 @@ def lcz_uhi_surface(
         Save chart(s) + CSV to ``LCZ4r_output/``.
     save_extension : str
         "html" for interactive, "png"/"pdf" for static.
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
     inclusive : bool
         Use the colorblind-friendly LCZ palette (bar charts only).
     title, caption : str, optional
@@ -728,7 +734,7 @@ def lcz_uhi_surface(
                     )
         result = LCZUHISurfaceResult(df=df, fig=fig)
         if isave:
-            _save_result(name, result, save_extension)
+            _save_result(name, result, save_extension, style=style, lang=lang)
         return result
 
     def _run(name: str) -> LCZUHISurfaceResult:

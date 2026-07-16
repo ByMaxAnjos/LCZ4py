@@ -27,6 +27,7 @@ from LCZ4py._internal.lcz_ts_utils import (
     normalise_missing, select_by_date, utm_epsg_for,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +218,6 @@ def _build_variogram_plot(
         title=lcz_msg("variogram_title", lang),
         xaxis_title=lcz_msg("variogram_xlabel", lang),
         yaxis_title=lcz_msg("variogram_ylabel", lang),
-        template="plotly_white",
         legend=dict(x=0.02, y=0.98),
     )
     return fig
@@ -235,6 +235,7 @@ def lcz_variogram(
     model: str = "Sph",
     n_lags: int = 20,
     max_dist: Optional[float] = None,
+    style: str = "default",
     lang: str = "en",
     year=None,
     month=None,
@@ -264,6 +265,10 @@ def lcz_variogram(
     max_dist : float, optional
         Maximum pairwise distance for the variogram (metres). If None, uses
         half the maximum inter-station distance.
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
     lang : str
         Language for log messages — ``"en"``, ``"pt"``, ``"es"``, or ``"zh"``.
     year, month, day, hour : optional
@@ -365,6 +370,7 @@ def lcz_variogram(
     fig = None
     if HAS_PLOTLY:
         fig = _build_variogram_plot(lag_c, gamma, counts, params, r2, lang)
+        fig = finalize_export(fig, style=style, lang=lang)
 
     logger.info(
         lcz_msg("variogram_complete", lang,

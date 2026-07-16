@@ -29,6 +29,7 @@ from rasterio.warp import Resampling, calculate_default_transform, reproject
 
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_IDS, get_lcz_names
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ def plot_lcz_relationship(
     agg_fun: str = "mean",
     isave: bool = False,
     save_extension: str = "html",
+    style: str = "default",
     lang: str = "en",
 ) -> go.Figure:
     """Plot the distribution of a gridded variable across LCZ classes.
@@ -90,6 +92,10 @@ def plot_lcz_relationship(
         Save the figure to ``LCZ4r_output/``. Default False.
     save_extension : str
         File extension when ``isave``. Default "html".
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
     lang : str
         Message language. Default "en".
 
@@ -133,15 +139,9 @@ def plot_lcz_relationship(
     else:
         raise ValueError(lcz_msg("plot_lcz_rel_invalid_type", lang, valid="box, violin, scatter, heatmap"))
 
-    fig.update_layout(title=f"{variable_name} by LCZ class", template="plotly_white")
+    fig.update_layout(title=f"{variable_name} by LCZ class")
 
-    if isave:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        out_path = os.path.join(OUTPUT_DIR, f"lcz_relationship_{plot_type}.{save_extension}")
-        if save_extension == "html":
-            fig.write_html(out_path)
-        else:
-            fig.write_image(out_path)
-        logger.info("Saved: %s", os.path.abspath(out_path))
+    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                           filename=f"lcz_relationship_{plot_type}", lang=lang)
 
     return fig

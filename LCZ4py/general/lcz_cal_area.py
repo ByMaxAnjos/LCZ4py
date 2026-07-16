@@ -51,6 +51,7 @@ except ImportError:
 
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND, LCZ_NAMES, LCZ_IDS, get_lcz_names
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
@@ -512,6 +513,7 @@ def lcz_cal_area(
     iplot: bool = True,
     isave: bool = False,
     save_extension: str = "html",
+    style: str = "default",
     show_legend: bool = True,
     inclusive: bool = False,
     use_duckdb: bool = True,
@@ -536,7 +538,11 @@ def lcz_cal_area(
     isave : bool
         Save chart + CSV.
     save_extension : str
-        "html" for interactive, "png"/"pdf" for static.
+        "html" for interactive, "png"/"pdf"/"svg"/"tiff" for static.
+    style : str
+        Publication style preset: "default", "nature", "science", or
+        "generic_bw". Controls font, figure size (mm), DPI, and palette
+        used when ``isave`` and ``save_extension`` != "html".
     show_legend : bool
         Show legend (always True for interactive plots).
     inclusive : bool
@@ -634,20 +640,13 @@ def lcz_cal_area(
         geoarrow_table = _to_geoarrow(df, crs or "EPSG:4326")
     
     # Save outputs
+    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                           filename=f"lcz4r_area_{plot_type}", lang=lang)
     if isave:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        
-        # Save plot
-        plot_path = os.path.join(OUTPUT_DIR, f"lcz4r_area_{plot_type}.{save_extension}")
-        if save_extension == "html":
-            fig.write_html(plot_path, include_plotlyjs="cdn")
-        else:
-            fig.write_image(plot_path, width=1200, height=800, scale=2)
-        
         # Save CSV (Polars is faster than Pandas for this)
         csv_path = os.path.join(OUTPUT_DIR, "lcz4r_area_df.csv")
         df.drop("color").write_csv(csv_path)
-        
         logger.info("Saved to: %s", os.path.abspath(OUTPUT_DIR))
     
     return LCZAreaResult(

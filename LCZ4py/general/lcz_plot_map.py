@@ -24,7 +24,7 @@ import pyarrow as pa
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import shapes
-from shapely.geometry import shape, mapping
+from shapely.geometry import shape
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -46,6 +46,7 @@ except ImportError:
 
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND, LCZ_NAMES, LCZ_IDS, get_lcz_names
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export, add_map_furniture
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
@@ -254,7 +255,7 @@ def raster_to_geoarrow(
         records.append({
             "lcz": val,
             "name": LCZ_NAMES[val - 1],
-            "geometry": mapping(geom_shape),
+            "geometry": geom_shape,
         })
     
     if not records:
@@ -262,7 +263,7 @@ def raster_to_geoarrow(
     
     # Convert to GeoArrow via GeoPandas (fast path)
     import geopandas as gpd
-    gdf = gpd.GeoDataFrame(records, crs=crs)
+    gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
     
     try:
         # Try direct GeoArrow conversion
@@ -541,6 +542,7 @@ def lcz_plot_map(
     x: Union[str, Path, rasterio.io.DatasetReader],
     isave: bool = False,
     save_extension: str = "html",
+    style: str = "default",
     show_legend: bool = True,
     inclusive: bool = False,
     use_webgl: bool = True,
@@ -556,6 +558,8 @@ def lcz_plot_map(
     data_type: Literal["auto", "lcz", "continuous"] = "auto",
     band: Union[int, str, None] = None,
     colorscale: str = "RdBu_r",
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
 ) -> LCZPlotResult:
     """Plot an LCZ map, or a continuous raster stack (e.g. lcz_get_lst output).
 
@@ -569,6 +573,10 @@ def lcz_plot_map(
         Save the figure.
     save_extension : str
         "html" for interactive, "png"/"pdf" for static.
+    style : str
+        Publication style preset: "default", "nature", "science", or
+        "generic_bw". Controls font, figure size (mm), DPI, and palette
+        used when ``isave`` and ``save_extension`` != "html".
     show_legend : bool
         Show the LCZ class legend. Ignored for continuous data (a colorbar
         is shown instead).
@@ -601,6 +609,10 @@ def lcz_plot_map(
     colorscale : str
         Plotly colorscale for continuous data. Default "RdBu_r" (blue=cold,
         red=hot).
+    add_scalebar, add_north_arrow : bool
+        Add a scale bar / north arrow to the map (Plotly renderer only;
+        skipped for geographic/lon-lat CRSs where ground distance isn't
+        directly meaningful).
 
     Returns
     -------
@@ -618,6 +630,7 @@ def lcz_plot_map(
             resampling = Resampling.bilinear if is_continuous else Resampling.nearest
             arr = reader.read_downsampled(band=band_idx, resampling=resampling)
             extent = reader.get_extent()
+            crs_obj = src.crs
             crs = str(src.crs) if src.crs else "EPSG:4326"
             transform = src.transform
             units = src.tags().get("units", "K")
@@ -632,6 +645,7 @@ def lcz_plot_map(
         resampling = Resampling.bilinear if is_continuous else Resampling.nearest
         arr = reader.read_downsampled(band=band_idx, resampling=resampling)
         extent = reader.get_extent()
+        crs_obj = x.crs
         crs = str(x.crs) if x.crs else "EPSG:4326"
         transform = x.transform
         units = x.tags().get("units", "K")
@@ -650,14 +664,11 @@ def lcz_plot_map(
                 text=caption, xref="paper", yref="paper", x=0.01, y=-0.02,
                 showarrow=False, font=dict(size=10, color="gray"),
             )
-        if isave:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            out_path = os.path.join(OUTPUT_DIR, f"lcz_plot_lst.{save_extension}")
-            if save_extension == "html":
-                fig.write_html(out_path, include_plotlyjs="cdn")
-            else:
-                fig.write_image(out_path, width=1400, height=1000, scale=2)
-            logger.info("Saved: %s", os.path.abspath(out_path))
+        bounds = (extent[0], extent[2], extent[1], extent[3])
+        add_map_furniture(fig, bounds=bounds, crs=crs_obj,
+                           add_scalebar=add_scalebar, add_north_arrow=add_north_arrow)
+        fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                               filename="lcz_plot_lst", lang=lang)
         return LCZPlotResult(fig=fig)
 
     # Keep nodata (0) as 0 — transparent in the plot, not Water.
@@ -666,12 +677,12 @@ def lcz_plot_map(
 
     # ── MapLibre renderer (Plotly mapbox + OSM basemap) ──────────────────────
     if renderer == "maplibre":
+        # ponytail: no add_map_furniture here — this figure is a mapbox/geo trace,
+        # not a Cartesian one, so paper-relative scale bar/north arrow annotations
+        # don't line up with the map; skip until furniture supports mapbox layouts.
         fig = _create_basemap_fig(arr, extent, inclusive, show_legend, title, opacity, lang=lang)
-        if isave:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            out_path = os.path.join(OUTPUT_DIR, "lcz_plot_map_maplibre.html")
-            fig.write_html(out_path, include_plotlyjs="cdn")
-            logger.info("Saved: %s", os.path.abspath(out_path))
+        fig = finalize_export(fig, style=style, isave=isave, save_extension="html",
+                               filename="lcz_plot_map_maplibre", lang=lang)
         return LCZPlotResult(fig=fig)
 
     # ── Plotly renderer (default) ────────────────────────────────────────────
@@ -704,19 +715,14 @@ def lcz_plot_map(
     legend_df = None
     if use_duckdb:
         legend_df = compute_legend_with_duckdb(arr, transform, crs)
-    
-    # Save
-    if isave:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        out_path = os.path.join(OUTPUT_DIR, f"lcz_plot_map.{save_extension}")
-        
-        if save_extension == "html":
-            fig.write_html(out_path, include_plotlyjs="cdn")
-        else:
-            fig.write_image(out_path, width=1400, height=1000, scale=2)
-        
-        logger.info("Saved: %s", os.path.abspath(out_path))
-    
+
+    # Add map furniture (scale bar / north arrow), then save
+    bounds = (extent[0], extent[2], extent[1], extent[3])
+    add_map_furniture(fig, bounds=bounds, crs=crs_obj,
+                       add_scalebar=add_scalebar, add_north_arrow=add_north_arrow)
+    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                           filename="lcz_plot_map", lang=lang)
+
     return LCZPlotResult(
         fig=fig,
         geoarrow_table=geoarrow_table,

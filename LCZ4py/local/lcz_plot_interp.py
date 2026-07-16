@@ -25,8 +25,8 @@ try:
 except ImportError:
     HAS_DATASHADER = False
 
-from LCZ4py._internal.lcz_ts_utils import OUTPUT_DIR
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export, add_map_furniture
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +46,10 @@ def _colorscale(name: str, reverse: bool = False) -> list[tuple[float, str]]:
     return [(i / (n - 1), c) for i, c in enumerate(pal)]
 
 
-def _read_resampled(path: str, max_pixels: int = 4_000_000) -> tuple[np.ndarray, dict]:
+def _read_resampled(path: str, max_pixels: int = 4_000_000) -> tuple[np.ndarray, dict, tuple]:
     with rasterio.open(path) as src:
         h, w = src.height, src.width
+        bounds = tuple(src.bounds)  # full-res extent; unaffected by resampling below
         if h * w > max_pixels:
             scale = (max_pixels / (h * w)) ** 0.5
             out_shape = (src.count, max(1, int(h * scale)), max(1, int(w * scale)))
@@ -57,7 +58,7 @@ def _read_resampled(path: str, max_pixels: int = 4_000_000) -> tuple[np.ndarray,
             arr = src.read()
         profile = src.profile.copy()
         profile.update(height=arr.shape[-2], width=arr.shape[-1])
-    return arr, profile
+    return arr, profile, bounds
 
 
 def lcz_plot_interp(
@@ -67,6 +68,9 @@ def lcz_plot_interp(
     isave: bool = False,
     save_extension: str = "html",
     *,
+    style: str = "default",
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
     title: Optional[str] = None,
     caption: Optional[str] = None,
     lang: str = "en",
@@ -86,6 +90,15 @@ def lcz_plot_interp(
         Save the figure to ``LCZ4r_output/``.
     save_extension : str
         ``"html"`` (interactive) or ``"png"``/``"pdf"`` (static).
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
+    add_scalebar : bool
+        Add a cartographic scale bar (skipped for geographic/lon-lat CRS or
+        when ``x`` is a bare ndarray with no known CRS).
+    add_north_arrow : bool
+        Add a north arrow (same skip conditions as ``add_scalebar``).
     title : str, optional
         Override the default figure title.
     caption : str, optional
@@ -100,15 +113,20 @@ def lcz_plot_interp(
     if x is None:
         raise ValueError("x is required.")
 
+    bounds = None
+    crs = None
     if isinstance(x, np.ndarray):
         arr = x if x.ndim == 3 else x[np.newaxis, ...]
         band_descs: list[str] = []
     elif hasattr(x, "read"):
         arr = x.read()
         band_descs = [x.descriptions[i] or f"Band {i + 1}" for i in range(x.count)]
+        bounds = tuple(x.bounds)
+        crs = x.crs
     else:
-        arr, profile = _read_resampled(str(x))
+        arr, profile, bounds = _read_resampled(str(x))
         band_descs = list(profile.get("descriptions") or [])
+        crs = profile.get("crs")
 
     finite_vals = arr[np.isfinite(arr)]
     vmin = float(finite_vals.min()) if len(finite_vals) else 0.0
@@ -179,14 +197,12 @@ def lcz_plot_interp(
             font=dict(size=10, color="gray"),
         )
 
-    if isave:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        path = os.path.join(OUTPUT_DIR, f"lcz_interp_map.{save_extension}")
-        if save_extension == "html":
-            fig.write_html(path, include_plotlyjs="cdn")
-        else:
-            fig.write_image(path, scale=2)
-        logger.info(lcz_msg("save_output_path", lang, path=os.path.abspath(path)))
+    if bounds is not None:
+        add_map_furniture(fig, bounds=bounds, crs=crs,
+                           add_scalebar=add_scalebar, add_north_arrow=add_north_arrow)
+
+    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                           filename="lcz_interp_map", lang=lang)
 
     return fig
 

@@ -10,7 +10,6 @@ polygons) rather than a rendered raster.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Optional, Union
 
@@ -23,10 +22,9 @@ except ImportError:
     HAS_CONTEXTILY = False
 
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export, _nice_scale_length
 
 logger = logging.getLogger(__name__)
-
-OUTPUT_DIR = "LCZ4r_output"
 
 
 def plot_grid_only(
@@ -42,6 +40,9 @@ def plot_grid_only(
     title: Optional[str] = None,
     isave: bool = False,
     save_extension: str = "png",
+    style: str = "default",
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
     lang: str = "en",
 ) -> "plt.Figure":
     """Plot a grid/mesh GeoDataFrame over a contextily basemap.
@@ -76,6 +77,14 @@ def plot_grid_only(
         Save the figure to ``LCZ4r_output/``. Default False.
     save_extension : str
         File extension when ``isave``. Default "png".
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
+    add_scalebar : bool
+        Draw a cartographic scale bar (bottom-left).
+    add_north_arrow : bool
+        Draw a north arrow (top-right).
     lang : str
         Message language. Default "en".
 
@@ -105,12 +114,29 @@ def plot_grid_only(
     ax.set_axis_off()
     if title:
         ax.set_title(title)
+
+    # grid_3857 (EPSG:3857) is projected/metric, so ground distance is
+    # meaningful directly off the axes extent.
+    if add_scalebar:
+        xmin, xmax = ax.get_xlim()
+        map_width_m = xmax - xmin
+        bar_m = _nice_scale_length(map_width_m) if map_width_m > 0 else 1.0
+        bar_frac = min(bar_m / map_width_m, 0.3) if map_width_m > 0 else 0.0
+        label = f"{bar_m / 1000:.0f} km" if bar_m >= 1000 else f"{bar_m:.0f} m"
+        ax.add_patch(plt.Rectangle((0.03, 0.04), bar_frac, 0.01,
+                                    transform=ax.transAxes, facecolor="black", clip_on=False))
+        ax.text(0.03 + bar_frac / 2, 0.06, label,
+                transform=ax.transAxes, ha="center", fontsize=9)
+    if add_north_arrow:
+        # Arrow tail (xytext) -> head (xy): head must be on top for "N" to point up.
+        ax.annotate("N", xy=(0.95, 0.95), xytext=(0.95, 0.85),
+                    xycoords="axes fraction", ha="center", va="center",
+                    fontsize=12, fontweight="bold",
+                    arrowprops=dict(facecolor="black", width=4, headwidth=10))
+
     fig.tight_layout()
 
-    if isave:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        out_path = os.path.join(OUTPUT_DIR, f"lcz_plot_grid.{save_extension}")
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        logger.info("Saved: %s", os.path.abspath(out_path))
+    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                           filename="lcz_plot_grid", lang=lang)
 
     return fig

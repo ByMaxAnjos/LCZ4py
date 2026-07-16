@@ -1326,6 +1326,15 @@ LCZ_MESSAGES: dict[str, dict[str, Any]] = {
         "zh": "未安装 contextily，跳过底图。请使用 pip install contextily 安装。",
     },
 
+    # ── lcz_theme (publication style export) ─────────────────────────────────
+
+    "invalid_style": {
+        "en": "Unknown style '{style}'. Valid options: {valid}.",
+        "pt": "Estilo '{style}' desconhecido. Opções válidas: {valid}.",
+        "es": "Estilo '{style}' desconocido. Opciones válidas: {valid}.",
+        "zh": "未知的 style '{style}'。可用选项：{valid}。",
+    },
+
     # ── lcz_climate_compute_spi ──────────────────────────────────────────────
 
     "spi_var_not_found": {

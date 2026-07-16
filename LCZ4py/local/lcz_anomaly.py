@@ -22,6 +22,7 @@ from LCZ4py._internal.lcz_ts_utils import (
     add_by_column, by_sorted_groups,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,7 @@ def lcz_anomaly(
     iplot: bool = True,
     isave: bool = False,
     save_extension: str = "html",
+    style: str = "default",
     inclusive: bool = False,
     title: Optional[str] = None,
     caption: Optional[str] = None,
@@ -311,6 +313,10 @@ def lcz_anomaly(
         Save the figure to ``LCZ4r_output/``.
     save_extension : str
         ``"html"`` (interactive) or ``"png"``/``"pdf"`` (static).
+    style : str
+        Publication style preset: 'default', 'nature', 'science', or
+        'generic_bw'. Controls font, figure size (mm), DPI, and palette
+        used when isave and save_extension != 'html'.
     inclusive : bool
         Use the colorblind-friendly LCZ palette.
     title : str, optional
@@ -398,14 +404,8 @@ def lcz_anomaly(
             font=dict(size=10, color="gray"),
         )
 
-    if isave:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        path = os.path.join(OUTPUT_DIR, f"lcz4r_anomaly_plot.{save_extension}")
-        if save_extension == "html":
-            fig.write_html(path, include_plotlyjs="cdn")
-        else:
-            fig.write_image(path, scale=2)
-        logger.info(lcz_msg("save_output_path", lang, path=os.path.abspath(path)))
+    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
+                           filename="lcz4r_anomaly_plot", lang=lang)
 
     return fig
 
