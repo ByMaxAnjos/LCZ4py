@@ -135,6 +135,24 @@ def _create_basemap_fig(
                 showlegend=True,
             ))
 
+    # Attribution required by the basemap/data providers.
+    # OpenFreeMap says attribution is automatically handled by MapLibre, but
+    # for Plotly/printed/static outputs we place it explicitly in the figure.
+    fig.add_annotation(
+        text="OpenFreeMap | © OpenMapTiles | Data from OpenStreetMap",
+        xref="paper",
+        yref="paper",
+        x=0.99,
+        y=0.01,
+        xanchor="right",
+        yanchor="bottom",
+        showarrow=False,
+        font=dict(size=10, color="rgba(40,40,40,0.9)"),
+        bgcolor="rgba(255,255,255,0.75)",
+        bordercolor="rgba(120,120,120,0.35)",
+        borderpad=3,
+    )
+
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",

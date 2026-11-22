@@ -263,6 +263,21 @@ def test_lcz_plot_map_no_webgl(lcz_tif):
     assert isinstance(result, LCZPlotResult)
 
 
+def test_finalize_export_missing_kaleido_is_helpful(monkeypatch):
+    from LCZ4py._internal import lcz_theme
+    from LCZ4py._internal.lcz_theme import finalize_export
+
+    monkeypatch.setattr(lcz_theme, "find_spec", lambda name: None)
+    fig = go.Figure()
+
+    with pytest.raises(ValueError) as excinfo:
+        finalize_export(fig, isave=True, save_extension="png")
+
+    msg = str(excinfo.value)
+    assert "Kaleido" in msg
+    assert "html" in msg
+
+
 def test_raster_to_geoarrow(lcz_tif):
     from LCZ4py.general.lcz_plot_map import raster_to_geoarrow
     import pyarrow as pa

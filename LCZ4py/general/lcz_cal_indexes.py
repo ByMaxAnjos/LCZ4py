@@ -27,6 +27,7 @@ import plotly.graph_objects as go
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND, get_lcz_names
 from LCZ4py._internal._lcz_grid_raster_base import LCZGridResult
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import save_plotly_figure
 
 OUTPUT_DIR = "LCZ4r_output"
 
@@ -167,8 +168,19 @@ def lcz_cal_indexes(
     if isave:
         import os
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        fig.write_html(os.path.join(OUTPUT_DIR, f"lcz_cal_indexes.{save_extension}")) if save_extension == "html" \
-            else fig.write_image(os.path.join(OUTPUT_DIR, f"lcz_cal_indexes.{save_extension}"))
+        plot_path = os.path.join(OUTPUT_DIR, f"lcz_cal_indexes.{save_extension}")
+        if save_extension == "html":
+            fig.write_html(plot_path)
+        else:
+            save_plotly_figure(
+                fig,
+                plot_path,
+                width_px=1200,
+                height_px=800,
+                scale=2,
+                save_extension=save_extension,
+                lang=lang,
+            )
         df.write_csv(os.path.join(OUTPUT_DIR, "lcz_cal_indexes.csv"))
 
     return LCZIndexesResult(df=df, fig=fig)

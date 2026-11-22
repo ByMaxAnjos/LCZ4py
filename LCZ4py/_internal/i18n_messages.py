@@ -162,6 +162,58 @@ LCZ_MESSAGES: dict[str, dict[str, Any]] = {
         "es": "Salida guardada en {path {path}}",
         "zh": "输出已保存至 {path {path}}",
     },
+    "kaleido_missing": {
+        "en": [
+            "Static image export for .{ext} requires the optional Kaleido package.",
+            "i=Install it with `pip install kaleido` or `pip install -r requirements.txt`, then rerun with isave=True.",
+            "i=If you only need an interactive figure, use `save_extension=\"html\"` instead.",
+        ],
+        "pt": [
+            "A exportação de imagem estática para .{ext} requer o pacote opcional Kaleido.",
+            "i=Instale com `pip install kaleido` ou `pip install -r requirements.txt` e rode novamente com isave=True.",
+            "i=Se você só precisa da figura interativa, use `save_extension=\"html\"`.",
+        ],
+        "es": [
+            "La exportación de imagen estática para .{ext} requiere el paquete opcional Kaleido.",
+            "i=Instálelo con `pip install kaleido` o `pip install -r requirements.txt` y ejecute de nuevo con isave=True.",
+            "i=Si solo necesita la figura interactiva, use `save_extension=\"html\"`.",
+        ],
+        "zh": [
+            "导出 .{ext} 静态图片需要可选的 Kaleido 包。",
+            "i=请使用 `pip install kaleido` 或 `pip install -r requirements.txt` 安装后，再以 isave=True 重新运行。",
+            "i=如果只需要交互式图，请改用 `save_extension=\"html\"`。",
+        ],
+    },
+    "kaleido_error": {
+        "en": [
+            "Kaleido is installed but failed to export this figure as .{ext}.",
+            "i=Kaleido 1.x needs a Chromium/Chrome binary; install Chrome or set the CHROME_PATH environment variable.",
+            "i=Make sure Plotly and Kaleido are compatible: `pip install -U \"plotly>=6.1\" \"kaleido>=1.0\"`.",
+            "i=If you only need an interactive figure, use `save_extension=\"html\"` instead.",
+            "i=Original error: {error {error}}",
+        ],
+        "pt": [
+            "O Kaleido está instalado, mas falhou ao exportar esta figura como .{ext}.",
+            "i=O Kaleido 1.x precisa de um binário Chromium/Chrome; instale o Chrome ou defina a variável CHROME_PATH.",
+            "i=Verifique a compatibilidade entre Plotly e Kaleido: `pip install -U \"plotly>=6.1\" \"kaleido>=1.0\"`.",
+            "i=Se você só precisa da figura interativa, use `save_extension=\"html\"`.",
+            "i=Erro original: {error {error}}",
+        ],
+        "es": [
+            "Kaleido está instalado, pero no pudo exportar esta figura como .{ext}.",
+            "i=Kaleido 1.x necesita un binario de Chromium/Chrome; instale Chrome o defina la variable CHROME_PATH.",
+            "i=Verifique la compatibilidad entre Plotly y Kaleido: `pip install -U \"plotly>=6.1\" \"kaleido>=1.0\"`.",
+            "i=Si solo necesita la figura interactiva, use `save_extension=\"html\"`.",
+            "i=Error original: {error {error}}",
+        ],
+        "zh": [
+            "Kaleido 已安装，但导出 .{ext} 图片失败。",
+            "i=Kaleido 1.x 需要 Chromium/Chrome 可执行文件；请安装 Chrome 或设置 CHROME_PATH 环境变量。",
+            "i=请确保 Plotly 与 Kaleido 版本兼容：`pip install -U \"plotly>=6.1\" \"kaleido>=1.0\"`。",
+            "i=如果只需要交互式图，请改用 `save_extension=\"html\"`。",
+            "i=原始错误：{error {error}}",
+        ],
+    },
     "analysis_done": {
         "en": "Done. {val {n}} rows processed.",
         "pt": "Concluído. {val {n}} linhas processadas.",
@@ -1484,4 +1536,31 @@ def lcz_msg(key: str, lang: str = "en", **kwargs: Any) -> str:
     )
 
 
-__all__ = ["LCZ_MESSAGES", "lcz_msg"]
+def lcz_msg_detail(
+    key: str, lang: str = "en", *, sep: str = "\n", **kwargs: Any
+) -> str:
+    """Retrieve a localized message including all hint lines.
+
+    :func:`lcz_msg` intentionally returns only the first line so plain-text
+    callers are not flooded by hints. Error messages that reach the user as an
+    exception need the hints too, so this variant joins every line of the
+    template with ``sep``.
+    """
+    if lang not in ("en", "pt", "es", "zh"):
+        lang = "en"
+
+    msgs = LCZ_MESSAGES.get(key)
+    if msgs is None:
+        return f"<missing i18n key: {key}>"
+
+    template = msgs.get(lang, msgs["en"])
+    lines = template if isinstance(template, list) else [template]
+
+    def _fill(value: str) -> str:
+        if not kwargs:
+            return value
+        return _PLACEHOLDER_RE.sub(
+            lambda m: str(kwargs.get(m.group(1), m.group(0))), value
+        )
+
+    return sep.join(_fill(line) for line in lines)

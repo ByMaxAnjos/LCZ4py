@@ -22,6 +22,7 @@ journals without a specific house style.
 
 from __future__ import annotations
 
+from importlib.util import find_spec
 import logging
 import os
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ from typing import Optional
 import numpy as np
 import plotly.graph_objects as go
 
-from .i18n_messages import lcz_msg
+from .i18n_messages import lcz_msg, lcz_msg_detail
 from .lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND
 
 logger = logging.getLogger(__name__)
@@ -181,6 +182,55 @@ def _mm_to_px(mm: float, dpi: int) -> int:
     return round(mm / MM_PER_INCH * dpi)
 
 
+def _plotly_image_export_available() -> bool:
+    """Return True when Plotly static image export can run in this runtime.
+
+    ``find_spec`` only proves the module file exists; importing it also catches
+    partially installed / broken Kaleido environments (missing Chromium, ABI
+    mismatch, incompatible Plotly version), which would otherwise surface as an
+    opaque error from inside ``fig.write_image``.
+    """
+    if find_spec("kaleido") is None:
+        return False
+    try:
+        import kaleido  # noqa: F401
+    except Exception:  # pragma: no cover - depends on the local environment
+        return False
+    return True
+
+
+def save_plotly_figure(
+    fig: go.Figure,
+    save_path: str,
+    *,
+    width_px: int,
+    height_px: int,
+    scale: int = 1,
+    save_extension: str,
+    lang: str = "en",
+) -> None:
+    """Write a Plotly figure to disk with a clearer missing-dependency error."""
+    if not _plotly_image_export_available():
+        raise ValueError(
+            lcz_msg_detail(
+                "kaleido_missing",
+                lang,
+                ext=save_extension,
+            )
+        )
+    try:
+        fig.write_image(save_path, width=width_px, height=height_px, scale=scale)
+    except Exception as exc:  # pragma: no cover - environment specific
+        raise ValueError(
+            lcz_msg_detail(
+                "kaleido_error",
+                lang,
+                ext=save_extension,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        ) from exc
+
+
 def finalize_export(
     fig,
     *,
@@ -212,13 +262,27 @@ def finalize_export(
                 height_px = _mm_to_px(min(spec.max_height_mm, width_mm * 0.75), spec.dpi)
                 if save_extension == "tiff":
                     png_path = os.path.join(OUTPUT_DIR, f"{filename}.png")
-                    fig.write_image(png_path, width=width_px, height=height_px,
-                                     scale=1)
+                    save_plotly_figure(
+                        fig,
+                        png_path,
+                        width_px=width_px,
+                        height_px=height_px,
+                        scale=1,
+                        save_extension="png",
+                        lang=lang,
+                    )
                     from PIL import Image
                     Image.open(png_path).save(save_path, dpi=(spec.dpi, spec.dpi))
                 else:
-                    fig.write_image(save_path, width=width_px, height=height_px,
-                                     scale=1)
+                    save_plotly_figure(
+                        fig,
+                        save_path,
+                        width_px=width_px,
+                        height_px=height_px,
+                        scale=1,
+                        save_extension=save_extension,
+                        lang=lang,
+                    )
             logger.info("Saved: %s", os.path.abspath(save_path))
         return fig
 

@@ -281,6 +281,12 @@ async def _get_lcz_map_core(
                 _save_geoarrow_cache(study_area, cache_file)
                 if verbose: logger.info(f"Cached boundary to {cache_file}")
         elif roi is not None:
+            if not isinstance(roi, gpd.GeoDataFrame):
+                raise TypeError(
+                    f"roi must be a GeoDataFrame with polygon geometry, got {type(roi).__name__}. "
+                    "If you picked a previous result, make sure it's a vector/boundary output "
+                    "(e.g. GeoJSON), not a plot or raster result."
+                )
             study_area = roi
         else:
             raise ValueError("Provide either 'city' or 'roi'")
@@ -288,9 +294,16 @@ async def _get_lcz_map_core(
         # ── Step 2: Prepare Geometry with DuckDB Spatial ──────────────────
         bbox, study_area_4326 = _prepare_bounding_box_duckdb(study_area)
         
-        # Generate stable hash for the clipped cache
-        key = f"{url}|{bbox[0]:.4f}|{bbox[1]:.4f}|{bbox[2]:.4f}|{bbox[3]:.4f}"
-        clip_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
+        # Generate stable hash for the clipped cache. This MUST include the
+        # actual geometry, not just its bounding box: two different-shaped
+        # study areas (e.g. a custom ROI vs. a geocoded city, or two ROIs)
+        # can share the same bbox, and hashing only the bbox previously made
+        # them collide on the same cache file — silently returning one
+        # request's mask shape for a different, unrelated request ("crop"
+        # instead of "mask" bugs traced back to this).
+        geom_wkb = study_area_4326.geometry.union_all().wkb
+        key = f"{url}|{bbox[0]:.4f}|{bbox[1]:.4f}|{bbox[2]:.4f}|{bbox[3]:.4f}".encode() + geom_wkb
+        clip_hash = hashlib.sha256(key).hexdigest()[:16]
         clip_cache_path = os.path.join(cache_dir, f"clipped_{clip_hash}.tif")
 
         if _is_valid_raster(clip_cache_path):

@@ -19,7 +19,7 @@ dependencies = [
     "polars>=0.20.0",
     "pyarrow>=14.0.0",
     "numpy>=1.26.0",
-    "plotly>=5.18.0",
+    "plotly>=6.1.0",
     "scipy>=1.11.0",
     "httpx>=0.26.0",
     "aiohttp>=3.9.0",
@@ -32,7 +32,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "diskcache>=5.6.0",
     "matplotlib>=3.8.0",
-    "kaleido>=0.2.1",
+    "kaleido>=1.0.0",
 ]
 
 [project.optional-dependencies]
