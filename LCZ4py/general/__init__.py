@@ -22,6 +22,7 @@ from .lcz_grid_pollution_ghap import lcz_grid_pollution_ghap
 from .lcz_grid_pollution_merra2 import lcz_grid_pollution_merra2
 from .plot_grid_only import plot_grid_only
 from .plot_lcz_relationship import plot_lcz_relationship
+from LCZ4py._internal._lcz_grid_raster_base import LCZGridResult
 
 __all__ = [
     "lcz_get_map",
@@ -37,6 +38,7 @@ __all__ = [
     "lcz_cal_area",
     "LCZStackResult",
     "lcz_get_parameters",
+    "parameter_names",
     "map_class_to_params_vectorized",
     "lcz_plot_parameters",
     "FastRasterReader",
@@ -64,4 +66,5 @@ __all__ = [
     "lcz_grid_pollution_merra2",
     "plot_grid_only",
     "plot_lcz_relationship",
+    "LCZGridResult",
 ]

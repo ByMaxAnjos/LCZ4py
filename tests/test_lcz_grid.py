@@ -144,9 +144,13 @@ def test_era5_out_of_latam_coverage_raises(tmp_path):
 
 # ── lcz_grid_era5_global (offline, fabricated NetCDF + monkeypatched CDS) ────
 
-def test_era5_global_no_auth_raises(lcz_map_path, monkeypatch):
+def test_era5_global_no_auth_raises(lcz_map_path, monkeypatch, tmp_path):
     from LCZ4py.general.lcz_grid_era5_global import lcz_grid_era5_global
 
+    # Isolate the user profile so a real ~/.cdsapirc on the test machine
+    # cannot make the download succeed instead of raising.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("CDSAPI_KEY", raising=False)
     monkeypatch.delenv("CDSAPI_URL", raising=False)
     with pytest.raises(ValueError):

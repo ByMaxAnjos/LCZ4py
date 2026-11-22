@@ -10,17 +10,18 @@ classification and urban climate analysis.
 ====================================================================
 """
 
+from __future__ import annotations
+
 import os
 import hashlib
 import logging
-import warnings
 import tempfile
 import zipfile
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Union, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial, wraps
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from datetime import datetime
 from contextlib import contextmanager
 import time
@@ -28,11 +29,12 @@ import time
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-import xarray as xr
-import rioxarray
 import rasterio
-from rasterio import warp, features
 from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.transform import Affine
+from rasterio.warp import reproject
+from rasterio.windows import from_bounds as window_from_bounds
 from shapely.geometry import box
 import requests
 from requests.adapters import HTTPAdapter
@@ -40,9 +42,22 @@ from urllib3.util.retry import Retry
 from tqdm import tqdm
 from diskcache import FanoutCache
 
-# Suppress warnings for cleaner output
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', category=UserWarning)
+# Optional: xarray + rioxarray backend. The processor works with rasterio alone
+# when they are missing (see _RasterGrid); only the few operations that
+# genuinely need xarray raise a clear ImportError when called.
+try:
+    import xarray as xr
+    HAS_XARRAY = True
+except ImportError:  # pragma: no cover - depends on the environment
+    xr = None
+    HAS_XARRAY = False
+
+try:
+    import rioxarray  # noqa: F401 - registers the .rio accessor
+    HAS_RIOXARRAY = HAS_XARRAY
+except ImportError:  # pragma: no cover - depends on the environment
+    rioxarray = None
+    HAS_RIOXARRAY = False
 
 # GDAL reads these from the process environment as a global fallback, so
 # setting them once here covers every /vsicurl/ open (variables + GHSL tiles)
@@ -57,15 +72,166 @@ os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.ovr,.zip"
 # now blocks with a 403 that GDAL surfaces as an opaque open failure.
 os.environ.setdefault("GDAL_HTTP_USERAGENT", "Mozilla/5.0 (compatible; lcz4r-python)")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
+# Library code must not reconfigure the root logger or globally silence
+# warnings on import — the host application owns that policy.
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+
+def _ensure_verbose_logging() -> None:
+    """Attach a console handler to the package logger when the host app has
+    configured no logging at all.
+
+    Importing a library must not call ``logging.basicConfig`` (it hijacks the
+    root logger); this opt-in helper is only called from code paths the user
+    explicitly starts with ``verbose=True``.
+    """
+    lg = logging.getLogger("LCZ4py")
+    if any(isinstance(h, logging.StreamHandler) for h in lg.handlers):
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S",
+    ))
+    lg.addHandler(handler)
+    if lg.level == logging.NOTSET or lg.level > logging.INFO:
+        lg.setLevel(logging.INFO)
 
 OUTPUT_DIR = "LCZ4r_output"
+
+
+# =============================================================================
+# RASTER GRID (rasterio-only fallback for xarray.DataArray)
+# =============================================================================
+
+@dataclass
+class _RasterGrid:
+    """Minimal 2-D georeferenced raster used when xarray is unavailable."""
+    array: np.ndarray
+    transform: Affine
+    crs: CRS
+    nodata: Optional[float] = np.nan
+    name: str = "raster"
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self.array.shape
+
+    @property
+    def dims(self) -> Tuple[str, str]:
+        return ("y", "x")
+
+    def bounds(self) -> Tuple[float, float, float, float]:
+        return rasterio.transform.array_bounds(self.shape[0], self.shape[1], self.transform)
+
+    def valid_mask(self) -> np.ndarray:
+        arr = self.array
+        mask = np.isfinite(arr) if arr.dtype.kind == "f" else np.ones(arr.shape, bool)
+        if self.nodata is not None and np.isfinite(self.nodata):
+            mask &= arr != self.nodata
+        return mask
+
+
+def _is_xarray(obj: Any) -> bool:
+    """True for an xarray DataArray/Dataset (when xarray is installed)."""
+    return HAS_XARRAY and isinstance(obj, (xr.DataArray, xr.Dataset))
+
+
+def _grid_crs(grid: Any) -> Any:
+    return grid.rio.crs if _is_xarray(grid) else grid.crs
+
+
+def _grid_transform(grid: Any) -> Any:
+    return grid.rio.transform() if _is_xarray(grid) else grid.transform
+
+
+def _grid_shape(grid: Any) -> Tuple[int, int]:
+    if _is_xarray(grid):
+        return grid.shape[-2], grid.shape[-1]
+    return grid.shape
+
+
+def _grid_bounds(grid: Any) -> Tuple[float, float, float, float]:
+    if _is_xarray(grid):
+        return tuple(grid.rio.bounds())
+    return grid.bounds()
+
+
+def _grid_array(grid: Any) -> np.ndarray:
+    return np.asarray(grid.values if _is_xarray(grid) else grid.array)
+
+
+def _grid_nodata(grid: Any) -> Optional[float]:
+    if _is_xarray(grid):
+        return grid.rio.nodata
+    return grid.nodata
+
+
+def _sample_grid(
+    grid: "_RasterGrid", xs: np.ndarray, ys: np.ndarray, method: str = "bilinear",
+) -> np.ndarray:
+    """Sample a georeferenced array at ``(xs, ys)`` in the grid's CRS.
+
+    ``method='nearest'`` picks the containing cell; anything else does
+    bilinear interpolation between the four surrounding cell centres.
+    Returns NaN outside the raster.
+    """
+    h, w = grid.shape
+    xs = np.atleast_1d(np.asarray(xs, dtype=float))
+    ys = np.atleast_1d(np.asarray(ys, dtype=float))
+    inv = ~grid.transform
+    cols_f, rows_f = inv * (xs, ys)
+    # Affine inverse puts (x, y) at the cell *corner*; shift to cell centres.
+    cols_f = cols_f - 0.5
+    rows_f = rows_f - 0.5
+
+    out = np.full(xs.shape, np.nan, dtype=float)
+
+    if method == "nearest":
+        rows = np.floor(rows_f + 0.5).astype(int)
+        cols = np.floor(cols_f + 0.5).astype(int)
+        inside = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+        out[inside] = np.asarray(grid.array, dtype=float)[rows[inside], cols[inside]]
+        return out
+
+    r0 = np.floor(rows_f).astype(int)
+    c0 = np.floor(cols_f).astype(int)
+    dr = rows_f - r0
+    dc = cols_f - c0
+    weights = (
+        (r0, c0, (1 - dr) * (1 - dc)),
+        (r0, c0 + 1, (1 - dr) * dc),
+        (r0 + 1, c0, dr * (1 - dc)),
+        (r0 + 1, c0 + 1, dr * dc),
+    )
+    arr = np.asarray(grid.array, dtype=float)
+    acc = np.zeros(xs.shape, dtype=float)
+    wsum = np.zeros(xs.shape, dtype=float)
+    for rr, cc, ww in weights:
+        inside = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+        vals = arr[np.clip(rr, 0, h - 1), np.clip(cc, 0, w - 1)]
+        good = inside & np.isfinite(vals)
+        acc[good] += vals[good] * ww[good]
+        wsum[good] += ww[good]
+    ok = wsum > 0
+    out[ok] = acc[ok] / wsum[ok]
+    return out
+
+
+def _require_xarray(feature: str) -> None:
+    """Raise a clear, actionable ImportError for xarray-only operations.
+
+    Kept for callers that genuinely need the xarray backend; the rasterio
+    fallbacks in this module do not call it.
+    """
+    if not (HAS_XARRAY and HAS_RIOXARRAY):
+        raise ImportError(
+            f"{feature} needs the optional xarray + rioxarray backend. Install "
+            "them with `pip install xarray rioxarray` (or "
+            "`pip install LCZ4py[ucp]`). The processor itself loads the LCZ "
+            "map and writes GeoTIFF stacks with rasterio, but remote-variable "
+            "download/mosaicking/resampling use xarray when installed."
+        )
 
 
 # =============================================================================
@@ -374,10 +540,16 @@ class GeoCache:
         return hashlib.sha256(content.encode()).hexdigest()[:16]
     
     def _verify_raster(self, path: Path) -> bool:
-        """Verify a raster file is not corrupt."""
+        """Verify a raster file is not corrupt (xarray or rasterio)."""
+        if HAS_RIOXARRAY:
+            try:
+                with rioxarray.open_rasterio(path, chunks=None) as src:
+                    return src.size > 0 and src.rio.crs is not None
+            except Exception:
+                return False
         try:
-            with rioxarray.open_rasterio(path, chunks=None) as src:
-                return src.size > 0 and src.rio.crs is not None
+            with rasterio.open(path) as src:
+                return src.width > 0 and src.height > 0 and src.crs is not None
         except Exception:
             return False
     
@@ -402,30 +574,41 @@ class GeoCache:
     
     def save_raster(
         self,
-        raster: xr.DataArray,
+        raster: Any,
         var_name: str,
         extent_id: str,
         compress: str = "LZW",
         predictor: int = 2
     ) -> Path:
-        """Save raster to cache with compression."""
+        """Save raster to cache with compression.
+
+        Accepts an ``xarray.DataArray`` (xarray backend) or a
+        :class:`_RasterGrid` / 2-D numpy array (rasterio backend).
+        """
         cache_file = self.cache_dir / "rasters" / f"{var_name}_{extent_id}.tif"
-        
-        # Remove band dimension if single
-        if 'band' in raster.dims and raster.band.size == 1:
-            raster = raster.squeeze('band', drop=True)
-        
-        raster.rio.to_raster(
-            cache_file,
-            driver="GTiff",
-            compress=compress,
-            predictor=predictor if compress == "LZW" else 1,
-            tiled=True,
-            blockxsize=256,
-            blockysize=256,
-            windowed=True
-        )
-        
+
+        if _is_xarray(raster):
+            # Remove band dimension if single
+            if 'band' in raster.dims and raster.band.size == 1:
+                raster = raster.squeeze('band', drop=True)
+
+            raster.rio.to_raster(
+                cache_file,
+                driver="GTiff",
+                compress=compress,
+                predictor=predictor if compress == "LZW" else 1,
+                tiled=True,
+                blockxsize=256,
+                blockysize=256,
+                windowed=True
+            )
+        else:
+            grid = self._coerce_grid(raster)
+            self._write_grid_geotiff(
+                cache_file, grid,
+                compress=compress.lower(), predictor=predictor,
+            )
+
         # Update index
         key = self._generate_key(var_name, extent_id)
         self.index[key] = {
@@ -433,8 +616,38 @@ class GeoCache:
             'created': datetime.now().isoformat(),
             'size': cache_file.stat().st_size
         }
-        
+
         return cache_file
+
+    @staticmethod
+    def _coerce_grid(raster: Any, fallback: Optional[_RasterGrid] = None) -> _RasterGrid:
+        if isinstance(raster, _RasterGrid):
+            return raster
+        if isinstance(raster, np.ndarray):
+            if fallback is None:
+                raise ValueError(
+                    "A bare numpy array needs a _RasterGrid fallback with "
+                    "transform/CRS to be written to disk."
+                )
+            return _RasterGrid(raster, fallback.transform, fallback.crs,
+                               fallback.nodata, fallback.name)
+        raise TypeError(f"Unsupported raster type: {type(raster)!r}")
+
+    @staticmethod
+    def _write_grid_geotiff(
+        path: Path, grid: _RasterGrid, compress: str = "lzw", predictor: int = 3,
+    ) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        profile = {
+            "driver": "GTiff", "height": grid.shape[0], "width": grid.shape[1],
+            "count": 1, "dtype": "float32", "crs": grid.crs,
+            "transform": grid.transform, "nodata": np.nan,
+            "compress": compress, "predictor": predictor,
+            "BIGTIFF": "IF_SAFER",
+        }
+        with rasterio.open(path, "w", **profile) as dst:
+            dst.write(np.asarray(grid.array, dtype=np.float32), 1)
+        return path
     
     def get_vector_path(self, name: str) -> Optional[Path]:
         """Get cached vector path if exists and valid."""
@@ -464,26 +677,30 @@ class GeoCache:
     
     def save_ghsl_tile(
         self,
-        raster: xr.DataArray,
+        raster: Any,
         ghsl_type: str,
         tile_id: str
     ) -> Path:
-        """Save GHSL tile to cache."""
+        """Save GHSL tile to cache (xarray or rasterio backend)."""
         cache_file = self.cache_dir / "ghsl" / f"{ghsl_type}_{tile_id}.tif"
-        
-        if 'band' in raster.dims and raster.band.size == 1:
-            raster = raster.squeeze('band', drop=True)
-        
-        raster.rio.to_raster(
-            cache_file,
-            driver="GTiff",
-            compress="LZW",
-            tiled=True,
-            BIGTIFF="IF_SAFER",
-            blockxsize=256,
-            blockysize=256
-        )
-        
+
+        if _is_xarray(raster):
+            if 'band' in raster.dims and raster.band.size == 1:
+                raster = raster.squeeze('band', drop=True)
+
+            raster.rio.to_raster(
+                cache_file,
+                driver="GTiff",
+                compress="LZW",
+                tiled=True,
+                BIGTIFF="IF_SAFER",
+                blockxsize=256,
+                blockysize=256
+            )
+        else:
+            grid = self._coerce_grid(raster)
+            self._write_grid_geotiff(cache_file, grid)
+
         return cache_file
     
     def get_temp_path(self, prefix: str, suffix: str = ".tmp") -> Path:
@@ -634,6 +851,8 @@ class UrbanParameterProcessor:
             n_workers = min(max(1, cpu_count - 1), 4)
         self.n_workers = min(n_workers, cpu_count)
         self.verbose = verbose
+        if verbose:
+            _ensure_verbose_logging()
 
         # Initialize cache and session
         self.cache = GeoCache(cache_dir)
@@ -642,17 +861,36 @@ class UrbanParameterProcessor:
         # concurrency never exceeds n_workers across the whole run.
         self.executor = ThreadPoolExecutor(max_workers=self.n_workers)
         
-        # Load and validate LCZ map
+        # Load and validate LCZ map (xarray DataArray when available, else a
+        # rasterio-backed _RasterGrid with the same grid semantics).
         self.lcz_map = self._load_lcz_map(lcz_map)
-        self.target_crs = self.lcz_map.rio.crs
-        self.target_transform = self.lcz_map.rio.transform()
-        self.target_shape = self.lcz_map.shape
+        self.uses_xarray = _is_xarray(self.lcz_map)
+        self.target_crs = _grid_crs(self.lcz_map)
+        self.target_transform = _grid_transform(self.lcz_map)
+        self.target_shape = _grid_shape(self.lcz_map)
         # lcz_shp_wgs84 is only the rectangular bbox of lcz_map (cheap vsicurl
         # crop window) — it does not carry lcz_map's actual (often irregular)
         # valid-pixel footprint. Every resampled variable is re-masked against
         # this in _resample_to_target so outputs match lcz_map exactly, not
         # just its bounding box.
-        self._lcz_valid_mask = self.lcz_map.notnull()
+        if self.uses_xarray:
+            lcz_values = np.asarray(self.lcz_map.values)
+            class_mask = np.isfinite(lcz_values) & (lcz_values >= 1) & (lcz_values <= 17)
+            self._lcz_valid_mask = xr.DataArray(
+                class_mask, coords=self.lcz_map.coords, dims=self.lcz_map.dims,
+            )
+        else:
+            self._lcz_valid_mask = (
+                self.lcz_map.valid_mask()
+                & (self.lcz_map.array >= 1) & (self.lcz_map.array <= 17)
+            )
+
+        if not self.uses_xarray and self.verbose:
+            logger.warning(
+                "xarray/rioxarray not installed — using the rasterio backend "
+                "(windowed reads + rasterio.warp). Install `xarray rioxarray` "
+                "for the full xarray code path."
+            )
         
         # Setup study area
         self.lcz_shp_wgs84 = self._extract_study_area_wgs84()
@@ -673,52 +911,74 @@ class UrbanParameterProcessor:
             logger.info("=" * 60)
     
     def _load_lcz_map(self, lcz_map: Any) -> xr.DataArray:
-        """Load and validate LCZ map."""
+        """Load and validate the LCZ classification raster."""
         if isinstance(lcz_map, (str, Path)):
-            if not Path(lcz_map).exists():
+            path = Path(lcz_map)
+            if not path.exists():
                 raise FileNotFoundError(f"LCZ map file not found: {lcz_map}")
-            # Load into memory and close the file handle immediately — otherwise
-            # the underlying GDAL dataset stays open for the processor's lifetime
-            # and can raise unraisable errors during interpreter shutdown.
-            with rioxarray.open_rasterio(lcz_map, masked=True) as src:
-                da = src.load()
-        elif isinstance(lcz_map, xr.DataArray):
+            if HAS_RIOXARRAY:
+                # Load into memory and close the file handle immediately —
+                # otherwise the underlying GDAL dataset stays open for the
+                # processor's lifetime and can raise unraisable errors during
+                # interpreter shutdown.
+                with rioxarray.open_rasterio(path, masked=True) as src:
+                    da = src.load()
+            else:
+                with rasterio.open(path) as src:
+                    if src.count > 1:
+                        logger.warning("Multiple bands detected. Using first band.")
+                    arr = src.read(1, masked=True).astype("float32").filled(np.nan)
+                    da = _RasterGrid(
+                        array=arr, transform=src.transform, crs=src.crs,
+                        nodata=src.nodata, name=path.stem,
+                    )
+        elif HAS_XARRAY and isinstance(lcz_map, xr.DataArray):
             da = lcz_map.copy()
-        elif isinstance(lcz_map, xr.Dataset):
+        elif HAS_XARRAY and isinstance(lcz_map, xr.Dataset):
             da = lcz_map[list(lcz_map.data_vars)[0]].copy()
+        elif isinstance(lcz_map, _RasterGrid):
+            da = lcz_map
+        elif isinstance(lcz_map, np.ndarray):
+            raise ValueError(
+                "A bare numpy array has no georeferencing; pass a file path or "
+                "an xarray.DataArray instead."
+            )
         else:
             raise ValueError(
-                "lcz_map must be a file path, xarray DataArray, or Dataset"
+                "lcz_map must be a file path"
+                + (", xarray DataArray, or Dataset" if HAS_XARRAY else "")
+                + f" (got {type(lcz_map).__name__})"
             )
-        
+
         # Handle multi-band rasters
-        if 'band' in da.dims:
+        if _is_xarray(da) and 'band' in da.dims:
             if da.band.size > 1:
-                warnings.warn("Multiple bands detected. Using first band.")
+                logger.warning("Multiple bands detected. Using first band.")
             da = da.isel(band=0, drop=True)
-        
+
         # Validate
-        if da.rio.crs is None:
+        crs = _grid_crs(da)
+        if crs is None:
             raise ValueError("LCZ map must have a valid CRS defined")
-        
+
         return da
-    
+
     def _extract_study_area_wgs84(self) -> gpd.GeoDataFrame:
         """Extract study area boundary in WGS84."""
-        bounds = self.lcz_map.rio.bounds()
+        bounds = _grid_bounds(self.lcz_map)
         bbox = box(*bounds)
-        
+
         gdf = gpd.GeoDataFrame(
             {'id': [1]},
             geometry=[bbox],
             crs=self.target_crs
         )
-        
+
         return gdf.to_crs(epsg=4326)
-    
+
     def _generate_extent_id(self) -> str:
         """Generate unique ID for the study area extent."""
-        bounds = self.lcz_map.rio.bounds()
+        bounds = _grid_bounds(self.lcz_map)
         rounded = [round(b, 3) for b in bounds]
         return "_".join(map(str, rounded))
     
@@ -777,42 +1037,83 @@ class UrbanParameterProcessor:
         self,
         url: str,
         study_area: gpd.GeoDataFrame
-    ) -> Optional[xr.DataArray]:
-        """Download raster using GDAL's vsicurl (fastest method)."""
-        try:
-            vsi_url = f"/vsicurl/{url}"
+    ) -> Optional[Any]:
+        """Download a raster window using GDAL's /vsicurl/ (fastest method).
 
-            with rioxarray.open_rasterio(
-                vsi_url,
-                masked=True,
-                chunks='auto'
-            ) as src:
-                # Clip to study area. from_disk=True is required for global
-                # rasters (e.g. GLC_FCS30D at 30m is ~527k x 1.3M px): without
-                # it, dask's clip() materializes far more than the requested
-                # window and OOM-kills the process; from_disk routes through
-                # rasterio.mask.mask for a true windowed read (verified: same
-                # global raster goes from OOM to ~50MB peak with this on).
-                study_area_crs = study_area.to_crs(src.rio.crs)
-                clipped = src.rio.clip(
-                    study_area_crs.geometry.values,
-                    study_area_crs.crs,
-                    drop=True,
-                    all_touched=True,
-                    from_disk=True
+        xarray backend: clip the lazily-opened DataArray to the study area.
+        rasterio backend: read only the bounding-box window (the study area
+        *is* the LCZ raster's bbox, so a window read is equivalent and avoids
+        any full-file materialisation).
+        """
+        if HAS_RIOXARRAY:
+            try:
+                vsi_url = f"/vsicurl/{url}"
+
+                with rioxarray.open_rasterio(
+                    vsi_url,
+                    masked=True,
+                    chunks='auto'
+                ) as src:
+                    # Clip to study area. from_disk=True is required for global
+                    # rasters (e.g. GLC_FCS30D at 30m is ~527k x 1.3M px): without
+                    # it, dask's clip() materializes far more than the requested
+                    # window and OOM-kills the process; from_disk routes through
+                    # rasterio.mask.mask for a true windowed read (verified: same
+                    # global raster goes from OOM to ~50MB peak with this on).
+                    study_area_crs = study_area.to_crs(src.rio.crs)
+                    clipped = src.rio.clip(
+                        study_area_crs.geometry.values,
+                        study_area_crs.crs,
+                        drop=True,
+                        all_touched=True,
+                        from_disk=True
+                    )
+                    return clipped
+
+            except Exception as e:
+                logger.debug(f"vsicurl failed: {e}")
+                return None
+
+        return self._read_window_rasterio(url, study_area)
+
+    def _read_window_rasterio(
+        self, path_or_url: str, study_area: gpd.GeoDataFrame,
+    ) -> Optional[_RasterGrid]:
+        """Bounding-box window read via rasterio (local path or /vsicurl/)."""
+        vsi = path_or_url
+        if "://" in path_or_url and not path_or_url.startswith(("file://", "/vsi")):
+            vsi = f"/vsicurl/{path_or_url}"
+        elif path_or_url.startswith("file://"):
+            vsi = path_or_url[len("file://"):]
+
+        try:
+            with rasterio.open(vsi) as src:
+                if src.crs is None:
+                    logger.warning("%s has no CRS; skipping.", path_or_url)
+                    return None
+                bbox = study_area.to_crs(src.crs).total_bounds
+                win = window_from_bounds(
+                    bbox[0], bbox[1], bbox[2], bbox[3], transform=src.transform,
+                ).round_offsets(op="floor").round_lengths(op="ceil")
+
+                arr = src.read(
+                    1, window=win, boundless=True, masked=True,
+                    fill_value=np.nan,
+                ).astype("float32").filled(np.nan)
+                return _RasterGrid(
+                    array=arr, transform=src.window_transform(win), crs=src.crs,
+                    nodata=src.nodata,
                 )
-                return clipped
-                
-        except Exception as e:
-            logger.debug(f"vsicurl failed: {e}")
+        except Exception as e:  # noqa: BLE001 - network/GDAL failures are opaque
+            logger.debug(f"Windowed rasterio read failed for {path_or_url}: {e}")
             return None
-    
+
     @retry_on_failure(max_retries=2)
     def _download_and_process_raster(
         self,
         var_def: VariableDefinition,
         study_area: gpd.GeoDataFrame
-    ) -> Optional[xr.DataArray]:
+    ) -> Optional[Any]:
         """
         Download and process a raster variable via GDAL's /vsicurl/ streaming.
 
@@ -827,8 +1128,10 @@ class UrbanParameterProcessor:
         if cached_path:
             if self.verbose:
                 logger.info(f"  ✓ Using cached: {cached_path.name}")
-            with rioxarray.open_rasterio(cached_path, masked=True) as src:
-                return src.load()
+            if HAS_RIOXARRAY:
+                with rioxarray.open_rasterio(cached_path, masked=True) as src:
+                    return src.load()
+            return self._load_grid_rasterio(cached_path)
 
         if self.verbose:
             logger.info(f"  ↓ Downloading: {var_def.name}")
@@ -839,8 +1142,11 @@ class UrbanParameterProcessor:
             raise RuntimeError(f"vsicurl failed for {var_def.name}")
 
         # Apply variable-specific processing
-        result = var_def.process(result, study_area)
-        
+        if _is_xarray(result):
+            result = var_def.process(result, study_area)
+        else:
+            result = self._process_grid_np(var_def, result)
+
         # Save to cache
         try:
             self.cache.save_raster(result, var_def.name, self.extent_id)
@@ -848,59 +1154,113 @@ class UrbanParameterProcessor:
                 logger.info(f"  ✓ Cached: {var_def.name}")
         except Exception as e:
             logger.warning(f"  Failed to cache {var_def.name}: {e}")
-        
+
         return result
-    
+
+    @staticmethod
+    def _load_grid_rasterio(path: Union[str, Path]) -> _RasterGrid:
+        with rasterio.open(path) as src:
+            arr = src.read(1, masked=True).astype("float32").filled(np.nan)
+            return _RasterGrid(
+                array=arr, transform=src.transform, crs=src.crs,
+                nodata=src.nodata, name=Path(path).stem,
+            )
+
+    @staticmethod
+    def _process_grid_np(
+        var_def: VariableDefinition, grid: _RasterGrid,
+    ) -> _RasterGrid:
+        """numpy equivalent of ``VariableDefinition.process``."""
+        arr = np.asarray(grid.array, dtype="float32")
+        if var_def.na_to_zero:
+            arr = np.where(np.isfinite(arr), arr, 0.0).astype("float32")
+        return _RasterGrid(
+            array=arr, transform=grid.transform, crs=grid.crs,
+            nodata=grid.nodata, name=var_def.name,
+        )
+
     def _extract_values_at_stations(
         self,
-        raster: xr.DataArray,
+        raster: Any,
         method: str = "bilinear"
     ) -> np.ndarray:
-        """Extract raster values at station locations via xarray's vectorised
-        pointwise indexing (correct, real API — no manual affine math needed).
+        """Extract raster values at station locations.
+
+        xarray backend: vectorised pointwise indexing via ``sel``/``interp``.
+        rasterio backend: affine inverse + bilinear interpolation.
         """
-        # Reproject stations to raster CRS
-        stations_crs = self.stations.to_crs(raster.rio.crs)
-        x_coords = xr.DataArray([p.x for p in stations_crs.geometry], dims="points")
-        y_coords = xr.DataArray([p.y for p in stations_crs.geometry], dims="points")
+        if self.stations is None:
+            raise ValueError("No stations were provided; cannot extract values.")
 
-        # Remove band dimension if present
-        if 'band' in raster.dims and raster.band.size == 1:
-            raster = raster.squeeze('band', drop=True)
+        if HAS_RIOXARRAY and _is_xarray(raster):
+            # Reproject stations to raster CRS
+            stations_crs = self.stations.to_crs(raster.rio.crs)
+            x_coords = xr.DataArray([p.x for p in stations_crs.geometry], dims="points")
+            y_coords = xr.DataArray([p.y for p in stations_crs.geometry], dims="points")
 
-        if method == "nearest":
-            sampled = raster.sel(x=x_coords, y=y_coords, method="nearest")
-        else:  # bilinear
-            sampled = raster.interp(x=x_coords, y=y_coords, method="linear")
-
-        return sampled.values.astype(float)
-    
-    def _resample_to_target(
-        self,
-        raster: xr.DataArray,
-        method: str = "bilinear"
-    ) -> xr.DataArray:
-        """Resample raster to target grid."""
-        try:
             # Remove band dimension if present
             if 'band' in raster.dims and raster.band.size == 1:
                 raster = raster.squeeze('band', drop=True)
-            
-            # Reproject to match target
-            resampled = raster.rio.reproject_match(
-                self.lcz_map,
-                resampling=getattr(warp.Resampling, method, warp.Resampling.bilinear)
+
+            if method == "nearest":
+                sampled = raster.sel(x=x_coords, y=y_coords, method="nearest")
+            else:  # bilinear
+                sampled = raster.interp(x=x_coords, y=y_coords, method="linear")
+
+            return sampled.values.astype(float)
+
+        grid = raster if isinstance(raster, _RasterGrid) else self._coerce_grid(raster)
+        stations = self.stations.to_crs(grid.crs)
+        xs = np.array([p.x for p in stations.geometry], dtype=float)
+        ys = np.array([p.y for p in stations.geometry], dtype=float)
+        return _sample_grid(grid, xs, ys, method=method)
+
+    def _resample_to_target(
+        self,
+        raster: Any,
+        method: str = "bilinear"
+    ) -> Optional[Any]:
+        """Resample to the LCZ grid; returns None if reprojection fails."""
+        resampling = getattr(Resampling, method, Resampling.bilinear)
+
+        if HAS_RIOXARRAY and _is_xarray(raster):
+            try:
+                # Remove band dimension if present
+                if 'band' in raster.dims and raster.band.size == 1:
+                    raster = raster.squeeze('band', drop=True)
+
+                resampled = raster.rio.reproject_match(
+                    self.lcz_map, resampling=resampling,
+                )
+                # reproject_match only aligns the grid to lcz_map's bbox — it does
+                # not apply lcz_map's own nodata mask, so re-mask here.
+                return resampled.where(self._lcz_valid_mask)
+            except Exception as e:
+                logger.error("Resampling failed for %r: %s", getattr(raster, "name", raster), e)
+                return None
+
+        grid = raster if isinstance(raster, _RasterGrid) else self._coerce_grid(raster)
+        try:
+            dst = np.full(self.target_shape, np.nan, dtype="float32")
+            reproject(
+                source=np.asarray(grid.array, dtype="float32"),
+                destination=dst,
+                src_transform=grid.transform,
+                src_crs=grid.crs,
+                dst_transform=self.target_transform,
+                dst_crs=self.target_crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=resampling,
             )
-
-            # reproject_match only aligns the grid to lcz_map's bbox — it does
-            # not apply lcz_map's own nodata mask, so re-mask here.
-            resampled = resampled.where(self._lcz_valid_mask)
-
-            return resampled
-            
+            dst = np.where(self._lcz_valid_mask, dst, np.nan)
+            return _RasterGrid(
+                array=dst, transform=self.target_transform, crs=self.target_crs,
+                nodata=np.nan, name=grid.name,
+            )
         except Exception as e:
-            logger.warning(f"Resampling failed: {e}")
-            return raster
+            logger.error("Resampling failed for %r: %s", grid.name, e)
+            return None
     
     def _process_single_variable(
         self,
@@ -938,7 +1298,14 @@ class UrbanParameterProcessor:
 
             # Resample to target grid
             resampled = self._resample_to_target(raster, var_def.resample_method)
-            
+            if resampled is None:
+                return ProcessingResult(
+                    name=var_name,
+                    success=False,
+                    error="Could not reproject/resample onto the LCZ grid",
+                    processing_time=time.time() - start_time
+                )
+
             return ProcessingResult(
                 df=df,
                 raster=resampled,
@@ -1019,39 +1386,46 @@ class UrbanParameterProcessor:
         if cached_path:
             if self.verbose:
                 logger.info(f"    ✓ Cached tile: {tile_id}")
-            with rioxarray.open_rasterio(cached_path, masked=True) as src:
-                return src.load()
-        
+            if HAS_RIOXARRAY:
+                with rioxarray.open_rasterio(cached_path, masked=True) as src:
+                    return src.load()
+            return self._load_grid_rasterio(cached_path)
+
         # Build URLs
         zip_url = f"{mapping.base_url}{tile_id}.zip"
         tif_filename = f"{mapping.filename_pattern}{tile_id}.tif"
-        
+
         # Try vsicurl first
         try:
             vsi_path = f"/vsizip//vsicurl/{zip_url}/{tif_filename}"
-            
-            with rioxarray.open_rasterio(vsi_path, masked=True) as src:
-                study_area_crs = self.lcz_shp_wgs84.to_crs(src.rio.crs)
-                clipped = src.rio.clip(
-                    study_area_crs.geometry.values,
-                    study_area_crs.crs,
-                    drop=True,
-                    all_touched=True
-                )
-                
-                self.cache.save_ghsl_tile(clipped, ghsl_type, tile_id)
-                
-                if self.verbose:
-                    logger.info(f"    ✓ Processed tile: {tile_id}")
-                
-                return clipped
-                
+
+            if HAS_RIOXARRAY:
+                with rioxarray.open_rasterio(vsi_path, masked=True) as src:
+                    study_area_crs = self.lcz_shp_wgs84.to_crs(src.rio.crs)
+                    clipped = src.rio.clip(
+                        study_area_crs.geometry.values,
+                        study_area_crs.crs,
+                        drop=True,
+                        all_touched=True
+                    )
+            else:
+                clipped = self._read_window_rasterio(vsi_path, self.lcz_shp_wgs84)
+                if clipped is None:
+                    raise RuntimeError("windowed read returned no data")
+
+            self.cache.save_ghsl_tile(clipped, ghsl_type, tile_id)
+
+            if self.verbose:
+                logger.info(f"    ✓ Processed tile: {tile_id}")
+
+            return clipped
+
         except Exception as e:
             logger.debug(f"vsicurl failed for tile {tile_id}: {e}")
             return self._process_ghsl_tile_fallback(
                 tile_id, ghsl_type, mapping, zip_url, tif_filename
             )
-    
+
     def _process_ghsl_tile_fallback(
         self,
         tile_id: str,
@@ -1059,89 +1433,121 @@ class UrbanParameterProcessor:
         mapping: GHSLMapping,
         zip_url: str,
         tif_filename: str
-    ) -> Optional[xr.DataArray]:
+    ) -> Optional[Any]:
         """Fallback method to download and process GHSL tile."""
         temp_zip = self.cache.get_temp_path(f"ghsl_{tile_id}", ".zip")
-        
+
         try:
             # Download ZIP
             self.session.download_file(zip_url, temp_zip)
-            
+
             # Extract and read
             with zipfile.ZipFile(temp_zip, 'r') as zf:
                 # Find the TIF file (might have slightly different name)
                 tif_names = [n for n in zf.namelist() if n.endswith('.tif')]
-                
+
                 if not tif_names:
                     raise ValueError("No TIF file found in ZIP")
-                
+
                 tif_to_use = tif_names[0]  # Use first TIF found
-                
+
                 with tempfile.TemporaryDirectory() as temp_dir:
                     zf.extract(tif_to_use, temp_dir)
                     tif_path = Path(temp_dir) / tif_to_use
-                    
-                    with rioxarray.open_rasterio(tif_path, masked=True) as src:
-                        study_area_crs = self.lcz_shp_wgs84.to_crs(src.rio.crs)
-                        clipped = src.rio.clip(
-                            study_area_crs.geometry.values,
-                            study_area_crs.crs,
-                            drop=True,
-                            all_touched=True
+
+                    if HAS_RIOXARRAY:
+                        with rioxarray.open_rasterio(tif_path, masked=True) as src:
+                            study_area_crs = self.lcz_shp_wgs84.to_crs(src.rio.crs)
+                            clipped = src.rio.clip(
+                                study_area_crs.geometry.values,
+                                study_area_crs.crs,
+                                drop=True,
+                                all_touched=True
+                            )
+                    else:
+                        clipped = self._read_window_rasterio(
+                            str(tif_path), self.lcz_shp_wgs84,
                         )
-                        
-                        self.cache.save_ghsl_tile(clipped, ghsl_type, tile_id)
-                        
-                        if self.verbose:
-                            logger.info(f"    ✓ Processed tile (fallback): {tile_id}")
-                        
-                        return clipped
-                        
+                        if clipped is None:
+                            raise RuntimeError("windowed read returned no data")
+
+                    self.cache.save_ghsl_tile(clipped, ghsl_type, tile_id)
+
+                    if self.verbose:
+                        logger.info(f"    ✓ Processed tile (fallback): {tile_id}")
+
+                    return clipped
+
         except Exception as e:
             logger.warning(f"    ✗ Fallback failed for tile {tile_id}: {e}")
             return None
-            
+
         finally:
             temp_zip.unlink(missing_ok=True)
     
     def _mosaic_rasters(
         self,
-        rasters: List[xr.DataArray],
+        rasters: List[Any],
         var_name: str
-    ) -> Optional[xr.DataArray]:
-        """Mosaic multiple rasters into one."""
+    ) -> Optional[Any]:
+        """Mosaic multiple rasters into one (deterministic tile order)."""
         if not rasters:
             return None
-        
+
         if len(rasters) == 1:
             result = rasters[0]
-            if 'band' in result.dims and result.band.size == 1:
-                result = result.squeeze('band', drop=True)
-            return result.rename(var_name)
-        
+            if HAS_XARRAY and _is_xarray(result):
+                if 'band' in result.dims and result.band.size == 1:
+                    result = result.squeeze('band', drop=True)
+                return result.rename(var_name)
+            return result
+
+        if not HAS_XARRAY or not _is_xarray(rasters[0]):
+            # rasterio backend: nan-fill grids reprojected onto the first
+            # tile's grid (tiles of the same product normally share it).
+            base = rasters[0]
+            if not isinstance(base, _RasterGrid):
+                raise TypeError("Cannot mosaic mixed backend types.")
+            merged = np.array(base.array, dtype="float32", copy=True)
+            for r in rasters[1:]:
+                if not isinstance(r, _RasterGrid):
+                    raise TypeError("Cannot mosaic mixed backend types.")
+                tile = r.array.astype("float32", copy=False)
+                if (r.shape != base.shape or r.transform != base.transform
+                        or r.crs != base.crs):
+                    warped = np.full(base.shape, np.nan, dtype="float32")
+                    reproject(
+                        source=tile, destination=warped,
+                        src_transform=r.transform, src_crs=r.crs,
+                        dst_transform=base.transform, dst_crs=base.crs,
+                        src_nodata=np.nan, dst_nodata=np.nan,
+                        resampling=Resampling.bilinear,
+                    )
+                    tile = warped
+                merged = np.where(np.isfinite(merged), merged, tile)
+            return _RasterGrid(
+                merged, base.transform, base.crs, base.nodata, var_name,
+            )
+
         try:
             # Merge using xarray
-            merged = xr.merge([r.rename(f"temp_{i}") for i, r in enumerate(rasters)])
-            
+            merged_ds = xr.merge([r.rename(f"temp_{i}") for i, r in enumerate(rasters)])
+
             # Get the first variable
-            result = merged[list(merged.data_vars)[0]]
-            
+            result = merged_ds[list(merged_ds.data_vars)[0]]
+
             # Fill NaN with values from other rasters
-            for i, r in enumerate(rasters[1:], 1):
+            for i in range(1, len(rasters)):
                 temp_name = f"temp_{i}"
-                if temp_name in merged:
-                    result = result.fillna(merged[temp_name])
-            
+                if temp_name in merged_ds:
+                    result = result.fillna(merged_ds[temp_name])
+
             return result.rename(var_name)
-            
+
         except Exception as e:
             logger.warning(f"Mosaicking failed: {e}")
-            # Return first raster as fallback
-            result = rasters[0]
-            if 'band' in result.dims and result.band.size == 1:
-                result = result.squeeze('band', drop=True)
-            return result.rename(var_name)
-    
+            return None
+
     def _process_ghsl_type(
         self,
         ghsl_type: str,
@@ -1151,35 +1557,32 @@ class UrbanParameterProcessor:
         if ghsl_type not in self.GHSL_MAPPINGS:
             logger.error(f"Invalid GHSL type: {ghsl_type}")
             return None
-        
+
         mapping = self.GHSL_MAPPINGS[ghsl_type]
         start_time = time.time()
-        
+
         if self.verbose:
             logger.info(f"  Processing GHSL: {ghsl_type} ({len(tile_ids)} tiles)")
-        
-        # Process tiles in parallel, reusing the shared pool
-        tiles_data = []
 
-        futures = {
-            self.executor.submit(
-                self._process_ghsl_tile,
-                tile_id,
-                ghsl_type,
-                mapping
-            ): tile_id
+        # Process tiles in parallel, reusing the shared pool. Iterate futures
+        # in submission order so the mosaic (and therefore the output band
+        # order / values where tiles overlap) is deterministic.
+        futures = [
+            (tile_id, self.executor.submit(
+                self._process_ghsl_tile, tile_id, ghsl_type, mapping,
+            ))
             for tile_id in tile_ids
-        }
+        ]
 
-        for future in as_completed(futures):
-            tile_id = futures[future]
+        tiles_data = []
+        for tile_id, future in futures:
             try:
                 result = future.result()
                 if result is not None:
                     tiles_data.append(result)
             except Exception as e:
                 logger.warning(f"Tile {tile_id} failed: {e}")
-        
+
         if not tiles_data:
             logger.warning(f"No tiles processed for {ghsl_type}")
             return ProcessingResult(
@@ -1188,13 +1591,13 @@ class UrbanParameterProcessor:
                 error="No tiles processed",
                 processing_time=time.time() - start_time
             )
-        
+
         # Mosaic tiles
         if self.verbose:
             logger.info(f"    Mosaicking {len(tiles_data)} tiles...")
-        
+
         mosaic = self._mosaic_rasters(tiles_data, mapping.var_name)
-        
+
         if mosaic is None:
             return ProcessingResult(
                 name=ghsl_type,
@@ -1202,19 +1605,28 @@ class UrbanParameterProcessor:
                 error="Mosaicking failed",
                 processing_time=time.time() - start_time
             )
-        
+
         # Reproject and resample
         mosaic = self._resample_to_target(mosaic)
-        
-        # Extract at stations
-        extracted = self._extract_values_at_stations(mosaic)
-        
-        id_col = self.stations.columns[0]
-        df = pd.DataFrame({
-            id_col: self.stations[id_col].values,
-            mapping.var_name: extracted
-        })
-        
+        if mosaic is None:
+            return ProcessingResult(
+                name=ghsl_type,
+                success=False,
+                error="Could not reproject/resample onto the LCZ grid",
+                processing_time=time.time() - start_time
+            )
+
+        # Extract at stations (skipped when no stations given)
+        if self.stations is not None:
+            extracted = self._extract_values_at_stations(mosaic)
+            id_col = self.stations.columns[0]
+            df = pd.DataFrame({
+                id_col: self.stations[id_col].values,
+                mapping.var_name: extracted
+            })
+        else:
+            df = None
+
         return ProcessingResult(
             df=df,
             raster=mosaic,
@@ -1371,9 +1783,11 @@ class UrbanParameterProcessor:
         
         return definitions
     
-    def _save_stack(self, combined_rasters: xr.Dataset) -> str:
+    def _save_stack(self, combined_rasters: Any) -> str:
         """Write the processed parameters as a multi-band GeoTIFF stack.
 
+        Accepts an xarray ``Dataset`` (xarray backend) or a ``dict`` of
+        ``{name: 2-D array}`` / ``{name: _RasterGrid}`` (rasterio backend).
         Used when no stations are given, so the raster stack (already
         cropped/aligned to the lcz_map grid via _resample_to_target) is the
         deliverable, following the same GeoTIFF conventions as
@@ -1382,11 +1796,42 @@ class UrbanParameterProcessor:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, "lcz_ucp_stack.tif")
 
-        band_names = list(combined_rasters.data_vars)
-        stacked = combined_rasters.to_array(dim="band")
-        stacked.rio.write_crs(self.target_crs, inplace=True)
-        stacked.rio.write_nodata(np.nan, inplace=True)
-        stacked.rio.to_raster(out_path, compress="lzw", predictor=3, dtype="float32")
+        if HAS_RIOXARRAY and _is_xarray(combined_rasters):
+            band_names = list(combined_rasters.data_vars)
+            stacked = combined_rasters.to_array(dim="band")
+            stacked.rio.write_crs(self.target_crs, inplace=True)
+            stacked.rio.write_nodata(np.nan, inplace=True)
+            stacked.rio.to_raster(out_path, compress="lzw", predictor=3, dtype="float32")
+        else:
+            if isinstance(combined_rasters, dict):
+                band_names = list(combined_rasters)
+                arrays = [np.asarray(
+                    v.array if isinstance(v, _RasterGrid) else v,
+                    dtype="float32",
+                ) for v in combined_rasters.values()]
+            elif isinstance(combined_rasters, (list, tuple)):
+                band_names = [f"band_{i + 1}" for i in range(len(combined_rasters))]
+                arrays = [np.asarray(
+                    v.array if isinstance(v, _RasterGrid) else v,
+                    dtype="float32",
+                ) for v in combined_rasters]
+            else:  # pragma: no cover - defensive
+                raise TypeError(
+                    f"Cannot save a stack from {type(combined_rasters).__name__}; "
+                    "expected an xarray.Dataset or a dict of 2-D arrays."
+                )
+            if not arrays:
+                raise ValueError("No raster bands to write.")
+
+            profile = {
+                "driver": "GTiff", "height": arrays[0].shape[0],
+                "width": arrays[0].shape[1], "count": len(arrays),
+                "dtype": "float32", "crs": self.target_crs,
+                "transform": self.target_transform, "nodata": np.nan,
+                "compress": "lzw", "predictor": 3, "BIGTIFF": "IF_SAFER",
+            }
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(np.stack(arrays).astype("float32"))
 
         with rasterio.open(out_path, "r+") as dst:
             for i, name in enumerate(band_names, start=1):
@@ -1436,7 +1881,8 @@ class UrbanParameterProcessor:
         dict
             Dictionary containing:
             - 'df_vars': DataFrame with extracted values at stations
-            - 'combined_rasters': xarray Dataset with all processed rasters
+            - 'combined_rasters': xarray Dataset (xarray backend) or
+              {name: 2-D ndarray} dict (rasterio backend) with all rasters
             - 'variable_list': List of successfully processed variables
             - 'failed_variables': List of (variable, error) tuples
             - 'summary': ProcessingSummary object
@@ -1472,14 +1918,12 @@ class UrbanParameterProcessor:
                 logger.info(f"Processing {len(var_definitions)} variables")
                 logger.info(f"{'='*60}")
             
-            futures = {
-                self.executor.submit(
-                    self._process_single_variable,
-                    name,
-                    var_def
-                ): (name, var_def)
+            futures = [
+                (name, self.executor.submit(
+                    self._process_single_variable, name, var_def,
+                ))
                 for name, var_def in var_definitions.items()
-            }
+            ]
 
             with tqdm(
                 total=len(futures),
@@ -1487,9 +1931,9 @@ class UrbanParameterProcessor:
                 disable=not self.verbose,
                 unit="var"
             ) as pbar:
-                for future in as_completed(futures):
-                    var_name, _ = futures[future]
-
+                # Iterate in submission order: results (and therefore the
+                # output column/band order) stay deterministic.
+                for var_name, future in futures:
                     try:
                         result = future.result(timeout=600)  # 10 min timeout
 
@@ -1574,11 +2018,22 @@ class UrbanParameterProcessor:
         # Combine rasters
         raster_dict = {}
         for r in results:
-            if r.raster is not None:
+            if r.raster is None:
+                continue
+            if HAS_XARRAY and _is_xarray(r.raster):
                 name = r.raster.name if r.raster.name else r.name
-                raster_dict[name] = r.raster
+            else:
+                name = getattr(r.raster, "name", None) or r.name
+            raster_dict[name] = r.raster
 
-        combined_rasters = xr.Dataset(raster_dict) if raster_dict else None
+        if raster_dict and all(_is_xarray(v) for v in raster_dict.values()):
+            combined_rasters = xr.Dataset(raster_dict)
+        else:
+            # rasterio backend: expose plain 2-D arrays (name -> ndarray).
+            combined_rasters = {
+                name: (v.array if isinstance(v, _RasterGrid) else np.asarray(v))
+                for name, v in raster_dict.items()
+            } or None
 
         # No stations -> the raster stack is the deliverable, save it to disk
         stack_path = None
@@ -1607,8 +2062,12 @@ class UrbanParameterProcessor:
             if failed:
                 logger.warning(f"Failed variables: {[f[0] for f in failed]}")
             
-            if combined_rasters:
-                logger.info(f"Raster layers: {len(combined_rasters.data_vars)}")
+            if combined_rasters is not None:
+                n_layers = (
+                    len(combined_rasters.data_vars) if _is_xarray(combined_rasters)
+                    else len(combined_rasters)
+                )
+                logger.info(f"Raster layers: {n_layers}")
             if df_vars is not None:
                 logger.info(f"DataFrame: {len(df_vars)} rows × {len(df_vars.columns)} cols")
             if stack_path:
@@ -1710,7 +2169,8 @@ def lcz_get_ucp(
     dict
         Results dictionary with:
         - 'df_vars': DataFrame with extracted values (None if stations is None)
-        - 'combined_rasters': xarray Dataset with rasters
+        - 'combined_rasters': xarray Dataset (xarray backend) or
+          {name: 2-D ndarray} dict (rasterio backend)
         - 'stack_path': path to the saved GeoTIFF stack (set only when
           stations is None; otherwise None)
         - 'variable_list': List of successful variables

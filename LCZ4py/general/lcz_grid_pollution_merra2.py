@@ -15,28 +15,45 @@ monthly-dated band. Ported as-is for R/Python parity.
 Output is a multi-band GeoTIFF (one band per pollutant x month), float32
 with NaN nodata, pixel-aligned to the input LCZ map's grid — the same
 ``LCZGridResult`` convention used by ``lcz_get_lst``/``lcz_get_planetary_computer``.
+
+Monthly files are downloaded in parallel (bounded by ``max_workers``) with a
+single reused HTTP client; each file is then opened once to derive every
+requested pollutant (PM2.5 needs five variables from the same file).
 """
 
 from __future__ import annotations
 
 import logging
+import netrc as netrc_module
 import os
 from datetime import date
 from pathlib import Path
 from typing import Optional, Union
+from urllib.parse import urlparse
 
 import numpy as np
-import rioxarray  # noqa: F401 - registers the .rio accessor
-import xarray as xr
 
+try:
+    import xarray as xr
+
+    HAS_XARRAY = True
+except ImportError:  # pragma: no cover - depends on the environment
+    xr = None  # type: ignore[assignment]
+    HAS_XARRAY = False
+
+from LCZ4py._internal._lcz_grid_base import (
+    download_many,
+    normalize_int_list,
+    resolve_max_workers,
+)
 from LCZ4py._internal._lcz_grid_raster_base import (
     DEFAULT_GRID_CACHE_DIR,
     LCZGridResult,
     cache_key,
     crop_reproject_dataarray,
     load_target_grid,
-    read_grid_stack,
-    rio_template,
+    make_template_factory,
+    try_read_grid_stack,
     write_grid_stack,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
@@ -47,6 +64,7 @@ OUTPUT_DIR = "LCZ4r_output"
 _VALID_POLLUTANTS = ("pm25", "aod", "so2")
 _VALID_RESOLUTIONS = ("monthly", "daily")
 _VALID_RESAMPLING = ("average", "bilinear", "nearest")
+_FIRST_YEAR = 1980
 
 _VAR_MAP = {
     "pm25": {
@@ -62,6 +80,8 @@ _VAR_MAP = {
         "derive": lambda d: d["SO2SMASS"] * 1e9,
     },
 }
+
+_SPATIAL_NAMES = ("lat", "lon", "latitude", "longitude", "x", "y")
 
 
 def _version_code(year: int) -> str:
@@ -81,47 +101,131 @@ def _file_info(year: int, month: int) -> tuple[str, str]:
     return fname, base + fname
 
 
-def _download_auth(url: str, cache_path: str, use_cache: bool, user: str, password: str, netrc_path: Optional[str], verbose: bool) -> bool:
-    import httpx
+def _resolve_auth(
+    url: str,
+    user: Optional[str],
+    password: Optional[str],
+    netrc_path: Optional[str],
+) -> Optional[tuple[str, str]]:
+    """Build an ``(user, password)`` pair from a .netrc file or explicit creds."""
+    if netrc_path:
+        expanded = os.path.expanduser(netrc_path)
+        if not os.path.exists(expanded):
+            logger.warning("netrc file not found: %s", expanded)
+        else:
+            try:
+                host = urlparse(url).hostname or ""
+                parsed = netrc_module.netrc(expanded)
+                # Try the exact host first, then the shared Earthdata login
+                # host, then the only entry in the file (common when users
+                # keep a single `machine urs.earthdata.nasa.gov` block).
+                candidates = [host, "urs.earthdata.nasa.gov"]
+                entry = None
+                for candidate in candidates:
+                    if not candidate:
+                        continue
+                    entry = parsed.authenticators(candidate)
+                    if entry:
+                        break
+                if entry is None and len(parsed.hosts) == 1:
+                    entry = next(iter(parsed.hosts.values()))
+                if entry and entry[0] and entry[2]:
+                    return (entry[0], entry[2])
+                logger.warning(
+                    "No .netrc credentials for %r in %s; falling back to "
+                    "EARTHDATA_USER/EARTHDATA_PASSWORD.",
+                    host, expanded,
+                )
+            except Exception as exc:  # noqa: BLE001 - malformed netrc
+                logger.warning("Could not read netrc file %s: %s", expanded, exc)
 
+    if user and password:
+        return (user, password)
+    return None
+
+
+def _download_auth(
+    url: str,
+    cache_path: str,
+    use_cache: bool,
+    user: str,
+    password: str,
+    netrc_path: Optional[str],
+    verbose: bool,
+) -> bool:
+    """Earthdata-authenticated download (atomic, retried, cache-aware).
+
+    Kept as a thin wrapper for backward compatibility; batch downloads go
+    through :func:`download_many` with a shared authenticated client.
+    """
     if use_cache and os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
         if verbose:
             print(f"Cache found: {os.path.basename(cache_path)}")
         return True
 
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    try:
-        auth = None if netrc_path else (user, password)
-        client_kwargs = {"follow_redirects": True, "timeout": 120.0}
-        if netrc_path:
-            client_kwargs["trust_env"] = True  # relies on NETRC env var / ~/.netrc
-        with httpx.Client(auth=auth, **client_kwargs) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            with open(cache_path, "wb") as f:
-                f.write(resp.content)
-        if verbose:
-            print(f"Downloaded: {os.path.basename(cache_path)}")
-        return True
-    except Exception as exc:
-        if os.path.exists(cache_path):
-            os.remove(cache_path)
-        logger.warning("Failed to download %s: %s", url, exc)
-        return False
+    from LCZ4py._internal._lcz_grid_base import download_file
+
+    auth = _resolve_auth(url, user, password, netrc_path)
+    return download_file(
+        url, cache_path, use_cache=use_cache, verbose=verbose, auth=auth,
+    )
 
 
-def _extract_period(nc_path: str, pollutant: str, grid, template, resampling: str) -> np.ndarray:
-    vmap = _VAR_MAP[pollutant]
+def _extract_period(
+    nc_path: str,
+    pollutant: str,
+    grid,
+    template,
+    resampling: str,
+) -> np.ndarray:
+    """Backward-compatible single-pollutant wrapper around :func:`_extract_file`."""
+    arrays = _extract_file(nc_path, [pollutant], grid, lambda: template, resampling)
+    return arrays[pollutant]
+
+
+def _extract_file(
+    nc_path: str,
+    pollutants: list[str],
+    grid,
+    template_factory,
+    resampling: str,
+) -> dict[str, np.ndarray]:
+    """Derive every requested pollutant from one MERRA-2 file (single open)."""
+    if not HAS_XARRAY:
+        raise ImportError(
+            "Reading MERRA-2 NetCDF files requires 'xarray'. "
+            "Install it with: pip install xarray"
+        )
+
+    needed = sorted({v for p in pollutants for v in _VAR_MAP[p]["nc_vars"]})
+    derived_inputs: dict[str, np.ndarray] = {}
+
     ds = xr.open_dataset(nc_path)
-    arrs = {}
-    for v in vmap["nc_vars"]:
-        da = ds[v]
-        extra_dims = [d for d in da.dims if d not in ("lat", "lon", "latitude", "longitude")]
-        if extra_dims:
-            da = da.mean(dim=extra_dims)
-        arrs[v] = crop_reproject_dataarray(da, grid, template, resampling)
-    ds.close()
-    return vmap["derive"](arrs).astype("float32")
+    try:
+        missing = [v for v in needed if v not in ds.data_vars]
+        if missing:
+            raise ValueError(
+                f"Variable(s) {', '.join(missing)} not found in "
+                f"{os.path.basename(nc_path)} (available: "
+                f"{', '.join(map(str, ds.data_vars)) or 'none'})."
+            )
+        for var in needed:
+            da = ds[var]
+            extra_dims = [d for d in da.dims if d not in _SPATIAL_NAMES]
+            if extra_dims:
+                # e.g. (time, lev) on an aerosol file: monthly/column mean,
+                # exactly as the R implementation does.
+                da = da.mean(dim=extra_dims)
+            derived_inputs[var] = crop_reproject_dataarray(
+                da, grid, template_factory(), resampling,
+            )
+    finally:
+        ds.close()
+
+    out: dict[str, np.ndarray] = {}
+    for p in pollutants:
+        out[p] = np.asarray(_VAR_MAP[p]["derive"](derived_inputs), dtype="float32")
+    return out
 
 
 def lcz_grid_pollution_merra2(
@@ -139,6 +243,7 @@ def lcz_grid_pollution_merra2(
     cache_dir: str = os.path.join(DEFAULT_GRID_CACHE_DIR, "merra2"),
     lang: str = "en",
     verbose: bool = True,
+    max_workers: Optional[int] = None,
 ) -> LCZGridResult:
     """Download MERRA-2 aerosol/pollution data cropped to an LCZ map's footprint.
 
@@ -173,6 +278,9 @@ def lcz_grid_pollution_merra2(
         Message language. Default "en".
     verbose : bool
         Print progress. Default True.
+    max_workers : int, optional
+        Threads used for parallel downloads. Default
+        ``min(8, os.cpu_count() or 4)``.
 
     Returns
     -------
@@ -185,14 +293,22 @@ def lcz_grid_pollution_merra2(
     PM2.5 = (DUSMASS25 + SSSMASS25 + BCSMASS + 1.4*OCSMASS + SO4SMASS) * 1e9
     (kg/m3 -> ug/m3, organic carbon scaled 1.4x for organic matter).
     """
-    pollutants = list(pollutants)
+    pollutants = [pollutants] if isinstance(pollutants, str) else list(pollutants)
+    pollutants = [str(p).lower() for p in pollutants]
+    pollutants = list(dict.fromkeys(pollutants))
     bad_p = [p for p in pollutants if p not in _VALID_POLLUTANTS]
     if bad_p:
-        raise ValueError(lcz_msg("grid_merra2_invalid_pollutants", lang, bad=", ".join(bad_p)))
+        raise ValueError(lcz_msg(
+            "grid_merra2_invalid_pollutants", lang, bad=", ".join(bad_p),
+        ))
+    if not pollutants:
+        raise ValueError(lcz_msg("grid_merra2_no_pollutants", lang))
     if resolution not in _VALID_RESOLUTIONS:
         raise ValueError(lcz_msg("grid_merra2_invalid_resolution", lang))
     if resampling not in _VALID_RESAMPLING:
-        raise ValueError(lcz_msg("grid_raster_invalid_resampling", lang, valid=", ".join(_VALID_RESAMPLING)))
+        raise ValueError(lcz_msg(
+            "grid_raster_invalid_resampling", lang, valid=", ".join(_VALID_RESAMPLING),
+        ))
 
     if "so2" in pollutants and resolution == "daily":
         logger.warning(lcz_msg("grid_merra2_so2_monthly_only", lang))
@@ -203,19 +319,26 @@ def lcz_grid_pollution_merra2(
     current_year = date.today().year
     if years is None:
         years = [current_year - 2, current_year - 1]
-    else:
-        years = [int(y) for y in years]
-        bad_years = [y for y in years if y < 1980 or y > current_year]
-        if bad_years:
-            raise ValueError(lcz_msg("grid_merra2_invalid_years_range", lang, bad=", ".join(map(str, bad_years))))
+    years = sorted(set(normalize_int_list(years, "years")))
+    if not years:
+        raise ValueError(lcz_msg(
+            "grid_merra2_invalid_years_range", lang, bad="<empty>",
+        ))
+    bad_years = [y for y in years if y < _FIRST_YEAR or y > current_year]
+    if bad_years:
+        raise ValueError(lcz_msg(
+            "grid_merra2_invalid_years_range", lang,
+            bad=", ".join(map(str, bad_years)),
+        ))
 
-    months = sorted(set(int(m) for m in (months or range(1, 13))))
+    months = sorted(set(normalize_int_list(months, "months", default=range(1, 13))))
     if any(m < 1 or m > 12 for m in months):
         raise ValueError(lcz_msg("grid_merra2_invalid_months", lang))
 
     earthdata_user = earthdata_user or os.environ.get("EARTHDATA_USER", "")
     earthdata_pass = earthdata_pass or os.environ.get("EARTHDATA_PASSWORD", "")
-    has_netrc = netrc_path and os.path.exists(netrc_path)
+    netrc_path = os.path.expanduser(netrc_path) if netrc_path else None
+    has_netrc = bool(netrc_path and os.path.exists(netrc_path))
     if not has_netrc and not (earthdata_user and earthdata_pass):
         raise ValueError(lcz_msg("grid_merra2_no_auth", lang))
 
@@ -225,37 +348,57 @@ def lcz_grid_pollution_merra2(
     key = cache_key("merra2", sorted(pollutants), resolution, years, months, grid.bbox_wgs84, resampling)
     stack_path = os.path.join(cache_dir, "stack", f"merra2_stack_{key}.tif")
 
-    if cache and os.path.exists(stack_path):
-        if verbose:
-            print(lcz_msg("grid_raster_cache_hit", lang, name="MERRA-2"))
-        array, bands = read_grid_stack(stack_path)
-    else:
+    array: Optional[np.ndarray] = None
+    bands: list[str] = []
+    if cache:
+        cached = try_read_grid_stack(stack_path)
+        if cached is not None:
+            if verbose:
+                print(lcz_msg("grid_raster_cache_hit", lang, name="MERRA-2"))
+            array, bands = cached
+
+    if array is None:
         # ── Build manifest (one file per year x month, shared across pollutants) ──
         manifest = []
         for yr in years:
             for mo in months:
                 filename, url = _file_info(yr, mo)
-                manifest.append(dict(year=yr, month=mo, filename=filename, url=url,
-                                      cache_nc=os.path.join(cache_dir, filename)))
+                manifest.append(dict(
+                    year=yr, month=mo, filename=filename, url=url,
+                    cache_nc=os.path.join(cache_dir, filename),
+                ))
 
         unique_files = {m["filename"]: (m["url"], m["cache_nc"]) for m in manifest}
         if verbose:
             print(lcz_msg("grid_merra2_download_start", lang, n_files=len(unique_files)))
-        for filename, (url, cache_nc) in unique_files.items():
-            _download_auth(url, cache_nc, cache, earthdata_user, earthdata_pass, netrc_path, verbose)
 
-        template = rio_template(grid)
+        workers = resolve_max_workers(max_workers, len(unique_files))
+        auth = _resolve_auth(manifest[0]["url"], earthdata_user, earthdata_pass, netrc_path)
+        download_many(
+            unique_files, use_cache=cache, verbose=verbose, max_workers=workers,
+            auth=auth, progress_desc="MERRA-2",
+        )
+
+        template = make_template_factory(grid)
         layers: dict[str, np.ndarray] = {}
         for m in manifest:
             if not os.path.exists(m["cache_nc"]) or os.path.getsize(m["cache_nc"]) == 0:
-                logger.warning(lcz_msg("grid_merra2_skip_missing", lang, filename=m["filename"]))
+                logger.warning(lcz_msg(
+                    "grid_merra2_skip_missing", lang, filename=m["filename"],
+                ))
                 continue
-            for p in pollutants:
-                label = f"{p}_{m['year']:04d}-{m['month']:02d}-01"
-                try:
-                    layers[label] = _extract_period(m["cache_nc"], p, grid, template, resampling)
-                except Exception as exc:
-                    logger.warning(lcz_msg("grid_merra2_extract_warn", lang, filename=m["filename"]) + f" ({exc})")
+            try:
+                derived = _extract_file(
+                    m["cache_nc"], pollutants, grid, template, resampling,
+                )
+            except Exception as exc:  # noqa: BLE001 - reported per file
+                logger.warning(
+                    lcz_msg("grid_merra2_extract_warn", lang, filename=m["filename"])
+                    + f" ({exc})"
+                )
+                continue
+            for p, arr in derived.items():
+                layers[f"{p}_{m['year']:04d}-{m['month']:02d}-01"] = arr
 
         if not layers:
             raise RuntimeError(lcz_msg("grid_merra2_no_data", lang))
@@ -263,16 +406,25 @@ def lcz_grid_pollution_merra2(
         bands = sorted(layers)
         array = np.stack([layers[b] for b in bands]).astype(np.float32)
         if cache:
-            write_grid_stack(stack_path, array, bands, grid, variable=",".join(pollutants), units="mixed")
+            write_grid_stack(
+                stack_path, array, bands, grid,
+                variable=",".join(pollutants), units="mixed",
+            )
 
     if isave:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, "lcz_grid_merra2.tif")
-        write_grid_stack(out_path, array, bands, grid, variable=",".join(pollutants), units="mixed")
+        write_grid_stack(
+            out_path, array, bands, grid,
+            variable=",".join(pollutants), units="mixed",
+        )
         if verbose:
             logger.info("Saved: %s", os.path.abspath(out_path))
 
     if verbose:
         print(lcz_msg("grid_raster_done", lang, name="MERRA-2", n_bands=len(bands)))
 
-    return LCZGridResult(path=stack_path if cache else None, array=array, bands=bands, variables=list(pollutants), units="mixed")
+    return LCZGridResult(
+        path=stack_path if cache else None,
+        array=array, bands=bands, variables=list(pollutants), units="mixed",
+    )

@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -70,6 +71,15 @@ from LCZ4py.general.lcz_get_planetary_computer import LCZPCResult
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
+
+
+def _resolve_workers(n_items: int, max_workers: Optional[int] = None) -> int:
+    """Bounded worker count: ``min(8, cpu_count, n_items)`` unless overridden."""
+    if max_workers is not None:
+        workers = int(max_workers)
+    else:
+        workers = min(8, os.cpu_count() or 4)
+    return max(1, min(workers, max(1, n_items)))
 
 # ── Band-role aliases across sensors ──────────────────────────────────────────
 _BAND_ALIASES: dict[str, tuple[str, ...]] = {
@@ -112,8 +122,17 @@ def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
 
 
 def _safe_sqrt(x: np.ndarray) -> np.ndarray:
-    """sqrt() that returns NaN instead of a runtime warning on negative input."""
-    return np.sqrt(np.clip(x, 0, None))
+    """sqrt() that returns NaN (not a silent 0) for negative input.
+
+    Returning 0 for a negative argument would fabricate a plausible-looking
+    value for an undefined index (e.g. ``TNDVI`` where ``NDVI + 0.5 < 0``);
+    NaN correctly marks the pixel as not computable.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    out = np.full(x.shape, np.nan, dtype=np.float64)
+    valid = x >= 0
+    out[valid] = np.sqrt(x[valid])
+    return out
 
 
 # ── Index formulas: name -> (required band roles, formula(bands_dict)) ───────
@@ -283,7 +302,9 @@ def _load_stack(x: Union[str, Path, LCZPCResult]) -> tuple[np.ndarray, list[str]
 
     Always re-reads from the on-disk GeoTIFF (rather than trusting an
     in-memory ``LCZPCResult.array``) so crs/transform/nodata are guaranteed
-    consistent with the written file.
+    consistent with the written file. Nodata (whatever sentinel the file
+    declares, including NaN) is converted to NaN before any formula runs, so
+    nodata pixels can never masquerade as reflectance 0.
     """
     if isinstance(x, LCZPCResult):
         if not x.path or not os.path.exists(x.path):
@@ -294,8 +315,13 @@ def _load_stack(x: Union[str, Path, LCZPCResult]) -> tuple[np.ndarray, list[str]
             )
         x = x.path
 
-    with rasterio.open(str(x)) as src:
-        array = src.read()
+    path = str(x)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Spectral band stack not found: {path}")
+
+    with rasterio.open(path) as src:
+        masked = src.read(masked=True).astype(np.float32)
+        array = masked.filled(np.nan)
         band_names = [src.descriptions[i] or f"band_{i + 1}" for i in range(src.count)]
         profile = src.profile.copy()
         collection = src.tags().get("collection", "")
@@ -305,17 +331,23 @@ def _load_stack(x: Union[str, Path, LCZPCResult]) -> tuple[np.ndarray, list[str]
 
 def _write_indices_stack(
     path: str, stack: np.ndarray, names: list[str], profile: dict, collection: str,
-) -> None:
-    out_profile = profile.copy()
+) -> str:
+    out_profile = dict(profile or {})
     out_profile.update(
-        count=stack.shape[0], dtype="float32", nodata=np.nan,
+        driver=out_profile.get("driver", "GTiff"),
+        count=int(stack.shape[0]), dtype="float32", nodata=np.nan,
         compress="lzw", predictor=3, BIGTIFF="IF_SAFER",
     )
+    # Source block sizes can be invalid for a differently-shaped output.
+    for key in ("tiled", "blockxsize", "blockysize", "photometric"):
+        out_profile.pop(key, None)
+
     with rasterio.open(path, "w", **out_profile) as dst:
-        dst.write(stack)
+        dst.write(np.asarray(stack, dtype=np.float32))
         dst.update_tags(collection=collection or "", indices=",".join(names))
         for i, name in enumerate(names, start=1):
             dst.set_band_description(i, name)
+    return path
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -326,6 +358,7 @@ def lcz_get_indices(
     isave: bool = False,
     lang: str = "en",
     verbose: bool = True,
+    max_workers: Optional[int] = None,
 ) -> LCZIndicesResult:
     """Compute spectral indices from a Sentinel-2/Landsat band stack.
 
@@ -355,6 +388,11 @@ def lcz_get_indices(
         Message language ("en"/"pt"/"es"/"zh").
     verbose : bool
         Log each computed index.
+    max_workers : int, optional
+        Bound on the thread pool used to compute the indices in parallel.
+        Default ``min(8, cpu_count)``. Output band order always follows
+        ``indices`` (or the registry order when ``indices`` is None),
+        independent of the worker count.
 
     Returns
     -------
@@ -387,9 +425,16 @@ def lcz_get_indices(
         raise ValueError(lcz_msg("indices_no_bands", lang, bands=", ".join(band_names)))
 
     if indices is None:
-        requested = sorted(available, key=list(INDEX_FORMULAS).index)
+        requested = [n for n in INDEX_FORMULAS if n in available]
     else:
+        if isinstance(indices, str):
+            indices = [indices]
         requested = list(indices)
+        if not requested:
+            raise ValueError(
+                "indices must contain at least one index name (or be None for "
+                "every computable index)."
+            )
         unknown = [n for n in requested if n not in INDEX_FORMULAS]
         if unknown:
             raise ValueError(lcz_msg(
@@ -405,6 +450,29 @@ def lcz_get_indices(
                 "indices_missing_bands", lang,
                 indices=", ".join(unavailable), bands=", ".join(missing_bands),
             ))
+
+    # De-duplicate while preserving the caller's order (duplicates would just
+    # write the same band twice).
+    if len(set(requested)) != len(requested):
+        seen: set[str] = set()
+        deduped = []
+        dupes: set[str] = set()
+        for name in requested:
+            if name in seen:
+                dupes.add(name)
+                continue
+            seen.add(name)
+            deduped.append(name)
+        logger.warning("Duplicate indices removed: %s", sorted(dupes))
+        requested = deduped
+
+    if "thermal" in roles and collection not in _THERMAL_SCALE:
+        logger.warning(
+            "Thermal band present but the raster's collection tag (%r) has no "
+            "known DN -> Kelvin calibration; LST_K/LST_C will use the raw band "
+            "values as-is.",
+            collection or "<none>",
+        )
 
     scale, offset = _REFLECTANCE_SCALE.get(collection, (1.0, 0.0))
     tscale, toffset = _THERMAL_SCALE.get(collection, (1.0, 0.0))
@@ -426,14 +494,23 @@ def lcz_get_indices(
             # defined in the literature — see the module docstring.)
             bands[role] = np.where(rescaled < 0, np.nan, rescaled)
 
-    out_bands = []
-    for name in requested:
+    def _compute(name: str) -> np.ndarray:
         _, fn = INDEX_FORMULAS[name]
-        out_bands.append(fn(bands).astype(np.float32))
-        if verbose:
+        return np.asarray(fn(bands), dtype=np.float32)
+
+    workers = _resolve_workers(len(requested), max_workers)
+    if workers == 1 or len(requested) == 1:
+        out_bands = [_compute(name) for name in requested]
+    else:
+        # ex.map preserves input order, so band order is deterministic.
+        with ThreadPoolExecutor(max_workers=min(workers, len(requested))) as pool:
+            out_bands = list(pool.map(_compute, requested))
+
+    if verbose:
+        for name in requested:
             logger.info(lcz_msg("indices_computed", lang, name=name))
 
-    stack = np.stack(out_bands).astype(np.float32)
+    stack = np.stack(out_bands).astype(np.float32, copy=False)
 
     result_path = None
     if isave:

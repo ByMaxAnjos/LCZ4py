@@ -14,6 +14,14 @@ a free CDS API key.
 Output is a multi-band GeoTIFF (one band per variable x day), float32 with
 NaN nodata, pixel-aligned to the input LCZ map's grid — the same
 ``LCZGridResult`` convention used by ``lcz_get_lst``/``lcz_get_planetary_computer``.
+
+Performance notes
+-----------------
+Monthly NetCDF files are downloaded in parallel (network-bound), then each
+file is opened **once**, clipped to the LCZ bbox **once**, and only the
+per-day slices are reprojected — instead of re-clipping the whole gridded
+file for every one of the ~30 days it contains. ``xarray``/HDF5 reads stay
+serialized in the main thread because the HDF5 C library is not thread-safe.
 """
 
 from __future__ import annotations
@@ -23,21 +31,32 @@ import logging
 import os
 from datetime import date
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import numpy as np
-import rioxarray  # noqa: F401 - registers the .rio accessor
-import xarray as xr
 
-from LCZ4py._internal._lcz_grid_base import download_file
+try:
+    import xarray as xr
+
+    HAS_XARRAY = True
+except ImportError:  # pragma: no cover - depends on the environment
+    xr = None  # type: ignore[assignment]
+    HAS_XARRAY = False
+
+from LCZ4py._internal._lcz_grid_base import (
+    download_many,
+    normalize_int_list,
+    resolve_max_workers,
+)
 from LCZ4py._internal._lcz_grid_raster_base import (
     DEFAULT_GRID_CACHE_DIR,
     LCZGridResult,
     cache_key,
-    crop_reproject_dataarray,
+    clip_dataarray_block,
     load_target_grid,
-    read_grid_stack,
-    rio_template,
+    make_template_factory,
+    reproject_to_grid,
+    try_read_grid_stack,
     write_grid_stack,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
@@ -46,6 +65,9 @@ logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = "LCZ4r_output"
 _VALID_RESAMPLING = ("average", "bilinear", "nearest")
+_FIRST_YEAR = 1950
+_LAST_YEAR = 2025
+
 # ponytail: rough bbox of the Saldanha Latin-America mirror's real extent
 # (measured from a downloaded file), not its true (likely irregular) land
 # mask. Good enough to reject obviously-out-of-coverage requests (e.g.
@@ -73,7 +95,7 @@ _ERA5_ZENODO_IDS = {
 }
 
 # alias -> (Zenodo indicator, agg label, unit-conversion fn)
-_VAR_MAP = {
+_VAR_MAP: dict[str, tuple[str, str, Callable[[np.ndarray], np.ndarray]]] = {
     "t2m":     ("2m_temperature", "mean", lambda a: a - 273.15),
     "t2m_max": ("2m_temperature", "max", lambda a: a - 273.15),
     "t2m_min": ("2m_temperature", "min", lambda a: a - 273.15),
@@ -104,35 +126,84 @@ def _in_latam(grid) -> bool:
     return bx0 <= cx <= bx1 and by0 <= cy <= by1
 
 
-def _extract_daily_layers(nc_path: str, grid, template, resampling: str, conv_fn, start_date: date) -> dict[str, np.ndarray]:
-    ds = xr.open_dataset(nc_path)
-    var_name = next(iter(ds.data_vars))
-    da = ds[var_name]
+def _time_dim(da) -> Optional[str]:
+    for name in ("time", "valid_time"):
+        if name in da.dims:
+            return name
+    return None
 
-    time_name = "time" if "time" in da.coords else None
-    n_layers = da.sizes.get(time_name, 1) if time_name else 1
 
-    dates = None
-    if time_name is not None:
+def _resolve_dates(block, tdim: Optional[str], n_layers: int, start_date: date) -> list:
+    """Dates for each time slice; falls back to daily steps from ``start_date``."""
+    import pandas as pd
+
+    if tdim is not None:
         try:
-            import pandas as pd
-            dates = pd.to_datetime(da[time_name].values)
-            if len(dates) != n_layers or dates.isna().any():
-                dates = None
-        except Exception:
-            dates = None
-    if dates is None:
-        import pandas as pd
-        dates = pd.date_range(start_date, periods=n_layers, freq="D")
+            dates = pd.to_datetime(np.asarray(block[tdim].values))
+            if len(dates) == n_layers and not pd.isna(dates).any():
+                return list(dates)
+        except Exception as exc:  # noqa: BLE001 - fall back below
+            logger.debug("Falling back to synthetic dates: %s", exc)
+    return list(pd.date_range(start_date, periods=n_layers, freq="D"))
 
-    out = {}
-    iterator = da[time_name].values if time_name else [None]
-    for t, d in zip(iterator, dates):
-        day_da = da.sel({time_name: t}) if time_name else da
-        arr = conv_fn(crop_reproject_dataarray(day_da, grid, template, resampling))
-        out[d.date().isoformat()] = arr
-    ds.close()
-    return out
+
+def _month_layers(
+    nc_path: str,
+    grid,
+    template_factory,
+    resampling: str,
+    conv_fn: Callable[[np.ndarray], np.ndarray],
+    start_date: date,
+) -> dict[str, np.ndarray]:
+    """Extract every daily layer of one monthly NetCDF as ``{ISO date: array}``.
+
+    Opens and clips the file once; only the per-day reprojection is repeated.
+    """
+    if not HAS_XARRAY:
+        raise ImportError(
+            "Reading ERA5 NetCDF files requires 'xarray'. "
+            "Install it with: pip install xarray"
+        )
+
+    ds = xr.open_dataset(nc_path)
+    try:
+        if not ds.data_vars:
+            return {}
+        var_name = next(iter(ds.data_vars))
+        da = ds[var_name]
+
+        tdim = _time_dim(da)
+        block = clip_dataarray_block(da, grid)
+        if block is None:
+            return {}
+
+        n_layers = int(block.sizes[tdim]) if tdim is not None else 1
+        if n_layers == 0:
+            return {}
+        dates = _resolve_dates(block, tdim, n_layers, start_date)
+
+        out: dict[str, np.ndarray] = {}
+        for i in range(n_layers):
+            layer = block.isel({tdim: i}, drop=True) if tdim is not None else block
+            arr = reproject_to_grid(layer, grid, template_factory(), resampling)
+            out[dates[i].date().isoformat()] = np.asarray(conv_fn(arr), dtype="float32")
+        return out
+    finally:
+        ds.close()
+
+
+def _extract_daily_layers(
+    nc_path: str,
+    grid,
+    template,
+    resampling: str,
+    conv_fn: Callable[[np.ndarray], np.ndarray],
+    start_date: date,
+) -> dict[str, np.ndarray]:
+    """Backward-compatible wrapper accepting a concrete template."""
+    return _month_layers(
+        nc_path, grid, lambda: template, resampling, conv_fn, start_date,
+    )
 
 
 def lcz_grid_era5(
@@ -146,6 +217,7 @@ def lcz_grid_era5(
     cache_dir: str = os.path.join(DEFAULT_GRID_CACHE_DIR, "era5"),
     lang: str = "en",
     verbose: bool = True,
+    max_workers: Optional[int] = None,
 ) -> LCZGridResult:
     """Download ERA5-Land daily climate variables cropped to an LCZ map's footprint.
 
@@ -174,6 +246,9 @@ def lcz_grid_era5(
         Message language. Default "en".
     verbose : bool
         Print progress. Default True.
+    max_workers : int, optional
+        Threads used for parallel downloads. Default
+        ``min(8, os.cpu_count() or 4)``.
 
     Returns
     -------
@@ -189,14 +264,17 @@ def lcz_grid_era5(
     Coverage is Latin America only (raises ``ValueError`` otherwise) — use
     ``lcz_grid_era5_global`` for any other region (requires a free CDS API key).
     """
+    years = sorted(set(normalize_int_list(years, "years")))
     if not years:
         raise ValueError(lcz_msg("grid_era5_missing_years", lang))
-    years = sorted(set(int(y) for y in years))
-    bad_years = [y for y in years if y < 1950 or y > 2025]
+    bad_years = [y for y in years if y < _FIRST_YEAR or y > _LAST_YEAR]
     if bad_years:
-        raise ValueError(lcz_msg("grid_era5_invalid_years_range", lang, bad=", ".join(map(str, bad_years))))
+        raise ValueError(lcz_msg(
+            "grid_era5_invalid_years_range", lang,
+            bad=", ".join(map(str, bad_years)),
+        ))
 
-    months = sorted(set(int(m) for m in (months or range(1, 13))))
+    months = sorted(set(normalize_int_list(months, "months", default=range(1, 13))))
     if any(m < 1 or m > 12 for m in months):
         raise ValueError(lcz_msg("grid_era5_invalid_months", lang))
 
@@ -204,12 +282,22 @@ def lcz_grid_era5(
         vars = list(_VAR_MAP.keys())
     elif isinstance(vars, str):
         vars = [vars]
+    else:
+        vars = list(vars)
+    vars = list(dict.fromkeys(vars))  # keep order, drop duplicates
+    if not vars:
+        raise ValueError(lcz_msg("grid_era5_invalid_vars", lang, bad="", valid=", ".join(_VAR_MAP)))
     bad_vars = [v for v in vars if v not in _VAR_MAP]
     if bad_vars:
-        raise ValueError(lcz_msg("grid_era5_invalid_vars", lang, bad=", ".join(bad_vars), valid=", ".join(_VAR_MAP)))
+        raise ValueError(lcz_msg(
+            "grid_era5_invalid_vars", lang,
+            bad=", ".join(bad_vars), valid=", ".join(_VAR_MAP),
+        ))
 
     if resampling not in _VALID_RESAMPLING:
-        raise ValueError(lcz_msg("grid_raster_invalid_resampling", lang, valid=", ".join(_VALID_RESAMPLING)))
+        raise ValueError(lcz_msg(
+            "grid_raster_invalid_resampling", lang, valid=", ".join(_VALID_RESAMPLING),
+        ))
 
     grid = load_target_grid(x)
     if not _in_latam(grid):
@@ -219,11 +307,16 @@ def lcz_grid_era5(
     key = cache_key("era5", years, months, sorted(vars), grid.bbox_wgs84, resampling)
     stack_path = os.path.join(cache_dir, "stack", f"era5_stack_{key}.tif")
 
-    if cache and os.path.exists(stack_path):
-        if verbose:
-            print(lcz_msg("grid_raster_cache_hit", lang, name="ERA5-Land"))
-        array, bands = read_grid_stack(stack_path)
-    else:
+    array: Optional[np.ndarray] = None
+    bands: list[str] = []
+    if cache:
+        cached = try_read_grid_stack(stack_path)
+        if cached is not None:
+            if verbose:
+                print(lcz_msg("grid_raster_cache_hit", lang, name="ERA5-Land"))
+            array, bands = cached
+
+    if array is None:
         # dedupe by (indicator, agg_label, year, month) so t2m_max/t2m_min
         # sharing one Zenodo file aren't downloaded twice.
         file_manifest: dict[tuple, dict] = {}
@@ -236,16 +329,27 @@ def lcz_grid_era5(
                         continue
                     filename = _nc_filename(indicator, yr, mo, agg_label)
                     file_manifest[fkey] = dict(
-                        year=yr, month=mo, filename=filename, url=_zenodo_url(yr, filename),
+                        year=yr, month=mo, filename=filename,
+                        url=_zenodo_url(yr, filename),
                         cache_path=os.path.join(cache_dir, str(yr), filename),
                     )
 
         if verbose:
             print(lcz_msg("grid_era5_download_start", lang, n_files=len(file_manifest)))
-        for entry in file_manifest.values():
-            download_file(entry["url"], entry["cache_path"], use_cache=cache, verbose=verbose)
 
-        template = rio_template(grid)
+        downloads = {
+            f"{entry['year']}-{entry['month']:02d}-{entry['filename']}": (
+                entry["url"], entry["cache_path"],
+            )
+            for entry in file_manifest.values()
+        }
+        workers = resolve_max_workers(max_workers, len(downloads))
+        download_many(
+            downloads, use_cache=cache, verbose=verbose,
+            max_workers=workers, progress_desc="ERA5-Land",
+        )
+
+        template = make_template_factory(grid)
 
         layers: dict[str, np.ndarray] = {}
         for alias in vars:
@@ -253,15 +357,21 @@ def lcz_grid_era5(
             for yr in years:
                 for mo in months:
                     entry = file_manifest[(indicator, agg_label, yr, mo)]
-                    if not os.path.exists(entry["cache_path"]) or os.path.getsize(entry["cache_path"]) == 0:
-                        logger.warning(lcz_msg("grid_era5_skip_missing", lang, filename=entry["filename"]))
+                    path = entry["cache_path"]
+                    if not os.path.exists(path) or os.path.getsize(path) == 0:
+                        logger.warning(lcz_msg(
+                            "grid_era5_skip_missing", lang, filename=entry["filename"],
+                        ))
                         continue
                     try:
-                        daily = _extract_daily_layers(
-                            entry["cache_path"], grid, template, resampling, conv_fn, date(yr, mo, 1),
+                        daily = _month_layers(
+                            path, grid, template, resampling, conv_fn, date(yr, mo, 1),
                         )
-                    except Exception as exc:
-                        logger.warning(lcz_msg("grid_era5_extract_warn", lang, file=entry["filename"]) + f" ({exc})")
+                    except Exception as exc:  # noqa: BLE001 - reported per file
+                        logger.warning(
+                            lcz_msg("grid_era5_extract_warn", lang, file=entry["filename"])
+                            + f" ({exc})"
+                        )
                         continue
                     for d, arr in daily.items():
                         layers[f"{alias}_{d}"] = arr
@@ -272,16 +382,25 @@ def lcz_grid_era5(
         bands = sorted(layers)
         array = np.stack([layers[b] for b in bands]).astype(np.float32)
         if cache:
-            write_grid_stack(stack_path, array, bands, grid, variable=",".join(vars), units="mixed")
+            write_grid_stack(
+                stack_path, array, bands, grid,
+                variable=",".join(vars), units="mixed",
+            )
 
     if isave:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, "lcz_grid_era5.tif")
-        write_grid_stack(out_path, array, bands, grid, variable=",".join(vars), units="mixed")
+        write_grid_stack(
+            out_path, array, bands, grid,
+            variable=",".join(vars), units="mixed",
+        )
         if verbose:
             logger.info("Saved: %s", os.path.abspath(out_path))
 
     if verbose:
         print(lcz_msg("grid_raster_done", lang, name="ERA5-Land", n_bands=len(bands)))
 
-    return LCZGridResult(path=stack_path if cache else None, array=array, bands=bands, variables=list(vars), units="mixed")
+    return LCZGridResult(
+        path=stack_path if cache else None,
+        array=array, bands=bands, variables=list(vars), units="mixed",
+    )

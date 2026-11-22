@@ -42,6 +42,7 @@ __all__ = [
     "lcz_interp_eval",
     "lcz_plot_interp",
     "krige_predict",
+    "krige_predict_points",
     "KrigeResult",
     "VgModel",
     "rbf_predict",

@@ -15,6 +15,8 @@ Polars group-by pattern.
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -27,9 +29,18 @@ import plotly.graph_objects as go
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND, get_lcz_names
 from LCZ4py._internal._lcz_grid_raster_base import LCZGridResult
 from LCZ4py._internal.i18n_messages import lcz_msg
-from LCZ4py._internal.lcz_theme import save_plotly_figure
+from LCZ4py._internal.lcz_theme import finalize_export
 
 OUTPUT_DIR = "LCZ4r_output"
+
+
+def _resolve_workers(n_items: int, max_workers: Optional[int] = None) -> int:
+    """Bounded worker count: ``min(8, cpu_count, n_items)`` unless overridden."""
+    if max_workers is not None:
+        workers = int(max_workers)
+    else:
+        workers = min(8, os.cpu_count() or 4)
+    return max(1, min(workers, max(1, n_items)))
 
 
 @dataclass
@@ -39,19 +50,53 @@ class LCZIndexesResult:
     fig: Optional[go.Figure] = None
 
 
-def _select_band(grid_result: LCZGridResult, band: Optional[Union[int, str]]) -> np.ndarray:
+def _select_band(
+    grid_result: LCZGridResult, band: Optional[Union[int, str]],
+) -> np.ndarray:
+    """Return a ``(1, H, W)`` or ``(n_bands, H, W)`` float array."""
     array = grid_result.array
+    if array is None:
+        raise ValueError(
+            "grid_result.array is None — pass the LCZGridResult returned by an "
+            "lcz_grid_* raster call (or set .array from its saved GeoTIFF)."
+        )
+    array = np.asarray(array)
+    if array.ndim == 2:  # tolerate a single 2-D band
+        array = array[None, ...]
+    if array.ndim != 3:
+        raise ValueError(
+            f"grid_result.array must be (n_bands, H, W); got shape {array.shape}."
+        )
+
     if band is None:
-        return array  # (n_bands, H, W) -> flattened across all bands below
+        return array
+
     if isinstance(band, str):
-        if band not in grid_result.bands:
-            raise ValueError(f"band {band!r} not found. Available: {grid_result.bands}")
-        band = grid_result.bands.index(band)
-    return array[band][None, ...]
+        bands = list(grid_result.bands or [])
+        if band not in bands:
+            raise ValueError(f"band {band!r} not found. Available: {bands}")
+        band = bands.index(band)
+
+    try:
+        idx = int(band)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"band must be an int or a label from {list(grid_result.bands or [])}, "
+            f"got {band!r}."
+        ) from exc
+    if idx < 0 or idx >= array.shape[0]:
+        raise IndexError(
+            f"band index {idx} out of range for {array.shape[0]} band(s)."
+        )
+    return array[idx][None, ...]
 
 
 def _build_summary(classes: np.ndarray, values: np.ndarray) -> pl.DataFrame:
-    df = pl.DataFrame({"lcz": classes.astype(np.int16), "value": values.astype(np.float64)}).lazy()
+    """Group valid (class, value) pairs and compute the summary statistics."""
+    df = pl.DataFrame({
+        "lcz": np.asarray(classes, dtype=np.int16),
+        "value": np.asarray(values, dtype=np.float64),
+    }).lazy()
     return (
         df.group_by("lcz")
         .agg([
@@ -74,29 +119,67 @@ def _attach_metadata(df: pl.DataFrame, inclusive: bool, lang: str) -> pl.DataFra
     return df.join(names_df, on="lcz", how="left")
 
 
-def _plot_bar(df: pl.DataFrame, variable_name: str, lang: str) -> go.Figure:
+def _axis_title(variable_name: str, units: Optional[str]) -> str:
+    """``'rainfall_mm [mm]'`` unless the label already carries units."""
+    if not units:
+        return variable_name
+    return f"{variable_name} [{units.strip('[]')}]"
+
+
+def _plot_bar(
+    df: pl.DataFrame, variable_name: str, lang: str, units: Optional[str] = None,
+) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=df["lcz"].cast(str),
         y=df["mean"],
-        error_y=dict(type="data", array=df["std"].fill_null(0)),
+        error_y=dict(type="data", array=df["std"].fill_null(0), color="#444444", thickness=1),
         marker_color=df["color"].to_list(),
         marker_line_color="black",
         marker_line_width=0.5,
-        customdata=df.select(["lcz_name", "n_pixels"]),
+        customdata=df.select(["lcz_name", "n_pixels", "std"]),
         hovertemplate=(
-            "<b>LCZ %{x}</b><br>%{customdata[0]}<br>"
-            f"{variable_name}: " + "%{y:.2f}<br>n pixels: %{customdata[1]}<extra></extra>"
+            "<b>LCZ %{x}</b> — %{customdata[0]}<br>"
+            f"mean: %{{y:.3f}}<br>"
+            "SD: %{customdata[2]:.3f}<br>"
+            "n pixels: %{customdata[1]}<extra></extra>"
         ),
     ))
     fig.update_layout(
-        title=dict(text=lcz_msg("cal_indexes_title", lang, variable=variable_name), x=0.5, xanchor="center"),
-        xaxis=dict(title="LCZ code", gridcolor="white"),
-        yaxis=dict(title=variable_name, gridcolor="#f0f0f0"),
-        plot_bgcolor="#fafafa", paper_bgcolor="white",
-        margin=dict(l=80, r=40, t=60, b=60), width=1000, height=600,
+        title=dict(
+            text=lcz_msg("cal_indexes_title", lang, variable=variable_name),
+            x=0.5, xanchor="center",
+        ),
+        xaxis=dict(title=dict(text=lcz_msg("lcz_code_label", lang)), gridcolor="white"),
+        yaxis=dict(title=dict(text=_axis_title(variable_name, units)),
+                   gridcolor="#f0f0f0", zeroline=False),
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(l=90, r=40, t=70, b=60), width=1000, height=600,
+        hoverlabel=dict(bgcolor="white"),
     )
     return fig
+
+
+def _valid_mask_per_band(
+    values: np.ndarray, max_workers: Optional[int] = None,
+) -> np.ndarray:
+    """``(n_bands, H, W)`` boolean finite mask, computed band-parallel.
+
+    Numpy releases the GIL for these reductions, so a small bounded thread
+    pool genuinely overlaps the per-band scans.
+    """
+    n_bands = values.shape[0]
+    workers = _resolve_workers(n_bands, max_workers)
+    if workers == 1 or n_bands == 1:
+        return np.isfinite(values)
+
+    mask = np.empty(values.shape, dtype=bool)
+    with ThreadPoolExecutor(max_workers=min(workers, n_bands)) as pool:
+        for i, band_mask in enumerate(pool.map(
+            lambda i: np.isfinite(values[i]), range(n_bands)
+        )):
+            mask[i] = band_mask
+    return mask
 
 
 def lcz_cal_indexes(
@@ -109,6 +192,9 @@ def lcz_cal_indexes(
     isave: bool = False,
     save_extension: str = "html",
     lang: str = "en",
+    units: Optional[str] = None,
+    style: str = "default",
+    max_workers: Optional[int] = None,
 ) -> Union[LCZIndexesResult, pl.DataFrame]:
     """Summarize a gridded variable (already aligned to an LCZ map) by class.
 
@@ -135,6 +221,14 @@ def lcz_cal_indexes(
         "html" (default, interactive) or a static image extension.
     lang : str
         Message language. Default "en".
+    units : str, optional
+        Variable units for the y-axis title. Defaults to
+        ``grid_result.units`` when set.
+    style : str
+        Publication style preset ("default"/"nature"/"science"/"generic_bw").
+    max_workers : int, optional
+        Bound on the thread pool used to scan the bands for valid pixels.
+        Default ``min(8, cpu_count)``.
 
     Returns
     -------
@@ -142,45 +236,65 @@ def lcz_cal_indexes(
         ``df`` has one row per LCZ class present: lcz, lcz_name, color,
         n_pixels, mean, std, min, max, median.
     """
-    with rasterio.open(str(x)) as src:
+    lcz_path = Path(x)
+    if not lcz_path.exists():
+        raise FileNotFoundError(f"LCZ map not found: {lcz_path}")
+
+    with rasterio.open(str(lcz_path)) as src:
         classes = src.read(1)
 
     values = _select_band(grid_result, band)
-    n_bands = values.shape[0]
-    tiled_classes = np.broadcast_to(classes, (n_bands,) + classes.shape)
+    if values.shape[1:] != classes.shape:
+        raise ValueError(
+            f"Grid data shape {values.shape[1:]} does not match LCZ map shape "
+            f"{classes.shape}. The lcz_grid_* result must be cropped to this "
+            "exact LCZ map (pass the same x used to download it)."
+        )
 
-    valid = (tiled_classes >= 1) & (tiled_classes <= 17) & np.isfinite(values)
+    n_bands = values.shape[0]
+    mask = _valid_mask_per_band(values, max_workers=max_workers)
+    class_mask = np.isfinite(classes) & (classes >= 1) & (classes <= 17)
+    valid = mask & class_mask[None, ...]
+
     if not valid.any():
         raise ValueError(lcz_msg("cal_indexes_no_overlap", lang))
 
+    tiled_classes = np.broadcast_to(classes, values.shape)
     df = _build_summary(tiled_classes[valid], values[valid])
     df = _attach_metadata(df, inclusive, lang)
+    if df.height == 0:  # pragma: no cover - valid.any() above already guards
+        raise ValueError(lcz_msg("cal_indexes_no_overlap", lang))
 
     variable_name = variable_name or (
         "+".join(grid_result.variables) if grid_result.variables else "value"
     )
+    units = units if units is not None else getattr(grid_result, "units", None)
 
     if not iplot:
+        if isave:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            df.write_csv(os.path.join(OUTPUT_DIR, "lcz_cal_indexes.csv"))
         return df
 
-    fig = _plot_bar(df, variable_name, lang)
+    fig = _plot_bar(df, variable_name, lang, units=units)
 
     if isave:
-        import os
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        plot_path = os.path.join(OUTPUT_DIR, f"lcz_cal_indexes.{save_extension}")
-        if save_extension == "html":
-            fig.write_html(plot_path)
-        else:
-            save_plotly_figure(
-                fig,
-                plot_path,
-                width_px=1200,
-                height_px=800,
-                scale=2,
-                save_extension=save_extension,
-                lang=lang,
-            )
+        finalize_export(
+            fig,
+            style=style,
+            isave=True,
+            save_extension=save_extension,
+            filename="lcz_cal_indexes",
+            column="double",
+            lang=lang,
+        )
         df.write_csv(os.path.join(OUTPUT_DIR, "lcz_cal_indexes.csv"))
+    else:
+        # Apply the publication template even when not saving.
+        finalize_export(fig, style=style, isave=False, lang=lang)
 
     return LCZIndexesResult(df=df, fig=fig)
+
+
+__all__ = ["lcz_cal_indexes", "LCZIndexesResult"]

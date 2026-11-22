@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Union
@@ -35,37 +36,62 @@ from scipy import stats as spstats
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-try:
-    import geoarrow.pyarrow as ga
-    HAS_GEOARROW = True
-except ImportError:
-    HAS_GEOARROW = False
-
 from LCZ4py.general.lcz_cal_area import _attach_metadata
 from LCZ4py.general.lcz_get_indices import LCZIndicesResult
-from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND
+from LCZ4py._internal.lcz_parameters_data import (
+    LCZ_COLORS, LCZ_COLORBLIND, PARAM_UNITS,
+)
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import get_style, save_plotly_figure
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
 
 
+def _resolve_workers(n_items: int, max_workers: Optional[int] = None) -> int:
+    """Bounded worker count: ``min(8, cpu_count, n_items)`` unless overridden."""
+    if max_workers is not None:
+        workers = int(max_workers)
+    else:
+        workers = min(8, os.cpu_count() or 4)
+    return max(1, min(workers, max(1, n_items)))
+
+
+def _axis_label(name: str) -> str:
+    """``'NDVI [-1 - 1]'`` — index name plus its documented unit bracket."""
+    units = PARAM_UNITS.get(name)
+    return f"{name} {units}" if units else name
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def _load_classes(lcz_map: Union[str, Path]) -> tuple[np.ndarray, tuple[int, int]]:
-    with rasterio.open(str(lcz_map)) as src:
+def _load_classes(
+    lcz_map: Union[str, Path],
+) -> tuple[np.ndarray, tuple[int, int], object, object]:
+    """Read the LCZ class raster; return (classes, shape, transform, crs)."""
+    path = Path(lcz_map)
+    if not path.exists():
+        raise FileNotFoundError(f"LCZ map not found: {path}")
+    with rasterio.open(str(path)) as src:
         classes = src.read(1)
         shape = (src.height, src.width)
-    return classes, shape
+        transform = src.transform
+        crs = src.crs
+    return classes, shape, transform, crs
 
 
 def _load_indices_stack(
     indices_x: Union[str, Path, LCZIndicesResult],
-) -> tuple[np.ndarray, list[str], tuple[int, int]]:
+) -> tuple[np.ndarray, list[str], tuple[int, int], object, object]:
+    """Return (array, band names, shape, transform, crs).
+
+    ``transform``/``crs`` are ``None`` for an in-memory ``LCZIndicesResult``
+    (alignment is then checked on shape only).
+    """
     if isinstance(indices_x, LCZIndicesResult):
         if indices_x.array is not None and indices_x.indices is not None:
-            arr = indices_x.array
-            return arr, list(indices_x.indices), arr.shape[1:]
+            arr = np.asarray(indices_x.array, dtype=np.float32)
+            return arr, list(indices_x.indices), arr.shape[1:], None, None
         if not indices_x.path or not os.path.exists(indices_x.path):
             raise ValueError(
                 "LCZIndicesResult has no array and no on-disk raster — call "
@@ -73,54 +99,86 @@ def _load_indices_stack(
             )
         indices_x = indices_x.path
 
-    with rasterio.open(str(indices_x)) as src:
-        arr = src.read()
+    path = Path(indices_x)
+    if not path.exists():
+        raise FileNotFoundError(f"Indices stack not found: {path}")
+    with rasterio.open(str(path)) as src:
+        arr = src.read(masked=True).astype(np.float32).filled(np.nan)
         names = [src.descriptions[i] or f"band_{i + 1}" for i in range(src.count)]
-    return arr, names, arr.shape[1:]
+        transform = src.transform
+        crs = src.crs
+    return arr, names, arr.shape[1:], transform, crs
 
 
 # ── Polars aggregation (generalizes lcz_cal_area's count/area pattern) ───────
 
+def _summarize_one(name: str, arr: np.ndarray, lcz_flat: np.ndarray, valid_lcz: np.ndarray) -> Optional[pl.DataFrame]:
+    """Per-LCZ descriptive statistics for one index (or None if all NaN)."""
+    val_flat = np.asarray(arr, dtype=np.float64).ravel()
+    keep = valid_lcz & np.isfinite(val_flat)
+    if not keep.any():
+        return None
+    return (
+        pl.DataFrame({"lcz": lcz_flat[keep], "value": val_flat[keep]})
+        .lazy()
+        .group_by("lcz")
+        .agg([
+            pl.len().alias("count"),
+            pl.col("value").mean().alias("mean"),
+            pl.col("value").median().alias("median"),
+            pl.col("value").std().alias("std"),
+            pl.col("value").min().alias("min"),
+            pl.col("value").max().alias("max"),
+            pl.col("value").quantile(0.25).alias("q25"),
+            pl.col("value").quantile(0.75).alias("q75"),
+        ])
+        .with_columns(pl.lit(name).alias("parameter"))
+        .sort("lcz")
+        .collect()
+    )
+
+
 def _build_indices_summary(
-    classes: np.ndarray, values: dict[str, np.ndarray],
+    classes: np.ndarray,
+    values: dict[str, np.ndarray],
+    max_workers: Optional[int] = None,
 ) -> pl.DataFrame:
-    """Per-(parameter, lcz) descriptive statistics, long format."""
-    lcz_flat = classes.astype(np.int16).ravel()
-    valid_lcz = (lcz_flat >= 1) & (lcz_flat <= 17)
+    """Per-(parameter, lcz) descriptive statistics, long format.
 
-    rows = []
-    for name, arr in values.items():
-        val_flat = arr.astype(np.float64).ravel()
-        keep = valid_lcz & np.isfinite(val_flat)
-        if not keep.any():
-            continue
-        agg = (
-            pl.DataFrame({"lcz": lcz_flat[keep], "value": val_flat[keep]})
-            .lazy()
-            .group_by("lcz")
-            .agg([
-                pl.len().alias("count"),
-                pl.col("value").mean().alias("mean"),
-                pl.col("value").median().alias("median"),
-                pl.col("value").std().alias("std"),
-                pl.col("value").min().alias("min"),
-                pl.col("value").max().alias("max"),
-                pl.col("value").quantile(0.25).alias("q25"),
-                pl.col("value").quantile(0.75).alias("q75"),
-            ])
-            .with_columns(pl.lit(name).alias("parameter"))
-            .sort("lcz")
-            .collect()
-        )
-        rows.append(agg)
+    Indices are aggregated in parallel (Polars releases the GIL inside each
+    group-by), and the output row order follows ``values`` regardless of the
+    worker count.
+    """
+    empty_schema = {
+        "lcz": pl.Int16, "count": pl.UInt32, "mean": pl.Float64,
+        "median": pl.Float64, "std": pl.Float64, "min": pl.Float64,
+        "max": pl.Float64, "q25": pl.Float64, "q75": pl.Float64,
+        "parameter": pl.String,
+    }
 
+    lcz_flat = np.asarray(classes).ravel()
+    valid_lcz = np.isfinite(lcz_flat) & (lcz_flat >= 1) & (lcz_flat <= 17)
+    if not valid_lcz.any():
+        return pl.DataFrame(schema=empty_schema)
+
+    # Normalize once: a single int16 copy shared by every index.
+    safe_lcz = np.zeros(lcz_flat.shape, dtype=np.int16)
+    safe_lcz[valid_lcz] = lcz_flat[valid_lcz].astype(np.int16)
+
+    items = list(values.items())
+    workers = _resolve_workers(len(items), max_workers)
+    if workers == 1 or len(items) == 1:
+        results = [_summarize_one(n, a, safe_lcz, valid_lcz) for n, a in items]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+            results = list(pool.map(
+                lambda item: _summarize_one(item[0], item[1], safe_lcz, valid_lcz),
+                items,
+            ))
+
+    rows = [r for r in results if r is not None]
     if not rows:
-        return pl.DataFrame(schema={
-            "lcz": pl.Int16, "count": pl.UInt32, "mean": pl.Float64,
-            "median": pl.Float64, "std": pl.Float64, "min": pl.Float64,
-            "max": pl.Float64, "q25": pl.Float64, "q75": pl.Float64,
-            "parameter": pl.String,
-        })
+        return pl.DataFrame(schema=empty_schema)
     return pl.concat(rows)
 
 
@@ -161,9 +219,10 @@ def _calculate_cohens_d(
     ``lcz_multi_app`` source app, whose Cohen's d is entirely
     ``np.random.uniform(-2, 2)``, never derived from actual pixel values).
     """
-    lcz_flat = classes.astype(np.int16).ravel()
-    urban_mask = (lcz_flat >= 1) & (lcz_flat <= 10)
-    natural_mask = (lcz_flat >= 11) & (lcz_flat <= 17)
+    lcz_flat = np.asarray(classes).ravel()
+    finite = np.isfinite(lcz_flat)
+    urban_mask = finite & (lcz_flat >= 1) & (lcz_flat <= 10)
+    natural_mask = finite & (lcz_flat >= 11) & (lcz_flat <= 17)
 
     rows = []
     for name, arr in values.items():
@@ -200,9 +259,17 @@ def _add_confidence_interval(df: pl.DataFrame, confidence: float = 0.95) -> pl.D
     effective-sample-size adjustment; fine for a quick descriptive chart,
     revisit if the CI needs to be publication-grade.
     """
-    n = df["count"].to_numpy()
-    std = df["std"].fill_null(0.0).to_numpy()
-    mean = df["mean"].to_numpy()
+    if not 0.0 < float(confidence) < 1.0:
+        raise ValueError(f"confidence must be in (0, 1), got {confidence!r}")
+    if df.height == 0:
+        return df.with_columns([
+            pl.Series("ci_lower", [], dtype=pl.Float64),
+            pl.Series("ci_upper", [], dtype=pl.Float64),
+        ])
+
+    n = df["count"].to_numpy().astype(np.float64)
+    std = df["std"].fill_null(0.0).to_numpy().astype(np.float64)
+    mean = df["mean"].to_numpy().astype(np.float64)
     se = std / np.sqrt(np.maximum(n, 1))
     tcrit = spstats.t.ppf(1 - (1 - confidence) / 2, np.maximum(n - 1, 1))
     half = tcrit * se
@@ -254,15 +321,17 @@ def _plot_box_interactive(df: pl.DataFrame, params: list[str], lang: str = "en")
                 ),
                 row=r, col=c,
             )
+        fig.update_yaxes(title=dict(text=_axis_label(param), font=dict(size=11)),
+                         row=r, col=c)
 
     fig.update_layout(
         title=dict(
             text=lcz_msg("indices_stats_title", lang),
-            font=dict(size=20), x=0.5, xanchor="center",
+            font=dict(size=18), x=0.5, xanchor="center",
         ),
-        plot_bgcolor="#fafafa",
+        plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=60, r=40, t=90, b=60),
+        margin=dict(l=70, r=30, t=90, b=60),
         width=420 * cols,
         height=380 * rows,
         hoverlabel=dict(bgcolor="white", font=dict(size=13)),
@@ -299,15 +368,17 @@ def _plot_bar_interactive(df: pl.DataFrame, params: list[str], lang: str = "en")
             ),
             row=r, col=c,
         )
+        fig.update_yaxes(title=dict(text=_axis_label(param), font=dict(size=11)),
+                         row=r, col=c)
 
     fig.update_layout(
         title=dict(
             text=lcz_msg("indices_stats_title", lang),
-            font=dict(size=20), x=0.5, xanchor="center",
+            font=dict(size=18), x=0.5, xanchor="center",
         ),
-        plot_bgcolor="#fafafa",
+        plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=60, r=40, t=90, b=60),
+        margin=dict(l=70, r=30, t=90, b=60),
         width=420 * cols,
         height=380 * rows,
         hoverlabel=dict(bgcolor="white", font=dict(size=13)),
@@ -319,7 +390,9 @@ def _plot_bar_interactive(df: pl.DataFrame, params: list[str], lang: str = "en")
 _MAGNITUDE_COLORS: dict[str, str] = {
     "N/A": "#999999",
 }
-_MAGNITUDE_COLOR_ORDER = ["#cccccc", "#91bfdb", "#fc8d59", "#d73027"]  # negligible -> large
+# Cividis-sampled, negligible -> large: monotonic in lightness and
+# colorblind-safe (unlike a red-green ramp).
+_MAGNITUDE_COLOR_ORDER = ["#d9d9d9", "#a59c74", "#575d6d", "#00204d"]
 
 
 def _plot_effect_size_interactive(cohens_d_df: pl.DataFrame, lang: str = "en") -> go.Figure:
@@ -381,19 +454,27 @@ def _plot_scatter_interactive(
     rasters — a scatter with millions of points bloats the HTML output and
     doesn't convey more information than a representative sample.
     """
-    lcz_flat = classes.astype(np.int16).ravel()
+    lcz_flat = np.asarray(classes).ravel()
     x = values[index_x].astype(np.float64).ravel()
     y = values[index_y].astype(np.float64).ravel()
-    valid = (lcz_flat >= 1) & (lcz_flat <= 17) & np.isfinite(x) & np.isfinite(y)
+    valid = (
+        np.isfinite(lcz_flat) & (lcz_flat >= 1) & (lcz_flat <= 17)
+        & np.isfinite(x) & np.isfinite(y)
+    )
     if size_by:
         s_all = values[size_by].astype(np.float64).ravel()
         valid &= np.isfinite(s_all)
 
     idx = np.where(valid)[0]
+    if len(idx) == 0:
+        raise ValueError(
+            f"No valid pixels for the scatter: {index_x}/{index_y} are NaN "
+            "wherever LCZ classes 1-17 are present."
+        )
     if len(idx) > max_points:
         idx = np.random.default_rng(seed).choice(idx, size=max_points, replace=False)
 
-    data = {"lcz": lcz_flat[idx], "x": x[idx], "y": y[idx]}
+    data = {"lcz": lcz_flat[idx].astype(np.int16), "x": x[idx], "y": y[idx]}
     if size_by:
         data["size"] = s_all[idx]
     df = pl.DataFrame(data)
@@ -402,9 +483,11 @@ def _plot_scatter_interactive(
     fig = go.Figure()
     for lcz_val in sorted(df["lcz"].unique().to_list()):
         sub = df.filter(pl.col("lcz") == lcz_val)
-        marker = dict(color=sub["color"][0], size=7, line=dict(color="black", width=0.3))
+        lcz_name = sub["lcz_name"].to_list()[0]
+        marker = dict(color=sub["color"].to_list()[0], size=7,
+                      line=dict(color="black", width=0.3))
         hovertemplate = (
-            f"<b>LCZ {lcz_val}</b> — {sub['lcz_name'][0]}<br>"
+            f"<b>LCZ {lcz_val}</b> — {lcz_name}<br>"
             f"{index_x}: %{{x:.3f}}<br>{index_y}: %{{y:.3f}}"
         )
         customdata = None
@@ -416,7 +499,7 @@ def _plot_scatter_interactive(
             customdata = sizes
         fig.add_trace(go.Scattergl(
             x=sub["x"], y=sub["y"], mode="markers", marker=marker,
-            name=str(sub["lcz_name"][0]), customdata=customdata,
+            name=lcz_name, customdata=customdata,
             hovertemplate=hovertemplate + "<extra></extra>",
         ))
 
@@ -502,27 +585,35 @@ def _plot_correlation_heatmap(
     56 available (e.g. LSWI/SOIL_MOISTURE/NDMI are literally the same
     formula and will show r=1.0).
     """
-    lcz_flat = classes.astype(np.int16).ravel()
-    valid = (lcz_flat >= 1) & (lcz_flat <= 17)
+    lcz_flat = np.asarray(classes).ravel()
+    valid = np.isfinite(lcz_flat) & (lcz_flat >= 1) & (lcz_flat <= 17)
     cols = {}
     for p in params:
-        v = values[p].astype(np.float64).ravel()
+        v = np.asarray(values[p], dtype=np.float64).ravel()
         valid = valid & np.isfinite(v)
         cols[p] = v
+    if len(params) < 2:
+        raise ValueError(
+            "plot_type='correlation' needs at least two indices to correlate."
+        )
+    if not valid.any():
+        raise ValueError(
+            "No valid (LCZ 1-17, finite) pixels to correlate — nothing to plot."
+        )
     df = pl.DataFrame(cols).filter(pl.Series(valid))
 
     corr = df.corr()
     z = corr.to_numpy()
 
     fig = go.Figure(go.Heatmap(
-        z=z, x=params, y=params, colorscale="RdBu_r", zmid=0, zmin=-1, zmax=1,
-        colorbar=dict(title=dict(text="Pearson r")),
+        z=z, x=params, y=params, colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        colorbar=dict(title=dict(text="Pearson r (dimensionless)")),
         hovertemplate="%{y} vs %{x}<br>r=%{z:.3f}<extra></extra>",
     ))
     fig.update_layout(
         title=dict(
             text=lcz_msg("indices_correlation_title", lang),
-            font=dict(size=20), x=0.5, xanchor="center",
+            font=dict(size=18), x=0.5, xanchor="center",
         ),
         xaxis=dict(tickangle=-45),
         yaxis=dict(autorange="reversed"),
@@ -534,11 +625,15 @@ def _plot_correlation_heatmap(
 
 
 def _to_geoarrow(df: pl.DataFrame) -> Optional[pa.Table]:
-    if not HAS_GEOARROW:
-        return None
+    """Statistics table as an Arrow table (no geometry -> plain Arrow).
+
+    Uses Polars' Arrow bridge, so the optional ``geoarrow`` package is not
+    needed for this (non-spatial) table.
+    """
     try:
-        return pa.Table.from_pandas(df.to_pandas())
-    except Exception:
+        return df.to_arrow()
+    except Exception as exc:  # noqa: BLE001 - pyarrow/polars interop edge case
+        logger.warning("Could not convert statistics table to Arrow: %s", exc)
         return None
 
 
@@ -575,6 +670,8 @@ def lcz_cal_indices(
     subtitle: Optional[str] = None,
     caption: Optional[str] = None,
     lang: str = "en",
+    style: str = "default",
+    max_workers: Optional[int] = None,
 ) -> Union[LCZIndicesStatsResult, pl.DataFrame]:
     """Per-LCZ-class descriptive statistics and charts for spectral indices.
 
@@ -637,6 +734,12 @@ def lcz_cal_indices(
         Figure annotations.
     lang : str
         Message language ("en"/"pt"/"es"/"zh").
+    style : str
+        Publication style preset applied to every returned figure
+        ("default", "nature", "science", "generic_bw").
+    max_workers : int, optional
+        Bound on the thread pool used to aggregate indices in parallel.
+        Default ``min(8, cpu_count)``. Output row order is independent of it.
 
     Returns
     -------
@@ -666,21 +769,44 @@ def lcz_cal_indices(
     if plot_type == "scatter" and not (index_x and index_y):
         raise ValueError("plot_type='scatter' requires both index_x and index_y")
 
-    classes, lcz_shape = _load_classes(lcz_map)
-    stack, band_names, idx_shape = _load_indices_stack(indices_x)
+    spec = get_style(style, lang)
+
+    classes, lcz_shape, lcz_transform, lcz_crs = _load_classes(lcz_map)
+    stack, band_names, idx_shape, idx_transform, idx_crs = _load_indices_stack(indices_x)
 
     if lcz_shape != idx_shape:
         raise ValueError(lcz_msg(
             "indices_shape_mismatch", lang, lcz_shape=lcz_shape, idx_shape=idx_shape,
         ))
+    # Same shape is not enough: the two rasters must share the same grid.
+    if idx_transform is not None and lcz_transform is not None:
+        if not lcz_transform.almost_equals(idx_transform, precision=1e-9):
+            raise ValueError(
+                "The LCZ map and the indices stack share a shape but not a "
+                f"transform:\n  lcz: {tuple(lcz_transform)[:6]}\n  idx: "
+                f"{tuple(idx_transform)[:6]}\nRecompute the indices on this "
+                "exact LCZ map grid."
+            )
+    if idx_crs is not None and lcz_crs is not None and idx_crs != lcz_crs:
+        raise ValueError(
+            f"The LCZ map ({lcz_crs}) and the indices stack ({idx_crs}) have "
+            "different CRSs. Recompute the indices on this exact LCZ map grid."
+        )
+
+    if not band_names:
+        raise ValueError("The indices stack has no bands.")
 
     if indices is not None:
+        if isinstance(indices, str):
+            indices = [indices]
         missing = [n for n in indices if n not in band_names]
         if missing:
             raise ValueError(f"Index/indices not found in indices_x: {missing}. Available: {band_names}")
-        selected = list(indices)
+        selected = list(dict.fromkeys(indices))  # de-duplicate, keep order
     else:
         selected = list(band_names)
+    if not selected:
+        raise ValueError("No indices selected to summarize.")
 
     for name, arg in (("index_x", index_x), ("index_y", index_y), ("size_by", size_by)):
         if arg and arg not in band_names:
@@ -692,10 +818,24 @@ def lcz_cal_indices(
         if extra and extra not in values:
             values[extra] = stack[band_names.index(extra)]
 
-    df = _build_indices_summary(classes, selected_values)
+    df = _build_indices_summary(classes, selected_values, max_workers=max_workers)
     df = _add_confidence_interval(df, confidence=confidence)
     df = _attach_metadata(df, inclusive, lang=lang)
     df = _attach_type(df, lang=lang)
+
+    if df.height == 0:
+        raise ValueError(
+            "No valid pixels: every selected index is NaN (or the LCZ map has "
+            "no classes 1-17) over the shared grid. Nothing to summarize."
+        )
+
+    summarized = set(df["parameter"].unique().to_list())
+    missing_params = [p for p in selected if p not in summarized]
+    if missing_params:
+        logger.warning(
+            "These indices are all-NaN over valid LCZ pixels and are omitted "
+            "from the statistics/charts: %s", missing_params,
+        )
 
     if not iplot:
         return df.drop("color")
@@ -703,6 +843,11 @@ def lcz_cal_indices(
     cohens_d_df = None
     if plot_type in ("effect_size", "all"):
         cohens_d_df = _calculate_cohens_d(classes, selected_values, lang=lang)
+        if plot_type == "effect_size" and cohens_d_df.height == 0:
+            raise ValueError(
+                "Cannot compute Cohen's d: need at least 2 finite pixels in "
+                "both built-up (LCZ 1-10) and natural (LCZ 11-17) groups."
+            )
 
     if plot_type == "box":
         fig = _plot_box_interactive(df, selected, lang=lang)
@@ -754,6 +899,8 @@ def lcz_cal_indices(
                 text=caption, xref="paper", yref="paper", x=0.5, y=-0.08,
                 showarrow=False, font=dict(size=10, color="gray"),
             )
+        # Publication style: consistent fonts/margins/ticks across figures.
+        f.update_layout(template=spec.template)
 
     geoarrow_table = _to_geoarrow(df.drop("color"))
 
@@ -765,7 +912,13 @@ def lcz_cal_indices(
             if save_extension == "html":
                 f.write_html(plot_path, include_plotlyjs="cdn")
             else:
-                f.write_image(plot_path, width=1200, height=800, scale=2)
+                width_px = int(f.layout.width or 1200)
+                height_px = int(f.layout.height or 800)
+                save_plotly_figure(
+                    f, plot_path,
+                    width_px=width_px, height_px=height_px, scale=2,
+                    save_extension=save_extension, lang=lang,
+                )
         csv_path = os.path.join(OUTPUT_DIR, "lcz4r_indices_df.csv")
         df.drop("color").write_csv(csv_path)
         if cohens_d_df is not None:

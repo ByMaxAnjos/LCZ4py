@@ -4,71 +4,83 @@ lcz_uhi_intensity.py — Urban Heat Island intensity from LCZ-stratified station
 Urban (LCZ 1–10) and rural (LCZ 11–16) stations are either chosen automatically
 from the LCZ raster or supplied manually. UHI = T_urban − T_rural.
 
-Plotting uses Plotly with optional dual y-axes (urban/rural temps + UHI).
+Thresholds follow the standard canopy-layer UHI definition: a timestamp is only
+kept when *both* a valid urban and a valid rural observation exist, so a missing
+rural reference never silently becomes a zero anomaly.
 """
 
 from __future__ import annotations
+import logging
 import os
 from typing import Optional, Sequence, Union
 
-import numpy as np
 import polars as pl
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import rasterio
 
 try:
-    from numba import njit
+    from numba import njit  # noqa: F401 - optional acceleration, API parity
     HAS_NUMBA = True
-except ImportError:
+except ImportError:  # pragma: no cover - depends on the local environment
     HAS_NUMBA = False
 
 from LCZ4py._internal.lcz_ts_utils import (
     load_lcz_raster, normalise_input_df, normalise_missing,
-    select_by_date, extract_lcz_at_points, lcz_palette, OUTPUT_DIR,
-    add_by_column, by_sorted_groups, _break_gaps_numpy,
+    select_by_date, assign_station_lcz, lcz_palette,
+    require_nonempty, add_by_column, by_sorted_groups,
+    _break_gaps_numpy, gap_threshold_hours,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import finalize_export
 
+logger = logging.getLogger(__name__)
+
 URBAN_CLASSES = [str(i) for i in range(1, 11)]
 RURAL_CLASSES = [str(i) for i in range(11, 17)]
+
+_TIME_FREQ = {"hour": "1h", "day": "1d", "month": "1mo", "year": "1y"}
 
 
 # ── Time averaging ────────────────────────────────────────────────────────────
 
 def _time_avg(df: pl.DataFrame, freq: str) -> pl.DataFrame:
-    freq_map = {"hour": "1h", "day": "1d", "month": "1mo", "year": "1y"}
+    if freq not in _TIME_FREQ:
+        raise ValueError(f"time_freq must be one of {tuple(_TIME_FREQ)}, got {freq!r}")
     return (
         df.sort("date")
-          .group_by_dynamic("date", every=freq_map.get(freq, "1h"), closed="left")
+          .group_by_dynamic("date", every=_TIME_FREQ[freq], closed="left")
           .agg(pl.col("var_interp").mean())
     )
 
 
 # ── Plotly figures ────────────────────────────────────────────────────────────
 
+def _gapped(dates_np, values_np):
+    """Break a line where observations are missing."""
+    threshold_h = gap_threshold_hours(dates_np)
+    return _break_gaps_numpy(dates_np, values_np, threshold_h)
+
+
 def _plot_single(df: pl.DataFrame, title: str, xlab: str, ylab: str) -> go.Figure:
     fig = go.Figure()
     dates_np = df["date"].to_numpy()
     vals_np = df["uhi"].to_numpy()
-    if len(dates_np) > 2:
-        diffs_h = np.diff(dates_np.astype("datetime64[s]")).astype(np.float64) / 3600
-        pos = diffs_h[diffs_h > 0]
-        threshold_h = max(2.0 * float(np.median(pos)), 1.5) if len(pos) else 2.0
-        dates_p, vals_p = _break_gaps_numpy(dates_np, vals_np, threshold_h)
-    else:
-        dates_p, vals_p = list(dates_np), list(vals_np)
+    dates_p, vals_p = _gapped(dates_np, vals_np)
     fig.add_trace(go.Scatter(
         x=dates_p, y=vals_p,
         mode="lines", name="UHI",
         line=dict(color="#333333", width=1.5),
         hovertemplate=f"{ylab}: %{{y:.2f}}<extra></extra>",
     ))
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
     fig.update_layout(
         title=dict(text=title, font=dict(size=20), x=0.5, xanchor="center"),
-        xaxis=dict(title=dict(text=xlab, font=dict(size=14)), tickfont=dict(size=12), gridcolor="#f0f0f0"),
-        yaxis=dict(title=dict(text=ylab, font=dict(size=14)), tickfont=dict(size=12), gridcolor="#f0f0f0"),
+        xaxis=dict(title=dict(text=xlab, font=dict(size=14)),
+                   tickfont=dict(size=12), gridcolor="#f0f0f0"),
+        yaxis=dict(title=dict(text=ylab, font=dict(size=14)),
+                   tickfont=dict(size=12), gridcolor="#f0f0f0",
+                   zeroline=True, zerolinecolor="#aaaaaa"),
         plot_bgcolor="#fafafa",
         paper_bgcolor="white",
         margin=dict(l=80, r=40, t=70, b=60),
@@ -89,19 +101,10 @@ def _plot_dual(
 ) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     dates_np = df["date"].to_numpy()
-    if len(dates_np) > 2:
-        diffs_h = np.diff(dates_np.astype("datetime64[s]")).astype(np.float64) / 3600
-        pos = diffs_h[diffs_h > 0]
-        threshold_h = max(2.0 * float(np.median(pos)), 1.5) if len(pos) else 2.0
-    else:
-        threshold_h = 2.0
 
-    def _gapped_series(col: str):
-        return _break_gaps_numpy(dates_np, df[col].to_numpy(), threshold_h)
-
-    u_d, u_v = _gapped_series("urban")
-    r_d, r_v = _gapped_series("rural")
-    h_d, h_v = _gapped_series("uhi")
+    u_d, u_v = _gapped(dates_np, df["urban"].to_numpy())
+    r_d, r_v = _gapped(dates_np, df["rural"].to_numpy())
+    h_d, h_v = _gapped(dates_np, df["uhi"].to_numpy())
 
     fig.add_trace(
         go.Scatter(x=u_d, y=u_v, name="Urban",
@@ -128,17 +131,68 @@ def _plot_dual(
     fig.update_yaxes(
         title_text=ylab2, secondary_y=True,
         tickfont=dict(size=12),
+        zeroline=True, zerolinecolor="#aaaaaa",
     )
     fig.update_layout(
         title=dict(text=title, font=dict(size=20), x=0.5, xanchor="center"),
-        xaxis=dict(title=dict(text=xlab, font=dict(size=14)), tickfont=dict(size=12), gridcolor="#f0f0f0"),
+        xaxis=dict(title=dict(text=xlab, font=dict(size=14)),
+                   tickfont=dict(size=12), gridcolor="#f0f0f0"),
         plot_bgcolor="#fafafa",
         paper_bgcolor="white",
         margin=dict(l=80, r=80, t=70, b=60),
         hovermode="x unified",
         hoverlabel=dict(bgcolor="white", font=dict(size=13)),
+        legend=dict(orientation="h", x=0.5, xanchor="center", y=1.05),
     )
     return fig
+
+
+def _dominant_lcz(df: pl.DataFrame, ids: Sequence[str]) -> Optional[str]:
+    """Most frequent LCZ class among the given stations (``None`` if empty)."""
+    if not ids:
+        return None
+    sub = df.filter(pl.col("station").is_in(list(ids)))
+    if sub.is_empty():
+        return None
+    mode = sub["lcz"].drop_nulls().mode()
+    return str(mode[0]) if mode.len() else None
+
+
+def _wide_from_avg(avg: pl.DataFrame, index_cols: list[str]) -> pl.DataFrame:
+    """Pivot long urban/rural means into a wide frame with a ``uhi`` column."""
+    if avg.is_empty():
+        raise ValueError(
+            "No averaged observations are available — the date range and "
+            "station filter removed every record."
+        )
+    wide = avg.pivot(index=index_cols, on="reference", values="var_interp")
+    for col in ("urban", "rural"):
+        if col not in wide.columns:
+            logger.warning(
+                "No '%s' observation in any time bin; UHI cannot be computed "
+                "for this selection.", col,
+            )
+            wide = wide.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
+
+    # Keep the urban/rural means, but only where *both* sides exist: a missing
+    # rural reference must not be treated as a zero-temperature baseline.
+    n_bins = wide.height
+    wide = wide.with_columns(
+        (pl.col("urban") - pl.col("rural")).round(2).alias("uhi")
+    ).drop_nulls(subset=["urban", "rural"])
+    dropped = n_bins - wide.height
+    if dropped:
+        logger.warning(
+            "Dropped %d/%d time bin(s) where the urban or rural mean was "
+            "missing (UHI needs both).", dropped, n_bins,
+        )
+    if wide.is_empty():
+        raise ValueError(
+            "No time bin has both an urban and a rural observation — cannot "
+            "compute UHI intensity. Check the station selection and the "
+            "date range."
+        )
+    return wide.sort(index_cols)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -182,7 +236,7 @@ def lcz_uhi_intensity(
         Column name for the meteorological variable.
     station_id : str
         Column name for the station identifier.
-    time_freq : {"hour", "day", "month"}
+    time_freq : {"hour", "day", "month", "year"}
         Time-averaging frequency.
     by : str, optional
         Split the UHI computation into faceted subplots by temporal group.
@@ -218,50 +272,85 @@ def lcz_uhi_intensity(
         Small annotation added below the chart.
     lang : str
         Language for labels — ``"en"``, ``"pt"``, ``"es"``, or ``"zh"``.
+    year, month, day, hour : int or sequence, optional
+        Date/time component filters (validated; out-of-range values raise).
+    start, end : str or datetime, optional
+        Inclusive date range bounds.
 
     Returns
     -------
     go.Figure or pl.DataFrame
-        Wide DataFrame has columns: date, urban, rural, uhi.
+        Wide DataFrame has columns: date, urban, rural, uhi (+ ``_by`` when
+        ``by=`` is used).
+
+    Raises
+    ------
+    ValueError
+        If no urban/rural pair can be formed, ``method="manual"`` is missing
+        its station lists, or the selection leaves no usable time bin.
     """
     if data_frame is None:
         raise ValueError("data_frame is required.")
+    if time_freq not in _TIME_FREQ:
+        raise ValueError(
+            f"time_freq must be one of {tuple(_TIME_FREQ)}, got {time_freq!r}"
+        )
+    method_key = str(method).lower()
+    if method_key not in ("lcz", "manual"):
+        raise ValueError(f"method must be 'LCZ' or 'manual', got {method!r}")
 
-    df = normalise_input_df(
-        data_frame.to_pandas() if isinstance(data_frame, pl.DataFrame) else data_frame,
-        var=var, station_id=station_id,
-    )
+    df = normalise_input_df(data_frame, var=var, station_id=station_id)
     df = select_by_date(
         normalise_missing(df, ("var_interp",)),
         year=year, month=month, day=day, hour=hour, start=start, end=end,
     )
-    df = df.filter(pl.col("var_interp").is_not_null() & pl.col("latitude").is_not_null())
+    df = df.filter(pl.col("var_interp").is_not_null())
+    require_nonempty(df, "observations")
 
     ds = load_lcz_raster(x)
-    stations = df.unique(subset=["latitude", "longitude"])
-    lcz_vals, mask = extract_lcz_at_points(
-        ds, stations["longitude"].to_numpy(), stations["latitude"].to_numpy()
-    )
-    stations = stations.with_columns(
-        pl.Series(name="lcz", values=np.where(mask, lcz_vals, 0))
-    )
-    df = df.join(stations.select(["latitude", "longitude", "lcz"]), on=["latitude", "longitude"], how="left")
-    df = df.filter(pl.col("lcz").is_between(1, 17)).with_columns(pl.col("lcz").cast(str))
+    df = assign_station_lcz(df, ds)
+    require_nonempty(df, "observations at stations inside the LCZ raster")
+    df = df.with_columns(pl.col("lcz").cast(pl.String))
 
-    if method == "LCZ":
+    if method_key == "lcz":
         u_ids = df.filter(pl.col("lcz").is_in(URBAN_CLASSES))["station"].unique().to_list()
         r_ids = df.filter(pl.col("lcz").is_in(RURAL_CLASSES))["station"].unique().to_list()
         if not u_ids or not r_ids:
-            raise ValueError(lcz_msg("no_urban_rural", lang))
+            raise ValueError(
+                lcz_msg("no_urban_rural", lang)
+                + f" Found urban={len(u_ids)}, rural={len(r_ids)} station(s) "
+                f"among classes {sorted(df['lcz'].unique().to_list())}."
+            )
     else:
         u_ids = [str(s) for s in (T_urban or [])]
         r_ids = [str(s) for s in (T_rural or [])]
+        if not u_ids or not r_ids:
+            raise ValueError(
+                "method='manual' requires non-empty T_urban and T_rural station "
+                f"lists (got {len(u_ids)} and {len(r_ids)})."
+            )
+        missing = [
+            sid for sid in (u_ids + r_ids)
+            if sid not in set(df["station"].unique().to_list())
+        ]
+        if missing:
+            raise ValueError(
+                "These T_urban/T_rural station IDs are not in the data (after "
+                f"filtering and LCZ matching): {missing}"
+            )
+
+    overlap = set(u_ids) & set(r_ids)
+    if overlap:
+        logger.warning(
+            "%d station(s) listed as both urban and rural; they are treated as "
+            "urban: %s", len(overlap), sorted(overlap)[:10],
+        )
 
     palette = lcz_palette()
-    u_lcz = df.filter(pl.col("station").is_in(u_ids))["lcz"].mode()[0]
-    r_lcz = df.filter(pl.col("station").is_in(r_ids))["lcz"].mode()[0]
-    u_color = palette.get(u_lcz, "#CC3333")
-    r_color = palette.get(r_lcz, "#3366CC")
+    u_lcz = _dominant_lcz(df, u_ids)
+    r_lcz = _dominant_lcz(df, r_ids)
+    u_color = palette.get(u_lcz, "#CC3333") if u_lcz else "#CC3333"
+    r_color = palette.get(r_lcz, "#3366CC") if r_lcz else "#3366CC"
 
     model_df = df.filter(pl.col("station").is_in(u_ids + r_ids)).with_columns(
         pl.when(pl.col("station").is_in(u_ids))
@@ -269,31 +358,26 @@ def lcz_uhi_intensity(
         .otherwise(pl.lit("rural"))
         .alias("reference")
     )
+    require_nonempty(model_df, "selected urban/rural observations")
 
-    freq_map = {"hour": "1h", "day": "1d", "month": "1mo", "year": "1y"}
-    p_freq = freq_map.get(time_freq, "1h")
+    p_freq = _TIME_FREQ[time_freq]
 
     if by is not None:
         lat_mean = float(df["latitude"].mean())
         lon_mean = float(df["longitude"].mean())
         model_df = add_by_column(model_df, by, lat=lat_mean, lon=lon_mean)
-        group_by_cols = ["reference", "_by"]
+        group_by_cols: Union[list[str], str] = ["reference", "_by"]
         pivot_index = ["date", "_by"]
     else:
         group_by_cols = "reference"
-        pivot_index = "date"
+        pivot_index = ["date"]
 
     avg = (
         model_df.sort("date")
         .group_by_dynamic("date", every=p_freq, closed="left", group_by=group_by_cols)
         .agg(pl.col("var_interp").mean())
     )
-    wide = avg.pivot(index=pivot_index, on="reference", values="var_interp").drop_nulls(
-        subset=["urban", "rural"]
-    )
-    wide = wide.with_columns(
-        (pl.col("urban") - pl.col("rural")).round(2).alias("uhi")
-    )
+    wide = _wide_from_avg(avg, pivot_index)
 
     if not iplot:
         return wide
@@ -305,7 +389,7 @@ def lcz_uhi_intensity(
 
     if by is not None:
         groups = by_sorted_groups(wide["_by"], by)
-        n = len(groups)
+        n = max(len(groups), 1)
         specs = [[{"secondary_y": True}]] * n if group else [[{}]] * n
         fig = make_subplots(
             rows=n, cols=1,
@@ -315,7 +399,7 @@ def lcz_uhi_intensity(
             specs=specs,
         )
         for i, g in enumerate(groups, 1):
-            sub = wide.filter(pl.col("_by") == g)
+            sub = wide.filter(pl.col("_by") == g).sort("date")
             if sub.is_empty():
                 continue
             if group:
@@ -358,7 +442,7 @@ def lcz_uhi_intensity(
     if caption:
         fig.add_annotation(
             text=caption, xref="paper", yref="paper",
-            x=0.5, y=-0.05, showarrow=False,
+            x=0.5, y=-0.08, showarrow=False,
             font=dict(size=10, color="gray"),
         )
 

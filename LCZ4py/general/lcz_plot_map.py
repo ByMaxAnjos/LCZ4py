@@ -1,11 +1,16 @@
 """
 lcz_plot_map.py
 
-Ultra-fast interactive LCZ map visualization with:
-- Plotly WebGL for smooth panning/zooming
-- GeoArrow for efficient categorical data handling
-- DuckDB Spatial for fast legend computation
-- ExactExtract for zonal statistics on hover
+Publication-quality LCZ map visualization.
+
+- Plotly WebGL traces for smooth panning/zooming on large rasters
+- Optional MapLibre/OSM basemap renderer
+- LCZ legend ordered by class, labelled from ``lcz_parameters_data``
+- North arrow + scale bar for projected CRSs (via ``lcz_theme``)
+- 300 dpi static export with the journal style presets
+
+Optional dependencies (duckdb, geoarrow) are guarded with ``HAS_*`` flags and
+fall back to the core Polars/NumPy implementation.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Union, Literal
@@ -27,29 +32,51 @@ from rasterio.features import shapes
 from shapely.geometry import shape
 
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-# GeoArrow
-try:
+# GeoArrow (optional)
+try:  # pragma: no cover - depends on the environment
     import geoarrow.pyarrow as ga
-    import geoarrow.pandas as gap
+    import geoarrow.pandas as gap  # noqa: F401 - registers the pandas extension
+
     HAS_GEOARROW = True
-except ImportError:
+except ImportError:  # pragma: no cover
+    ga = None  # type: ignore[assignment]
     HAS_GEOARROW = False
 
-# DuckDB Spatial
-try:
+# DuckDB Spatial (optional)
+try:  # pragma: no cover - depends on the environment
     import duckdb
+
     HAS_DUCKDB = True
-except ImportError:
+except ImportError:  # pragma: no cover
+    duckdb = None  # type: ignore[assignment]
     HAS_DUCKDB = False
 
-from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND, LCZ_NAMES, LCZ_IDS, get_lcz_names
+from LCZ4py._internal.lcz_parameters_data import (
+    LCZ_COLORS,
+    LCZ_COLORBLIND,
+    LCZ_NAMES,
+    get_lcz_names,
+)
 from LCZ4py._internal.i18n_messages import lcz_msg
-from LCZ4py._internal.lcz_theme import finalize_export, add_map_furniture
+from LCZ4py._internal.lcz_theme import (
+    add_map_furniture,
+    finalize_export,
+    get_style,
+    save_plotly_figure,
+)
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
+
+# Default cartographic credit line. Overridable through ``attribution=``.
+DEFAULT_ATTRIBUTION = "LCZ4py | Stewart & Oke (2012) LCZ scheme"
+BASEMAP_ATTRIBUTION = "OpenStreetMap contributors | OpenFreeMap | © OpenMapTiles"
+
+# Effective minimum resolution for static exports. The "default" style preset
+# targets 150 dpi for screen use; publication exports are rasterised at 300 dpi
+# (Plotly's ``scale`` multiplies the style's native dpi).
+MIN_STATIC_DPI = 300
 
 
 # ── Pre-computed color lookup table (GPU-friendly) ────────────────────────────
@@ -57,7 +84,7 @@ OUTPUT_DIR = "LCZ4r_output"
 @lru_cache(maxsize=2)
 def _build_color_lut(inclusive: bool) -> np.ndarray:
     """Build a lookup table: index -> RGBA as uint8.
-    
+
     Returns (18, 4) array where:
     - Index 0: transparent (nodata)
     - Indices 1-17: LCZ class colors
@@ -70,16 +97,26 @@ def _build_color_lut(inclusive: bool) -> np.ndarray:
     return lut
 
 
+def _present_classes(arr: np.ndarray) -> list[int]:
+    """Sorted LCZ classes present in ``arr`` (1-17 only, ordered by class)."""
+    valid = arr[(arr >= 1) & (arr <= 17)]
+    if valid.size == 0:
+        return []
+    return [int(v) for v in np.unique(valid)]
+
+
 def _arr_to_png_datauri(rgba: np.ndarray) -> str:
     """Encode RGBA (H,W,4) uint8 array as a PNG data URI."""
     try:
         from PIL import Image
         import io as _io
+
         buf = _io.BytesIO()
         Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
-    except ImportError:
+    except ImportError:  # pragma: no cover - Pillow ships with matplotlib
         from rasterio.io import MemoryFile
+
         h, w = rgba.shape[:2]
         with MemoryFile() as mf:
             with mf.open(driver="PNG", height=h, width=w, count=4, dtype="uint8") as dst:
@@ -87,6 +124,149 @@ def _arr_to_png_datauri(rgba: np.ndarray) -> str:
             b64 = base64.b64encode(mf.read()).decode()
     return f"data:image/png;base64,{b64}"
 
+
+# ── Publication export helper ────────────────────────────────────────────────
+
+def _finalize_publication(
+    fig: go.Figure,
+    *,
+    style: str,
+    isave: bool,
+    save_extension: str,
+    filename: str,
+    dpi: Optional[int] = None,
+    lang: str = "en",
+) -> go.Figure:
+    """Save ``fig`` through ``lcz_theme``, guaranteeing >=300 dpi static output.
+
+    ``finalize_export`` rasterises at the style preset's own dpi (150 for
+    "default"), which is too low for print. Here we compute the pixel size at
+    the requested resolution and let Plotly's ``scale`` factor reach it, while
+    reusing the preset's mm-based figure geometry.
+    """
+    if not (isave and save_extension != "html"):
+        return finalize_export(
+            fig, style=style, isave=isave, save_extension=save_extension,
+            filename=filename, lang=lang,
+        )
+
+    spec = get_style(style, lang)
+    target_dpi = int(dpi) if dpi else max(spec.dpi, MIN_STATIC_DPI)
+    if target_dpi < 1:
+        raise ValueError("dpi must be a positive integer")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    save_path = os.path.join(OUTPUT_DIR, f"{filename}.{save_extension}")
+    width_mm = spec.width_mm.get("single", 120)
+    # Preserve the figure's own aspect ratio (maps are 4:3, pies are almost
+    # square, facets are wider than tall). Squashing every chart into a fixed
+    # 3:4 box made multi-panel figures unreadable.
+    try:
+        fig_w = float(fig.layout.width or 0)
+        fig_h = float(fig.layout.height or 0)
+    except (TypeError, ValueError):  # pragma: no cover - layout is always numeric
+        fig_w = fig_h = 0.0
+    aspect = (fig_h / fig_w) if (fig_w > 0 and fig_h > 0) else 0.75
+    height_mm = max(30.0, min(spec.max_height_mm, width_mm * aspect))
+    width_px = max(1, round(width_mm / 25.4 * target_dpi))
+    height_px = max(1, round(height_mm / 25.4 * target_dpi))
+    scale = max(1, round(target_dpi / spec.dpi))
+
+    fig.update_layout(template=spec.template)
+
+    if save_extension == "tiff":
+        png_path = os.path.join(OUTPUT_DIR, f"{filename}.png")
+        save_plotly_figure(
+            fig, png_path, width_px=width_px, height_px=height_px,
+            scale=scale, save_extension="png", lang=lang,
+        )
+        from PIL import Image
+
+        with Image.open(png_path) as img:
+            img.save(save_path, dpi=(target_dpi, target_dpi))
+        os.remove(png_path)
+    else:
+        save_plotly_figure(
+            fig, save_path, width_px=width_px, height_px=height_px,
+            scale=scale, save_extension=save_extension, lang=lang,
+        )
+        if save_extension == "png":
+            # Plotly/Kaleido writes no DPI tag; journals check it, so tag the
+            # PNG with the effective resolution (lossless re-encode).
+            from PIL import Image
+
+            with Image.open(save_path) as img:
+                img.save(save_path, pnginfo=None, dpi=(target_dpi, target_dpi))
+
+    logger.info("Saved: %s", os.path.abspath(save_path))
+    return fig
+
+
+def _ensure_bottom_margin(fig: go.Figure, needed_px: float) -> None:
+    """Grow the bottom margin so panels can sit *below* the map frame.
+
+    Annotations placed at negative paper-y are clipped when the margin is too
+    small — captions and credit lines used to disappear from static exports.
+    """
+    try:
+        current = getattr(fig.layout.margin, "b", None) or 0
+    except Exception:  # pragma: no cover - margin always exists
+        current = 0
+    if current < needed_px:
+        fig.update_layout(margin=dict(b=needed_px))
+
+
+def _bottom_text_y(fig: go.Figure, margin_px: float) -> float:
+    """Paper-y for a text line that sits just above the figure's bottom edge."""
+    try:
+        height = float(fig.layout.height or 0) or 700.0
+    except (TypeError, ValueError):  # pragma: no cover
+        height = 700.0
+    return -max(0.0, (margin_px - 28.0)) / height
+
+
+def _add_attribution(fig: go.Figure, text: Optional[str]) -> None:
+    """Credit line placed below the frame, right-aligned (print-safe)."""
+    if not text:
+        return
+    _ensure_bottom_margin(fig, 58)
+    fig.add_annotation(
+        text=text,
+        xref="paper", yref="paper",
+        x=1.0, y=_bottom_text_y(fig, float(fig.layout.margin.b or 58)),
+        xanchor="right", yanchor="top",
+        showarrow=False,
+        font=dict(size=8, color="rgba(60,60,60,0.95)"),
+    )
+
+
+def _add_caption(fig: go.Figure, caption: Optional[str]) -> None:
+    """Figure caption below the panel, left-aligned, in paper coordinates.
+
+    Cartesian charts (bar/pie) have tick labels and an axis title inside the
+    bottom margin, so they need a deeper margin than a map panel; the caption
+    is anchored to the figure's bottom edge either way.
+    """
+    if not caption:
+        return
+    try:
+        is_chart = fig.layout.xaxis.showticklabels is not False
+    except Exception:  # pragma: no cover - layout always exists
+        is_chart = False
+    needed = 96 if is_chart else 58
+    _ensure_bottom_margin(fig, needed)
+    fig.add_annotation(
+        text=caption,
+        xref="paper", yref="paper",
+        x=0.0, y=_bottom_text_y(fig, float(fig.layout.margin.b or needed)),
+        xanchor="left", yanchor="top",
+        showarrow=False,
+        align="left",
+        font=dict(size=8, color="rgba(60,60,60,0.95)"),
+    )
+
+
+# ── Basemap renderer (MapLibre / plotly mapbox backend) ─────────────────────
 
 def _create_basemap_fig(
     arr: np.ndarray,
@@ -96,6 +276,7 @@ def _create_basemap_fig(
     title: Optional[str],
     opacity: float,
     lang: str = "en",
+    attribution: Optional[str] = None,
 ) -> go.Figure:
     """Plotly figure with OpenStreetMap basemap and LCZ raster overlay.
 
@@ -105,12 +286,15 @@ def _create_basemap_fig(
     without any CDN/CSP issues.
     """
     import math
+
     xmin, xmax, ymin, ymax = extent
     center_lon = (xmin + xmax) / 2
     center_lat = (ymin + ymax) / 2
 
     # Rough zoom from extent size
     span = max(xmax - xmin, ymax - ymin)
+    if span <= 0:
+        raise ValueError("Extent has zero width/height; cannot compute a map zoom.")
     zoom = max(1, min(15, round(math.log2(360 / (span + 1e-9))) - 1))
 
     lut = _build_color_lut(inclusive)
@@ -119,7 +303,7 @@ def _create_basemap_fig(
     data_uri = _arr_to_png_datauri(rgba)
 
     colors = LCZ_COLORBLIND if inclusive else LCZ_COLORS
-    present = sorted(set(display_arr.ravel().tolist()) & set(range(1, 18)))
+    present = _present_classes(arr)
     names = get_lcz_names(lang)
 
     fig = go.Figure()
@@ -135,17 +319,15 @@ def _create_basemap_fig(
                 showlegend=True,
             ))
 
-    # Attribution required by the basemap/data providers.
-    # OpenFreeMap says attribution is automatically handled by MapLibre, but
-    # for Plotly/printed/static outputs we place it explicitly in the figure.
+    # Attribution: basemap credit + data credit (required for printed output).
+    credit = " • ".join(
+        t for t in (BASEMAP_ATTRIBUTION, attribution) if t
+    )
     fig.add_annotation(
-        text="OpenFreeMap | © OpenMapTiles | Data from OpenStreetMap",
-        xref="paper",
-        yref="paper",
-        x=0.99,
-        y=0.01,
-        xanchor="right",
-        yanchor="bottom",
+        text=credit,
+        xref="paper", yref="paper",
+        x=0.99, y=0.01,
+        xanchor="right", yanchor="bottom",
         showarrow=False,
         font=dict(size=10, color="rgba(40,40,40,0.9)"),
         bgcolor="rgba(255,255,255,0.75)",
@@ -177,6 +359,7 @@ def _create_basemap_fig(
         legend=dict(
             title=dict(text=lcz_msg("lcz_class_legend", lang), font=dict(size=13)),
             font=dict(size=11),
+            itemsizing="constant",
             bgcolor="rgba(255,255,255,0.9)",
             bordercolor="gray",
             borderwidth=1,
@@ -191,13 +374,13 @@ def _create_basemap_fig(
 
 
 def _build_plotly_discrete_colorscale(
-    inclusive: bool
+    inclusive: bool,
 ) -> tuple[list[str], dict[int, str]]:
     """Build discrete colorscale for Plotly heatmap."""
     colors = LCZ_COLORBLIND if inclusive else LCZ_COLORS
     # Plotly needs colors at specific z-values
     color_list = ["rgba(0,0,0,0)"] + colors
-    color_map = {i: colors[i-1] for i in range(1, 18)}
+    color_map = {i: colors[i - 1] for i in range(1, 18)}
     return color_list, color_map
 
 
@@ -205,32 +388,46 @@ def _build_plotly_discrete_colorscale(
 
 class BlockReader:
     """Memory-efficient block-based raster reader."""
-    
+
     def __init__(self, src: rasterio.io.DatasetReader, max_pixels: int = 10_000_000):
+        if int(max_pixels) < 1:
+            raise ValueError("max_pixels must be a positive integer")
         self.src = src
-        self.max_pixels = max_pixels
+        self.max_pixels = int(max_pixels)
         self.h, self.w = src.height, src.width
-        
+        if self.h < 1 or self.w < 1:
+            raise ValueError("Raster has zero width/height.")
+
         # Calculate downsample factor
-        if self.h * self.w > max_pixels:
-            self.scale = (max_pixels / (self.h * self.w)) ** 0.5
+        if self.h * self.w > self.max_pixels:
+            self.scale = (self.max_pixels / (self.h * self.w)) ** 0.5
         else:
             self.scale = 1.0
-        
+
         self.out_h = max(1, int(self.h * self.scale))
         self.out_w = max(1, int(self.w * self.scale))
-    
-    def read_downsampled(self, band: int = 1, resampling: Resampling = Resampling.nearest) -> np.ndarray:
+
+    def read_downsampled(
+        self,
+        band: int = 1,
+        resampling: Resampling = Resampling.nearest,
+    ) -> np.ndarray:
         """Read one band of the raster downsampled."""
+        if band < 1 or band > self.src.count:
+            raise ValueError(
+                f"band {band} out of range (raster has {self.src.count} band(s))"
+            )
         return self.src.read(
             band,
             out_shape=(self.out_h, self.out_w),
             resampling=resampling,  # nearest for categorical, bilinear for continuous
         )
-    
+
     def get_extent(self) -> tuple[float, float, float, float]:
         """Get (xmin, xmax, ymin, ymax) in source CRS."""
         t = self.src.transform
+        if t is None:
+            raise ValueError("Raster has no geotransform; cannot place it on a map.")
         return (
             t.c,
             t.c + self.w * t.a,
@@ -248,103 +445,136 @@ def raster_to_geoarrow(
     min_area: float = 0.0,
 ) -> Optional[pa.Table]:
     """Convert categorical raster to GeoArrow table of polygons.
-    
-    Much faster than GeoPandas for large rasters due to Arrow's
-    zero-copy columnar format.
+
+    Returns ``None`` when GeoArrow is unavailable or the raster holds no LCZ
+    classes (nothing to vectorise). One representative polygon per class is
+    kept, so the table stays a legend/metadata artefact rather than a full
+    vectorisation (mirrors LCZ4r's behaviour).
     """
     if not HAS_GEOARROW:
         return None
-    
+    if arr is None or np.asarray(arr).size == 0:
+        return None
+    if transform is None:
+        return None
+
     records = []
-    seen_classes = set()
-    
-    for geom, val in shapes(arr.astype(np.int16), transform=transform):
-        val = int(val)
-        if val < 1 or val > 17:
-            continue
-        if val in seen_classes:
-            continue
-        
-        geom_shape = shape(geom)
-        if min_area > 0 and geom_shape.area < min_area:
-            continue
-        
-        seen_classes.add(val)
-        records.append({
-            "lcz": val,
-            "name": LCZ_NAMES[val - 1],
-            "geometry": geom_shape,
-        })
-    
+    seen_classes: set[int] = set()
+
+    try:
+        for geom, val in shapes(arr.astype(np.int16), transform=transform):
+            val = int(val)
+            if val < 1 or val > 17:
+                continue
+            if val in seen_classes:
+                continue
+
+            geom_shape = shape(geom)
+            if min_area > 0 and geom_shape.area < min_area:
+                continue
+
+            seen_classes.add(val)
+            records.append({
+                "lcz": val,
+                "name": LCZ_NAMES[val - 1],
+                "geometry": geom_shape,
+            })
+    except Exception as exc:  # noqa: BLE001 - vectorisation is best-effort
+        logger.warning("Raster-to-GeoArrow conversion failed (%s); skipping.", exc)
+        return None
+
     if not records:
         return None
-    
+
     # Convert to GeoArrow via GeoPandas (fast path)
     import geopandas as gpd
+
     gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
-    
+
     try:
         # Try direct GeoArrow conversion
-        arrow_table = ga.from_geopandas(gdf)
-        return arrow_table
-    except Exception:
-        # Fallback to regular Arrow
+        return ga.from_geopandas(gdf)
+    except Exception as exc:  # noqa: BLE001 - fall back to plain Arrow
+        logger.debug("GeoArrow conversion failed (%s); returning plain Arrow.", exc)
         return pa.Table.from_pandas(gdf.drop(columns=["geometry"]))
 
 
-# ── DuckDB Spatial for fast legend computation ────────────────────────────────
+# ── Legend statistics ────────────────────────────────────────────────────────
+
+def _legend_from_counts(
+    values: np.ndarray,
+    counts: np.ndarray,
+) -> pl.DataFrame:
+    """Build the legend frame from unique classes and their pixel counts."""
+    total = int(counts.sum())
+    if total == 0:
+        return pl.DataFrame(
+            schema={
+                "lcz": pl.Int64,
+                "pixel_count": pl.Int64,
+                "percentage": pl.Float64,
+            }
+        )
+    return pl.DataFrame({
+        "lcz": values.astype(np.int64),
+        "pixel_count": counts.astype(np.int64),
+        "percentage": (counts / total * 100.0).round(4),
+    }).sort("lcz")
+
 
 def compute_legend_with_duckdb(
     arr: np.ndarray,
-    transform,
+    transform=None,
     crs: str = "EPSG:4326",
 ) -> pl.DataFrame:
-    """Use DuckDB Spatial to compute legend statistics."""
-    if not HAS_DUCKDB:
-        # Fallback to Polars
-        return _compute_legend_polars(arr)
-    
-    # Create a Polars DataFrame with class counts
-    flat = arr.ravel()
-    valid_mask = (flat >= 1) & (flat <= 17)
-    valid_classes = flat[valid_mask]
-    
-    # Use DuckDB for aggregation
-    df = pl.DataFrame({"lcz": valid_classes.tolist()})
-    
-    try:
-        conn = duckdb.connect()
-        result = conn.execute("""
-            SELECT
-                lcz,
-                COUNT(*) as pixel_count,
-                COUNT(*) * 100.0 / SUM(COUNT(*)) OVER () as percentage
-            FROM df
-            GROUP BY lcz
-            ORDER BY lcz
-        """).pl()
-        conn.close()
-        return result
-    except Exception:
-        return _compute_legend_polars(arr)
+    """Compute legend statistics, using DuckDB when available.
+
+    Pixel counts come from ``np.unique`` (one pass, no per-pixel Python list),
+    so the DuckDB path stays cheap for 10 M+ pixel rasters.
+    """
+    if arr is None:
+        return _legend_from_counts(np.array([], dtype=np.int64), np.array([], dtype=np.int64))
+    flat = np.asarray(arr).ravel()
+    valid = flat[(flat >= 1) & (flat <= 17)]
+    if valid.size == 0:
+        return _legend_from_counts(np.array([], dtype=np.int64), np.array([], dtype=np.int64))
+
+    values, counts = np.unique(valid.astype(np.int64), return_counts=True)
+
+    if HAS_DUCKDB:
+        try:
+            df = pl.DataFrame({
+                "lcz": values.tolist(),
+                "pixel_count": counts.tolist(),
+            })
+            conn = duckdb.connect()
+            try:
+                return conn.execute("""
+                    SELECT
+                        lcz,
+                        pixel_count,
+                        ROUND(pixel_count * 100.0 / SUM(pixel_count) OVER (), 4) AS percentage
+                    FROM df
+                    ORDER BY lcz
+                """).pl()
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - fall back to numpy/polars
+            logger.debug("DuckDB legend aggregation failed (%s); using Polars.", exc)
+
+    return _legend_from_counts(values, counts)
 
 
 def _compute_legend_polars(arr: np.ndarray) -> pl.DataFrame:
-    """Fast legend computation using Polars."""
-    flat = arr.ravel()
-    valid_mask = (flat >= 1) & (flat <= 17)
-    valid_classes = flat[valid_mask]
-    
-    df = pl.DataFrame({"lcz": valid_classes.tolist()})
-    
-    return (
-        df.group_by("lcz")
-        .agg([
-            pl.len().alias("pixel_count"),
-            (pl.len() / pl.len().sum() * 100).alias("percentage"),
-        ])
-        .sort("lcz")
-    )
+    """Fast legend computation using NumPy + Polars (no DuckDB)."""
+    if arr is None:
+        return _legend_from_counts(np.array([], dtype=np.int64), np.array([], dtype=np.int64))
+    flat = np.asarray(arr).ravel()
+    valid = flat[(flat >= 1) & (flat <= 17)]
+    if valid.size == 0:
+        return _legend_from_counts(np.array([], dtype=np.int64), np.array([], dtype=np.int64))
+    values, counts = np.unique(valid.astype(np.int64), return_counts=True)
+    return _legend_from_counts(values, counts)
 
 
 # ── Interactive Plotly map ────────────────────────────────────────────────────
@@ -356,38 +586,37 @@ def _create_interactive_lcz_map(
     show_legend: bool = True,
     use_webgl: bool = True,
     lang: str = "en",
+    attribution: Optional[str] = None,
 ) -> go.Figure:
-    """Create an interactive LCZ map with Plotly."""
-    
+    """Create an interactive/publication LCZ map with Plotly."""
+
     # Prepare class array (0 = nodata -> transparent)
     # flipud: raster row 0 is north, but Plotly y0=ymin (south) — align them
     display_arr = np.flipud(np.where((arr >= 1) & (arr <= 17), arr, 0))
-    
+
     # Build color mapping
-    color_list, color_map = _build_plotly_discrete_colorscale(inclusive)
-    
+    color_list, _ = _build_plotly_discrete_colorscale(inclusive)
+
     # Calculate pixel dimensions
     xmin, xmax, ymin, ymax = extent
     h, w = arr.shape
     dx = (xmax - xmin) / w
     dy = (ymax - ymin) / h
-    
+
     fig = go.Figure()
-    
+
     if use_webgl and w * h > 1_000_000:
         # Use Image trace with pre-rendered RGBA for massive rasters
         lut = _build_color_lut(inclusive)
         rgba = lut[display_arr.astype(np.int32)]  # (H, W, 4)
-        
+
         fig.add_trace(go.Image(
             z=rgba,
             x0=xmin,
             y0=ymin,
             dx=dx,
             dy=dy,
-            hovertemplate=(
-                "X: %{x:.5f}<br>Y: %{y:.5f}<extra></extra>"
-            ),
+            hovertemplate="X: %{x:.5f}<br>Y: %{y:.5f}<extra></extra>",
         ))
     else:
         # Use Heatmap with discrete colorscale
@@ -397,22 +626,21 @@ def _create_interactive_lcz_map(
             y0=ymin,
             dx=dx,
             dy=dy,
-            colorscale=[
-                (i/17, color_list[i]) for i in range(18)
-            ],
+            colorscale=[(i / 17, color_list[i]) for i in range(18)],
             zmin=0,
             zmax=17,
             showscale=False,
             hovertemplate=(
-                "LCZ Class: %{z:.0f}<br>"
+                "LCZ class: %{z:.0f}<br>"
                 "X: %{x:.5f}<br>"
                 "Y: %{y:.5f}<extra></extra>"
             ),
         ))
-    
-    # Add legend as separate traces (more flexible than colorbar)
+
+    # Add legend as separate traces (more flexible than colorbar). Classes are
+    # emitted in ascending class order, matching the LCZ scheme.
     if show_legend:
-        present = sorted(set(display_arr.ravel().tolist()) & set(range(1, 18)))
+        present = _present_classes(arr)
         colors = LCZ_COLORBLIND if inclusive else LCZ_COLORS
         names = get_lcz_names(lang)
 
@@ -422,7 +650,7 @@ def _create_interactive_lcz_map(
                 y=[None],
                 mode="markers",
                 marker=dict(
-                    size=15,
+                    size=13,
                     color=colors[lcz_class - 1],
                     symbol="square",
                     line=dict(width=1, color="black"),
@@ -430,13 +658,14 @@ def _create_interactive_lcz_map(
                 name=f"{lcz_class}: {names[lcz_class - 1]}",
                 legendgroup="lcz_classes",
                 showlegend=True,
+                hoverinfo="name",
             ))
 
     # Configure layout
     fig.update_layout(
         title=dict(
             text=lcz_msg("lcz_map_title", lang),
-            font=dict(size=20),
+            font=dict(size=18),
             x=0.5,
             xanchor="center",
         ),
@@ -444,38 +673,40 @@ def _create_interactive_lcz_map(
             showgrid=False,
             showticklabels=False,
             zeroline=False,
+            showline=False,
+            ticks="",
         ),
         yaxis=dict(
             showgrid=False,
             showticklabels=False,
             zeroline=False,
+            showline=False,
+            ticks="",
             scaleanchor="x",
             scaleratio=1,
         ),
         legend=dict(
-            title=dict(text=lcz_msg("lcz_class_legend", lang), font=dict(size=14)),
-            font=dict(size=11),
-            bgcolor="rgba(255,255,255,0.9)",
-            bordercolor="gray",
+            title=dict(text=lcz_msg("lcz_class_legend", lang), font=dict(size=12)),
+            font=dict(size=10),
+            itemsizing="constant",
+            traceorder="normal",
+            bgcolor="rgba(255,255,255,0.92)",
+            bordercolor="rgba(90,90,90,0.6)",
             borderwidth=1,
-            x=1.02,
+            x=1.01,
             y=0.5,
             xanchor="left",
             yanchor="middle",
         ),
-        margin=dict(l=0, r=180, t=50, b=0),
+        margin=dict(l=10, r=190, t=55, b=25),
         width=1200,
         height=900,
         plot_bgcolor="white",
         paper_bgcolor="white",
         dragmode="pan",  # Enable panning
     )
-    
-    # Add hover behavior for class lookup
-    fig.update_traces(
-        hoverinfo="x+y+z",
-    )
-    
+
+    _add_attribution(fig, attribution)
     return fig
 
 
@@ -485,19 +716,31 @@ def _create_continuous_map(
     units: str,
     title: Optional[str] = None,
     colorscale: str = "RdBu_r",
+    attribution: Optional[str] = None,
 ) -> go.Figure:
-    """Create an interactive map for a continuous raster variable (e.g. LST)."""
+    """Create a map for a continuous raster variable (e.g. LST)."""
     # flipud: raster row 0 is north, but Plotly y0=ymin (south) — align them
-    display_arr = np.flipud(arr)
+    display_arr = np.flipud(np.asarray(arr, dtype=float))
+    display_arr[~np.isfinite(display_arr)] = np.nan
 
     xmin, xmax, ymin, ymax = extent
-    h, w = arr.shape
+    h, w = display_arr.shape
     dx = (xmax - xmin) / w
     dy = (ymax - ymin) / h
 
     finite = display_arr[np.isfinite(display_arr)]
     zmin, zmax = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
-    unit_label = "°C" if units == "C" else "K"
+    if zmin == zmax:
+        zmin, zmax = zmin - 0.5, zmax + 0.5
+
+    unit_label = (units or "").strip()
+    # Common abbreviations -> proper symbols (kept explicit: a wrong unit on a
+    # colourbar is worse than no unit at all).
+    unit_label = {
+        "C": "°C", "c": "°C", "celsius": "°C", "degc": "°C",
+        "K": "K", "kelvin": "K",
+        "m": "m", "km": "km", "m2": "m²",
+    }.get(unit_label, unit_label)
 
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
@@ -505,24 +748,37 @@ def _create_continuous_map(
         x0=xmin, y0=ymin, dx=dx, dy=dy,
         colorscale=colorscale,
         zmin=zmin, zmax=zmax,
-        colorbar=dict(title=unit_label),
+        colorbar=dict(
+            title=dict(text=unit_label or None, side="right", font=dict(size=11)),
+            thickness=16,
+            len=0.75,
+            tickfont=dict(size=10),
+            outlinewidth=0.8,
+            outlinecolor="black",
+        ),
         hovertemplate=(
-            f"Value: %{{z:.1f}} {unit_label}<br>"
+            f"Value: %{{z:.2f}}{' ' + unit_label if unit_label else ''}<br>"
             "X: %{x:.5f}<br>Y: %{y:.5f}<extra></extra>"
         ),
     ))
 
     fig.update_layout(
-        title=dict(text=title or "Land Surface Temperature", x=0.5, xanchor="center", font=dict(size=20)),
-        xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
-        yaxis=dict(showgrid=False, showticklabels=False, zeroline=False, scaleanchor="x", scaleratio=1),
-        margin=dict(l=0, r=80, t=50, b=0),
+        title=dict(
+            text=title or "Land Surface Temperature",
+            x=0.5, xanchor="center", font=dict(size=18),
+        ),
+        xaxis=dict(showgrid=False, showticklabels=False, zeroline=False,
+                   showline=False, ticks=""),
+        yaxis=dict(showgrid=False, showticklabels=False, zeroline=False,
+                   showline=False, ticks="", scaleanchor="x", scaleratio=1),
+        margin=dict(l=10, r=90, t=55, b=25),
         width=1200,
         height=900,
         plot_bgcolor="white",
         paper_bgcolor="white",
         dragmode="pan",
     )
+    _add_attribution(fig, attribution)
     return fig
 
 
@@ -530,6 +786,8 @@ def _resolve_band(src: rasterio.io.DatasetReader, band: Union[int, str, None]) -
     """Resolve a 1-based band index from an int, a matching band description, or None (-> 1)."""
     if band is None:
         return 1
+    if isinstance(band, bool):  # bool is an int subclass — reject explicitly
+        raise TypeError("band must be an int, a band description string, or None")
     if isinstance(band, int):
         if not (1 <= band <= src.count):
             raise ValueError(f"band {band} out of range (raster has {src.count} bands)")
@@ -578,6 +836,8 @@ def lcz_plot_map(
     colorscale: str = "RdBu_r",
     add_scalebar: bool = True,
     add_north_arrow: bool = True,
+    dpi: Optional[int] = None,
+    attribution: Optional[str] = None,
 ) -> LCZPlotResult:
     """Plot an LCZ map, or a continuous raster stack (e.g. lcz_get_lst output).
 
@@ -590,7 +850,7 @@ def lcz_plot_map(
     isave : bool
         Save the figure.
     save_extension : str
-        "html" for interactive, "png"/"pdf" for static.
+        "html" for interactive, "png"/"pdf"/"svg"/"tiff" for static.
     style : str
         Publication style preset: "default", "nature", "science", or
         "generic_bw". Controls font, figure size (mm), DPI, and palette
@@ -617,6 +877,8 @@ def lcz_plot_map(
         Continuous data only supports "plotly".
     opacity : float
         Raster overlay opacity for the MapLibre renderer (0–1, default 0.8).
+    lang : {"en", "pt", "es", "zh"}
+        Language for legend labels and default titles.
     data_type : {"auto", "lcz", "continuous"}
         "auto" (default) detects continuous data from the raster's dtype
         (float32/float64, as written by ``lcz_get_lst``); override if needed.
@@ -631,66 +893,113 @@ def lcz_plot_map(
         Add a scale bar / north arrow to the map (Plotly renderer only;
         skipped for geographic/lon-lat CRSs where ground distance isn't
         directly meaningful).
+    dpi : int, optional
+        Resolution for static exports. Defaults to 300 dpi (or the style
+        preset's own resolution if higher).
+    attribution : str, optional
+        Credit line printed in the bottom-right corner. Defaults to
+        ``"LCZ4py | Stewart & Oke (2012) LCZ scheme"`` (plus the basemap
+        credit for the MapLibre renderer).
 
     Returns
     -------
     LCZPlotResult
         Contains the figure (Plotly) or html string (MapLibre) and optional metadata.
     """
-    if isinstance(x, (str, Path)):
-        with rasterio.open(str(x)) as src:
-            is_continuous = (
-                data_type == "continuous"
-                or (data_type == "auto" and src.dtypes[0].startswith("float"))
-            )
-            band_idx = _resolve_band(src, band) if is_continuous else 1
-            reader = BlockReader(src, max_pixels)
-            resampling = Resampling.bilinear if is_continuous else Resampling.nearest
-            arr = reader.read_downsampled(band=band_idx, resampling=resampling)
-            extent = reader.get_extent()
-            crs_obj = src.crs
-            crs = str(src.crs) if src.crs else "EPSG:4326"
-            transform = src.transform
-            units = src.tags().get("units", "K")
-            band_label = src.descriptions[band_idx - 1] if src.descriptions[band_idx - 1] else None
-    elif hasattr(x, "read"):
-        is_continuous = (
-            data_type == "continuous"
-            or (data_type == "auto" and x.dtypes[0].startswith("float"))
+    # ── Argument validation ──────────────────────────────────────────────────
+    if data_type not in ("auto", "lcz", "continuous"):
+        raise ValueError(
+            f"data_type must be 'auto', 'lcz' or 'continuous', got {data_type!r}"
         )
-        band_idx = _resolve_band(x, band) if is_continuous else 1
-        reader = BlockReader(x, max_pixels)
-        resampling = Resampling.bilinear if is_continuous else Resampling.nearest
-        arr = reader.read_downsampled(band=band_idx, resampling=resampling)
-        extent = reader.get_extent()
-        crs_obj = x.crs
-        crs = str(x.crs) if x.crs else "EPSG:4326"
-        transform = x.transform
-        units = x.tags().get("units", "K")
-        band_label = x.descriptions[band_idx - 1] if x.descriptions[band_idx - 1] else None
+    if renderer not in ("plotly", "maplibre"):
+        raise ValueError(f"renderer must be 'plotly' or 'maplibre', got {renderer!r}")
+    if not 0.0 <= float(opacity) <= 1.0:
+        raise ValueError(f"opacity must be between 0 and 1, got {opacity!r}")
+    if (save_extension or "").lower().lstrip(".") not in (
+        "html", "png", "pdf", "svg", "tiff", "jpg", "jpeg", "webp"
+    ):
+        raise ValueError(
+            f"Unsupported save_extension {save_extension!r} "
+            "(use html, png, pdf, svg, tiff, jpg or webp)."
+        )
+    save_extension = (save_extension or "html").lower().lstrip(".")
+
+    # Reading a raster needs an open dataset; get one with correct lifetime.
+    close_src = False
+    if isinstance(x, (str, Path)):
+        src = rasterio.open(str(x))
+        close_src = True
+    elif hasattr(x, "read") and hasattr(x, "dtypes"):
+        src = x
     else:
         raise TypeError(f"x must be a path or rasterio dataset, got {type(x)}")
 
+    try:
+        if src.width < 1 or src.height < 1:
+            raise ValueError("Raster has zero width/height; nothing to plot.")
+
+        if band is not None and not isinstance(band, (int, str)):
+            raise TypeError("band must be an int, a band description string, or None")
+        if isinstance(band, int) and not (1 <= band <= src.count):
+            # Validate even for class maps, where the band is otherwise unused:
+            # silently ignoring an impossible band hides a caller mistake.
+            raise ValueError(f"band {band} out of range (raster has {src.count} bands)")
+
+        is_continuous = (
+            data_type == "continuous"
+            or (data_type == "auto" and src.dtypes[0].startswith("float"))
+        )
+        band_idx = _resolve_band(src, band) if is_continuous else 1
+
+        reader = BlockReader(src, max_pixels)
+        resampling = Resampling.bilinear if is_continuous else Resampling.nearest
+        arr = reader.read_downsampled(band=band_idx, resampling=resampling)
+        extent = reader.get_extent()
+        crs_obj = src.crs
+        crs = str(src.crs) if src.crs else "EPSG:4326"
+        transform = src.transform
+        units = src.tags().get("units", "") if is_continuous else ""
+        descriptions = list(src.descriptions)
+        band_label = descriptions[band_idx - 1] if descriptions[band_idx - 1] else None
+        nodata = src.nodata
+    finally:
+        if close_src:
+            src.close()
+
+    if extent[0] >= extent[1] or extent[2] >= extent[3]:
+        raise ValueError(
+            "Raster extent is degenerate (non-increasing bounds); check the GeoTIFF transform."
+        )
+
+    credit = attribution if attribution is not None else DEFAULT_ATTRIBUTION
+
     # ── Continuous raster (e.g. lcz_get_lst LST stack) ───────────────────────
     if is_continuous:
-        map_title = title or f"Land Surface Temperature{f' — {band_label}' if band_label else ''}"
-        fig = _create_continuous_map(arr, extent, units, title=map_title, colorscale=colorscale)
+        if nodata is not None:
+            arr = np.where(arr == nodata, np.nan, arr)
+        band_suffix = f" — {band_label}" if band_label else ""
+        map_title = title or f"Land Surface Temperature{band_suffix}"
+        fig = _create_continuous_map(
+            arr, extent, units, title=map_title, colorscale=colorscale,
+            attribution=credit,
+        )
         if subtitle:
             fig.update_layout(title=dict(text=f"{map_title}<br><sup>{subtitle}</sup>"))
-        if caption:
-            fig.add_annotation(
-                text=caption, xref="paper", yref="paper", x=0.01, y=-0.02,
-                showarrow=False, font=dict(size=10, color="gray"),
-            )
+        _add_caption(fig, caption)
         bounds = (extent[0], extent[2], extent[1], extent[3])
-        add_map_furniture(fig, bounds=bounds, crs=crs_obj,
-                           add_scalebar=add_scalebar, add_north_arrow=add_north_arrow)
-        fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
-                               filename="lcz_plot_lst", lang=lang)
+        add_map_furniture(
+            fig, bounds=bounds, crs=crs_obj,
+            add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+        )
+        fig = _finalize_publication(
+            fig, style=style, isave=isave, save_extension=save_extension,
+            filename="lcz_plot_lst", dpi=dpi, lang=lang,
+        )
         return LCZPlotResult(fig=fig)
 
     # Keep nodata (0) as 0 — transparent in the plot, not Water.
     # Water bodies are stored as class 17 in the source LCZ raster.
+    arr = np.asarray(arr)
     arr = np.where((arr >= 1) & (arr <= 17), arr, 0)
 
     # ── MapLibre renderer (Plotly mapbox + OSM basemap) ──────────────────────
@@ -698,48 +1007,60 @@ def lcz_plot_map(
         # ponytail: no add_map_furniture here — this figure is a mapbox/geo trace,
         # not a Cartesian one, so paper-relative scale bar/north arrow annotations
         # don't line up with the map; skip until furniture supports mapbox layouts.
-        fig = _create_basemap_fig(arr, extent, inclusive, show_legend, title, opacity, lang=lang)
-        fig = finalize_export(fig, style=style, isave=isave, save_extension="html",
-                               filename="lcz_plot_map_maplibre", lang=lang)
+        fig = _create_basemap_fig(
+            arr, extent, inclusive, show_legend, title, opacity,
+            lang=lang, attribution=credit,
+        )
+        if subtitle:
+            fig.update_layout(title=dict(
+                text=f"{title or lcz_msg('lcz_map_title', lang)}<br><sup>{subtitle}</sup>",
+            ))
+        _add_caption(fig, caption)
+        fig = finalize_export(
+            fig, style=style, isave=isave, save_extension="html",
+            filename="lcz_plot_map_maplibre", lang=lang,
+        )
         return LCZPlotResult(fig=fig)
 
     # ── Plotly renderer (default) ────────────────────────────────────────────
-    # Create interactive figure
     fig = _create_interactive_lcz_map(
-        arr, extent, inclusive, show_legend, use_webgl, lang=lang
+        arr, extent, inclusive, show_legend, use_webgl,
+        lang=lang, attribution=credit,
     )
-    
+
     # Add annotations
     if title or subtitle:
         title_text = title or lcz_msg("lcz_map_title", lang)
         if subtitle:
             title_text += f"<br><sup>{subtitle}</sup>"
         fig.update_layout(title=dict(text=title_text))
-    if caption:
-        fig.add_annotation(
-            text=caption,
-            xref="paper", yref="paper",
-            x=0.01, y=-0.02,
-            showarrow=False,
-            font=dict(size=10, color="gray"),
-        )
-    
+    _add_caption(fig, caption)
+
     # Generate GeoArrow table if requested
     geoarrow_table = None
     if use_geoarrow and HAS_GEOARROW and arr.shape[0] * arr.shape[1] < 5_000_000:
         geoarrow_table = raster_to_geoarrow(arr, transform, crs)
-    
+
     # Compute legend with DuckDB if requested
     legend_df = None
     if use_duckdb:
         legend_df = compute_legend_with_duckdb(arr, transform, crs)
+    if show_legend and not _present_classes(arr):
+        logger.warning(
+            "No LCZ classes (1-17) found in the raster; the map will be blank. "
+            "Check the band/dtype (continuous data needs data_type='continuous')."
+        )
 
     # Add map furniture (scale bar / north arrow), then save
     bounds = (extent[0], extent[2], extent[1], extent[3])
-    add_map_furniture(fig, bounds=bounds, crs=crs_obj,
-                       add_scalebar=add_scalebar, add_north_arrow=add_north_arrow)
-    fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
-                           filename="lcz_plot_map", lang=lang)
+    add_map_furniture(
+        fig, bounds=bounds, crs=crs_obj,
+        add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+    )
+    fig = _finalize_publication(
+        fig, style=style, isave=isave, save_extension=save_extension,
+        filename="lcz_plot_map", dpi=dpi, lang=lang,
+    )
 
     return LCZPlotResult(
         fig=fig,
@@ -748,4 +1069,10 @@ def lcz_plot_map(
     )
 
 
-__all__ = ["LCZPlotResult", "lcz_plot_map", "BlockReader", "raster_to_geoarrow"]
+__all__ = [
+    "LCZPlotResult",
+    "lcz_plot_map",
+    "BlockReader",
+    "raster_to_geoarrow",
+    "compute_legend_with_duckdb",
+]

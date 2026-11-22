@@ -8,6 +8,9 @@ O3 (10km, annual, 2000-2020), CO (1km, annual, 2019-2022). Zenodo, no auth.
 Output is a multi-band GeoTIFF (one band per pollutant x period), float32
 with NaN nodata, pixel-aligned to the input LCZ map's grid — the same
 ``LCZGridResult`` convention used by ``lcz_get_lst``/``lcz_get_planetary_computer``.
+
+Files are downloaded in parallel; extraction stays serial because the
+NetCDF/HDF5 reader is not thread-safe.
 """
 
 from __future__ import annotations
@@ -21,18 +24,28 @@ from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
-import rioxarray  # noqa: F401 - registers the .rio accessor
-import xarray as xr
 
-from LCZ4py._internal._lcz_grid_base import download_file
+try:
+    import xarray as xr
+
+    HAS_XARRAY = True
+except ImportError:  # pragma: no cover - depends on the environment
+    xr = None  # type: ignore[assignment]
+    HAS_XARRAY = False
+
+from LCZ4py._internal._lcz_grid_base import (
+    download_many,
+    normalize_int_list,
+    resolve_max_workers,
+)
 from LCZ4py._internal._lcz_grid_raster_base import (
     DEFAULT_GRID_CACHE_DIR,
     LCZGridResult,
     cache_key,
     crop_reproject_dataarray,
     load_target_grid,
-    read_grid_stack,
-    rio_template,
+    make_template_factory,
+    try_read_grid_stack,
     write_grid_stack,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
@@ -60,7 +73,6 @@ _AVAIL_YEARS = {
 _RES_CODE = {"pm25": "1K", "o3": "1K", "co": "1K"}
 _P_FNAME = {"pm25": "PM2.5", "o3": "O3", "co": "CO"}
 
-
 def _file_info(pollutant: str, resolution: str, year: int, month: Optional[int] = None) -> tuple[str, str]:
     p_fname = _P_FNAME[pollutant]
     res_code = _RES_CODE[pollutant]
@@ -82,35 +94,132 @@ def _file_info(pollutant: str, resolution: str, year: int, month: Optional[int] 
 
 
 def _read_nc_array(nc_path: str, grid, template, resampling: str) -> np.ndarray:
+    """Read the first variable of a GHAP NetCDF and put it on the LCZ grid."""
+    if not HAS_XARRAY:
+        raise ImportError(
+            "Reading GHAP NetCDF files requires 'xarray'. "
+            "Install it with: pip install xarray"
+        )
+
     ds = xr.open_dataset(nc_path)
-    var_name = next(iter(ds.data_vars))
-    da = ds[var_name]
-    if "time" in da.dims:
-        da = da.isel(time=0, drop=True)
-    arr = crop_reproject_dataarray(da, grid, template, resampling)
-    ds.close()
-    return arr
+    try:
+        if not ds.data_vars:
+            raise ValueError(f"No variables found in {os.path.basename(nc_path)}.")
+        da = ds[next(iter(ds.data_vars))]
+        # Collapse extra (non-spatial, non-time) dims and the time axis.
+        for dim in ("time", "valid_time"):
+            if dim in da.dims:
+                da = da.isel({dim: 0}, drop=True)
+        return crop_reproject_dataarray(da, grid, template, resampling)
+    finally:
+        ds.close()
 
 
-def _extract_daily_zip(zip_path: str, grid, template, resampling: str) -> dict[str, np.ndarray]:
-    out = {}
+def _extract_daily_zip(
+    zip_path: str,
+    grid,
+    template_factory,
+    resampling: str,
+    lang: str = "en",
+) -> dict[str, np.ndarray]:
+    """Extract every daily NetCDF from a GHAP monthly zip onto the LCZ grid."""
+    if not HAS_XARRAY:
+        raise ImportError(
+            "Reading GHAP NetCDF files requires 'xarray'. "
+            "Install it with: pip install xarray"
+        )
+
+    out: dict[str, np.ndarray] = {}
     with tempfile.TemporaryDirectory(prefix="ghap_") as tmp_dir:
         with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(tmp_dir)
+            for info in zf.infolist():
+                name = info.filename
+                # Guard against path traversal in the archive.
+                if name.startswith("/") or ".." in Path(name).parts:
+                    logger.warning("Skipping unsafe archive member %r", name)
+                    continue
+                zf.extract(info, tmp_dir)
+
         nc_files = sorted(glob.glob(os.path.join(tmp_dir, "**", "*.nc"), recursive=True))
         if not nc_files:
-            logger.warning(lcz_msg("grid_ghap_zip_no_nc", "en", filename=os.path.basename(zip_path)))
+            logger.warning(lcz_msg(
+                "grid_ghap_zip_no_nc", lang, filename=os.path.basename(zip_path),
+            ))
             return out
+
         for nc_path in nc_files:
             try:
                 bn = os.path.splitext(os.path.basename(nc_path))[0]
                 date_parts = [p for p in bn.split("_") if len(p) == 8 and p.isdigit()]
-                day_label = f"{date_parts[0][:4]}-{date_parts[0][4:6]}-{date_parts[0][6:8]}" if date_parts else bn
-                arr = _read_nc_array(nc_path, grid, template, resampling)
-                out[day_label] = arr
-            except Exception as exc:
-                logger.warning(f"Could not process {os.path.basename(nc_path)}: {exc}")
+                day_label = (
+                    f"{date_parts[0][:4]}-{date_parts[0][4:6]}-{date_parts[0][6:8]}"
+                    if date_parts else bn
+                )
+                out[day_label] = _read_nc_array(
+                    nc_path, grid, template_factory(), resampling,
+                )
+            except Exception as exc:  # noqa: BLE001 - reported per member
+                logger.warning(
+                    "Could not process %s: %s", os.path.basename(nc_path), exc,
+                )
     return out
+
+
+def _build_manifest(
+    pollutants: list[str],
+    resolution: str,
+    years: Optional[list[int]],
+    months: list[int],
+    cache_dir: str,
+    lang: str,
+    verbose: bool,
+) -> list[dict]:
+    """One entry per file to download, with per-pollutant year resolution."""
+    manifest: list[dict] = []
+    for p in pollutants:
+        p_res = "annual" if (p in _ANNUAL_ONLY or (resolution == "daily" and p != "pm25")) else resolution
+        if p_res != resolution and verbose:
+            print(lcz_msg("grid_ghap_fallback_annual", lang, pollutant=p.upper()))
+
+        avail_years = list(_AVAIL_YEARS[p][p_res])
+        if years is None:
+            req_years = avail_years
+        else:
+            req_years = [int(y) for y in years]
+            bad_y = [y for y in req_years if y not in avail_years]
+            if bad_y:
+                logger.warning(lcz_msg(
+                    "grid_ghap_years_unavail", lang, pollutant=p.upper(),
+                    bad_years=", ".join(map(str, bad_y)),
+                    avail=f"{avail_years[0]}-{avail_years[-1]}",
+                ))
+                req_years = [y for y in req_years if y in avail_years]
+
+        for yr in req_years:
+            if p_res == "daily":
+                for mo in months:
+                    filename, url = _file_info(p, "daily", yr, mo)
+                    manifest.append(dict(
+                        pollutant=p, resolution="daily", year=yr, month=mo,
+                        filename=filename, url=url,
+                        cache_nc=os.path.join(cache_dir, p, "daily", filename),
+                    ))
+            elif p_res == "monthly":
+                for mo in months:
+                    filename, url = _file_info(p, "monthly", yr, mo)
+                    manifest.append(dict(
+                        pollutant=p, resolution="monthly", year=yr, month=mo,
+                        filename=filename, url=url,
+                        cache_nc=os.path.join(cache_dir, p, filename),
+                    ))
+            else:
+                filename, url = _file_info(p, "annual", yr)
+                manifest.append(dict(
+                    pollutant=p, resolution="annual", year=yr, month=None,
+                    filename=filename, url=url,
+                    cache_nc=os.path.join(cache_dir, p, filename),
+                ))
+    return manifest
 
 
 def lcz_grid_pollution_ghap(
@@ -125,6 +234,7 @@ def lcz_grid_pollution_ghap(
     cache_dir: str = os.path.join(DEFAULT_GRID_CACHE_DIR, "ghap"),
     lang: str = "en",
     verbose: bool = True,
+    max_workers: Optional[int] = None,
 ) -> LCZGridResult:
     """Download GHAP pollution rasters cropped to an LCZ map's footprint.
 
@@ -155,6 +265,9 @@ def lcz_grid_pollution_ghap(
         Message language. Default "en".
     verbose : bool
         Print progress. Default True.
+    max_workers : int, optional
+        Threads used for parallel downloads. Default
+        ``min(8, os.cpu_count() or 4)``.
 
     Returns
     -------
@@ -166,94 +279,101 @@ def lcz_grid_pollution_ghap(
         pollutants = list(_VALID_POLLUTANTS)
     elif isinstance(pollutants, str):
         pollutants = [pollutants]
-    if "no2" in [p.lower() for p in pollutants]:
+    else:
+        pollutants = [str(p).lower() for p in pollutants]
+
+    pollutants = [str(p).lower() for p in pollutants]
+    if "no2" in pollutants:
         logger.warning(lcz_msg("grid_ghap_no2_unavailable", lang))
-        pollutants = [p for p in pollutants if p.lower() != "no2"]
+        pollutants = [p for p in pollutants if p != "no2"]
     bad_p = [p for p in pollutants if p not in _VALID_POLLUTANTS]
     if bad_p:
-        raise ValueError(lcz_msg("grid_ghap_invalid_pollutants", lang, bad=", ".join(bad_p)))
+        raise ValueError(lcz_msg(
+            "grid_ghap_invalid_pollutants", lang, bad=", ".join(bad_p),
+        ))
     if not pollutants:
         raise ValueError(lcz_msg("grid_ghap_no_pollutants", lang))
+    # De-duplicate while keeping the caller's order.
+    pollutants = list(dict.fromkeys(pollutants))
 
     if resolution not in _VALID_RESOLUTIONS:
         raise ValueError(lcz_msg("grid_ghap_invalid_resolution", lang))
     if resampling not in _VALID_RESAMPLING:
-        raise ValueError(lcz_msg("grid_raster_invalid_resampling", lang, valid=", ".join(_VALID_RESAMPLING)))
+        raise ValueError(lcz_msg(
+            "grid_raster_invalid_resampling", lang, valid=", ".join(_VALID_RESAMPLING),
+        ))
 
-    months = sorted(set(int(m) for m in (months or range(1, 13))))
+    months = sorted(set(normalize_int_list(months, "months", default=range(1, 13))))
     if any(m < 1 or m > 12 for m in months):
         raise ValueError(lcz_msg("grid_ghap_invalid_months", lang))
+
+    if years is not None:
+        years = sorted(set(normalize_int_list(years, "years")))
 
     grid = load_target_grid(x)
     cache_dir = os.path.expanduser(cache_dir)
 
-    key = cache_key("ghap", sorted(pollutants), resolution, years, months, grid.bbox_wgs84, resampling)
+    # Resolve years *before* computing the cache key so an explicit year list
+    # and the implicit "all available years" never share a cache entry.
+    manifest = _build_manifest(pollutants, resolution, years, months, cache_dir, lang, verbose)
+    if not manifest:
+        raise ValueError(lcz_msg("grid_ghap_no_data_to_download", lang))
+
+    key = cache_key(
+        "ghap",
+        tuple(sorted(m["filename"] for m in manifest)),
+        grid.bbox_wgs84,
+        resampling,
+    )
     stack_path = os.path.join(cache_dir, "stack", f"ghap_stack_{key}.tif")
 
-    if cache and os.path.exists(stack_path):
-        if verbose:
-            print(lcz_msg("grid_raster_cache_hit", lang, name="GHAP"))
-        array, bands = read_grid_stack(stack_path)
-    else:
-        # ── Build manifest ───────────────────────────────────────────────────
-        manifest = []
-        for p in pollutants:
-            p_res = "annual" if (p in _ANNUAL_ONLY or (resolution == "daily" and p != "pm25")) else resolution
-            if p_res != resolution and verbose:
-                print(lcz_msg("grid_ghap_fallback_annual", lang, pollutant=p.upper()))
+    array: Optional[np.ndarray] = None
+    bands: list[str] = []
+    if cache:
+        cached = try_read_grid_stack(stack_path)
+        if cached is not None:
+            if verbose:
+                print(lcz_msg("grid_raster_cache_hit", lang, name="GHAP"))
+            array, bands = cached
 
-            avail_years = list(_AVAIL_YEARS[p][p_res])
-            if years is None:
-                req_years = avail_years
-            else:
-                req_years = [int(y) for y in years]
-                bad_y = [y for y in req_years if y not in avail_years]
-                if bad_y:
-                    logger.warning(lcz_msg("grid_ghap_years_unavail", lang, pollutant=p.upper(),
-                                            bad_years=", ".join(map(str, bad_y)), avail=f"{avail_years[0]}-{avail_years[-1]}"))
-                    req_years = [y for y in req_years if y in avail_years]
-
-            for yr in req_years:
-                if p_res == "daily":
-                    for mo in months:
-                        filename, url = _file_info(p, "daily", yr, mo)
-                        manifest.append(dict(pollutant=p, resolution="daily", year=yr, month=mo, filename=filename, url=url,
-                                              cache_nc=os.path.join(cache_dir, p, "daily", filename)))
-                elif p_res == "monthly":
-                    for mo in months:
-                        filename, url = _file_info(p, "monthly", yr, mo)
-                        manifest.append(dict(pollutant=p, resolution="monthly", year=yr, month=mo, filename=filename, url=url,
-                                              cache_nc=os.path.join(cache_dir, p, filename)))
-                else:
-                    filename, url = _file_info(p, "annual", yr)
-                    manifest.append(dict(pollutant=p, resolution="annual", year=yr, month=None, filename=filename, url=url,
-                                          cache_nc=os.path.join(cache_dir, p, filename)))
-
-        if not manifest:
-            raise ValueError(lcz_msg("grid_ghap_no_data_to_download", lang))
-
+    if array is None:
         if verbose:
             print(lcz_msg("grid_ghap_download_start", lang, n_files=len(manifest)))
-        for m in manifest:
-            download_file(m["url"], m["cache_nc"], use_cache=cache, verbose=verbose)
 
-        template = rio_template(grid)
+        downloads = {
+            m["filename"]: (m["url"], m["cache_nc"])
+            for m in manifest
+        }
+        workers = resolve_max_workers(max_workers, len(downloads))
+        available = download_many(
+            downloads, use_cache=cache, verbose=verbose,
+            max_workers=workers, progress_desc="GHAP",
+        )
+
+        template = make_template_factory(grid)
         layers: dict[str, np.ndarray] = {}
         for m in manifest:
-            if not os.path.exists(m["cache_nc"]):
-                logger.warning(lcz_msg("grid_ghap_skip_missing", lang, filename=m["filename"]))
+            if not available.get(m["filename"], False):
+                logger.warning(lcz_msg(
+                    "grid_ghap_skip_missing", lang, filename=m["filename"],
+                ))
                 continue
             try:
                 if m["cache_nc"].endswith(".zip"):
-                    daily = _extract_daily_zip(m["cache_nc"], grid, template, resampling)
+                    daily = _extract_daily_zip(
+                        m["cache_nc"], grid, template, resampling, lang,
+                    )
                     for d, arr in daily.items():
                         layers[f"{m['pollutant']}_{d}"] = arr
                 else:
-                    arr = _read_nc_array(m["cache_nc"], grid, template, resampling)
+                    arr = _read_nc_array(m["cache_nc"], grid, template(), resampling)
                     label = f"{m['year']:04d}-{(m['month'] or 1):02d}-01"
                     layers[f"{m['pollutant']}_{label}"] = arr
-            except Exception as exc:
-                logger.warning(lcz_msg("grid_ghap_extract_warn", lang, filename=m["filename"]) + f" ({exc})")
+            except Exception as exc:  # noqa: BLE001 - reported per file
+                logger.warning(
+                    lcz_msg("grid_ghap_extract_warn", lang, filename=m["filename"])
+                    + f" ({exc})"
+                )
                 continue
 
         if not layers:
@@ -262,16 +382,25 @@ def lcz_grid_pollution_ghap(
         bands = sorted(layers)
         array = np.stack([layers[b] for b in bands]).astype(np.float32)
         if cache:
-            write_grid_stack(stack_path, array, bands, grid, variable=",".join(pollutants), units="ug_m3")
+            write_grid_stack(
+                stack_path, array, bands, grid,
+                variable=",".join(pollutants), units="ug_m3",
+            )
 
     if isave:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, "lcz_grid_ghap.tif")
-        write_grid_stack(out_path, array, bands, grid, variable=",".join(pollutants), units="ug_m3")
+        write_grid_stack(
+            out_path, array, bands, grid,
+            variable=",".join(pollutants), units="ug_m3",
+        )
         if verbose:
             logger.info("Saved: %s", os.path.abspath(out_path))
 
     if verbose:
         print(lcz_msg("grid_raster_done", lang, name="GHAP", n_bands=len(bands)))
 
-    return LCZGridResult(path=stack_path if cache else None, array=array, bands=bands, variables=list(pollutants), units="ug_m3")
+    return LCZGridResult(
+        path=stack_path if cache else None,
+        array=array, bands=bands, variables=list(pollutants), units="ug_m3",
+    )

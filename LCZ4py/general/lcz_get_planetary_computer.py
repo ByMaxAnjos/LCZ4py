@@ -16,6 +16,10 @@ explicitly (use :func:`lcz_list_pc_assets` to discover asset keys first).
 Output is a multi-band GeoTIFF (one band per requested asset), float32 with
 NaN nodata, pixel-aligned to the input LCZ map's grid — consistent with the
 ``LCZLSTResult``/``LCZStackResult`` conventions elsewhere in this codebase.
+
+Only core dependencies are required at import time: ``pystac-client`` /
+``planetary-computer`` and ``rioxarray`` are optional and only raise an
+actionable ``ImportError`` when a function that needs them is called.
 """
 
 from __future__ import annotations
@@ -24,33 +28,60 @@ import hashlib
 import logging
 import math
 import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import geopandas as gpd
 import numpy as np
 import pyproj
 import rasterio
-import rioxarray  # noqa: F401 - registers the .rio accessor
+
+try:  # optional at import time; only raster asset reads need it
+    import rioxarray  # noqa: F401 - registers the .rio accessor
+
+    HAS_RIOXARRAY = True
+except ImportError:  # pragma: no cover - exercised by the no-optional-deps test
+    rioxarray = None  # type: ignore[assignment]
+    HAS_RIOXARRAY = False
 
 try:
     import pystac_client
     import planetary_computer
+
     HAS_STAC = True
 except ImportError:
+    pystac_client = None  # type: ignore[assignment]
+    planetary_computer = None  # type: ignore[assignment]
     HAS_STAC = False
 
 from LCZ4py._internal.i18n_messages import lcz_msg
-from LCZ4py.general.lcz_get_lst import _load_target_grid, _rio_template
-from LCZ4py._internal._lcz_map_engine import _atomic_copy_raster, _is_valid_raster
+from LCZ4py.general.lcz_get_lst import (
+    DEFAULT_MAX_WORKERS,
+    _atomic_copy_raster,
+    _coerce_workers,
+    _is_valid_raster,
+    _load_target_grid,
+    _parse_iso_date,
+    _retry_call,
+    _rio_template,
+    _unlink,
+)
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
 DEFAULT_CACHE_DIR = "~/.lcz4r_cache"
 
 PC_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+# /vsicurl/ retry/timeout defaults for the remote COGs opened by rioxarray.
+os.environ.setdefault("GDAL_HTTP_TIMEOUT", "60")
+os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "3")
+os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
+os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "YES")
+os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.ovr")
 
 # ── Curated shortcuts for common global, keyless-access collections ──────────
 # Not exhaustive (Planetary Computer hosts 100+ collections) — pass the raw
@@ -119,6 +150,7 @@ PC_COLLECTIONS: dict[str, dict] = {
 @dataclass
 class LCZPCResult:
     """Return type for lcz_get_planetary_computer."""
+
     path: Optional[str] = None
     array: Optional[np.ndarray] = None
     bands: Optional[list[str]] = None
@@ -128,12 +160,52 @@ class LCZPCResult:
     geoarrow_table: Optional[object] = None
 
 
+# ── Optional dependency guards ────────────────────────────────────────────────
+
+
+def _require_stac(function: str) -> None:
+    if HAS_STAC:
+        return
+    raise ImportError(
+        f"{function} requires pystac-client and planetary-computer "
+        "(pip install pystac-client planetary-computer, or "
+        "'pip install LCZ4py[lst]')."
+    )
+
+
+def _require_rioxarray() -> None:
+    if HAS_RIOXARRAY:
+        return
+    raise ImportError(
+        "Reading Planetary Computer raster assets requires rioxarray "
+        "(pip install rioxarray)."
+    )
+
+
+def _open_catalog():
+    """Open the Planetary Computer STAC catalog (assets signed on access)."""
+    _require_stac("Planetary Computer access")
+    try:
+        return pystac_client.Client.open(
+            PC_STAC_URL, modifier=planetary_computer.sign_inplace
+        )
+    except Exception as exc:  # noqa: BLE001 - surface an actionable error
+        raise RuntimeError(
+            f"Could not open the Planetary Computer STAC catalog: {exc}"
+        ) from exc
+
+
 # ── Collection resolution ─────────────────────────────────────────────────────
 
+
 def _resolve_collection(
-    collection: str, assets: Optional[list[str]], lang: str,
+    collection: str, assets: Optional[list[str]], lang: str
 ) -> tuple[str, list[str], Optional[str], bool, str]:
     """Return (collection_id, assets, cloud_cover_property, time_varying, resampling)."""
+    if not isinstance(collection, str) or not collection.strip():
+        raise ValueError("collection must be a non-empty string")
+    collection = collection.strip()
+
     cfg = PC_COLLECTIONS.get(collection)
     if cfg is not None:
         return (
@@ -148,10 +220,16 @@ def _resolve_collection(
     # id. We can't guess its asset keys or whether it's time-varying, so
     # require the caller to be explicit (discoverable via lcz_list_pc_assets).
     if not assets:
-        raise ValueError(lcz_msg(
-            "pc_unknown_collection", lang,
-            collection=collection, known=", ".join(sorted(PC_COLLECTIONS)),
-        ))
+        raise ValueError(
+            lcz_msg(
+                "pc_unknown_collection",
+                lang,
+                collection=collection,
+                known=", ".join(sorted(PC_COLLECTIONS)),
+            )
+        )
+    if isinstance(assets, str):
+        assets = [assets]
     return collection, list(assets), None, True, "bilinear"
 
 
@@ -175,66 +253,120 @@ def lcz_list_pc_assets(collection: str, x: Union[str, Path]) -> dict[str, str]:
     dict
         ``{asset_key: title}`` from the first matching item.
     """
-    if not HAS_STAC:
-        raise ImportError(
-            "lcz_list_pc_assets requires pystac-client and planetary-computer "
-            "(pip install pystac-client planetary-computer)"
-        )
+    _require_stac("lcz_list_pc_assets")
+    if not isinstance(collection, str) or not collection.strip():
+        raise ValueError("collection must be a non-empty string")
+    collection = collection.strip()
+
     cfg = PC_COLLECTIONS.get(collection)
     collection_id = cfg["collection_id"] if cfg else collection
 
     grid = _load_target_grid(x)
-    catalog = pystac_client.Client.open(PC_STAC_URL, modifier=planetary_computer.sign_inplace)
-    search = catalog.search(collections=[collection_id], bbox=list(grid.bbox_wgs84), max_items=1)
-    items = list(search.items())
+
+    def _do_search():
+        catalog = _open_catalog()
+        search = catalog.search(
+            collections=[collection_id], bbox=list(grid.bbox_wgs84), max_items=1
+        )
+        return list(search.items())
+
+    try:
+        items = _retry_call(_do_search, attempts=2)
+    except Exception as exc:  # noqa: BLE001 - surface an actionable error
+        raise RuntimeError(
+            f"Planetary Computer search failed for '{collection_id}': {exc}"
+        ) from exc
+
     if not items:
-        raise ValueError(f"No items found for collection '{collection_id}' over this area.")
-    return {key: (asset.title or "") for key, asset in items[0].assets.items()}
+        raise ValueError(
+            f"No items found for collection '{collection_id}' over this area."
+        )
+    return {
+        key: (getattr(asset, "title", None) or "")
+        for key, asset in sorted(items[0].assets.items())
+    }
 
 
 # ── Item search / selection ───────────────────────────────────────────────────
 
+
 def _search_items(
-    collection_id: str, grid, start_date: Optional[str], end_date: Optional[str],
-    time_varying: bool, cloud_cover_property: Optional[str], max_cloud_cover: Optional[float],
-    max_items: int, lang: str,
+    collection_id: str,
+    grid,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    time_varying: bool,
+    cloud_cover_property: Optional[str],
+    max_cloud_cover: Optional[float],
+    max_items: int,
+    lang: str,
 ) -> list:
-    if not HAS_STAC:
-        raise ImportError(
-            "lcz_get_planetary_computer requires pystac-client and planetary-computer "
-            "(pip install pystac-client planetary-computer)"
-        )
+    """Search Planetary Computer and return items sorted best-first."""
+    _require_stac("lcz_get_planetary_computer")
 
     if time_varying and bool(start_date) != bool(end_date):
         raise ValueError("Provide both start_date and end_date, or neither.")
-
-    catalog = pystac_client.Client.open(PC_STAC_URL, modifier=planetary_computer.sign_inplace)
+    if start_date:
+        _parse_iso_date(start_date, "start_date")
+    if end_date:
+        _parse_iso_date(end_date, "end_date")
 
     search_kwargs: dict = {
         "collections": [collection_id],
         "bbox": list(grid.bbox_wgs84),
         # Candidate pool bigger than max_items so best-by-cloud-cover sorting
         # below has something to choose from; still server-side bounded.
+        # pystac-client follows the catalog's pagination links up to this cap.
         "max_items": max(50, max_items * 5),
     }
     if time_varying and start_date and end_date:
         search_kwargs["datetime"] = f"{start_date}/{end_date}"
     if cloud_cover_property and max_cloud_cover is not None:
-        search_kwargs["query"] = {cloud_cover_property: {"lt": max_cloud_cover}}
+        search_kwargs["query"] = {cloud_cover_property: {"lt": float(max_cloud_cover)}}
 
-    items = list(catalog.search(**search_kwargs).items())
+    try:
+        items = _retry_call(
+            lambda: list(_open_catalog().search(**search_kwargs).items()),
+            attempts=2,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface an actionable error
+        raise RuntimeError(
+            f"Planetary Computer search failed for '{collection_id}': {exc}"
+        ) from exc
+
+    # A paginated search can theoretically repeat an item; keep the first.
+    deduped: dict[str, Any] = {}
+    for item in items:
+        deduped.setdefault(str(item.id), item)
+    items = list(deduped.values())
+
     if not items:
-        raise ValueError(lcz_msg(
-            "pc_no_items_found", lang, collection=collection_id,
-            date_range=f" between {start_date} and {end_date}" if start_date else "",
-        ))
+        raise ValueError(
+            lcz_msg(
+                "pc_no_items_found",
+                lang,
+                collection=collection_id,
+                date_range=(
+                    f" between {start_date} and {end_date}" if start_date else ""
+                ),
+            )
+        )
 
     def sort_key(item):
-        cloud = item.properties.get(cloud_cover_property, 0.0) if cloud_cover_property else 0.0
+        raw_cloud = (
+            getattr(item, "properties", {}).get(cloud_cover_property)
+            if cloud_cover_property
+            else None
+        )
+        try:
+            cloud = float(raw_cloud) if raw_cloud is not None else 0.0
+        except (TypeError, ValueError):
+            cloud = 0.0
+        dt = getattr(item, "datetime", None)
         # Fallback for items without a datetime (some static collections):
         # sort_key still needs a comparable value, so treat as "oldest".
-        ts = item.datetime.timestamp() if item.datetime else 0.0
-        return (cloud, -ts)
+        ts = dt.timestamp() if dt is not None else 0.0
+        return (cloud, -ts, str(item.id))
 
     items.sort(key=sort_key)
     return items[:max_items]
@@ -247,12 +379,24 @@ def _clip_to_grid_bbox(da, grid):
     """
     minx, miny, maxx, maxy = grid.bbox_wgs84
     src_crs = da.rio.crs
-    if src_crs is not None and src_crs.to_epsg() != 4326:
-        transformer = pyproj.Transformer.from_crs("EPSG:4326", src_crs, always_xy=True)
-        xs, ys = transformer.transform([minx, maxx, minx, maxx], [miny, miny, maxy, maxy])
-        minx, maxx = min(xs), max(xs)
-        miny, maxy = min(ys), max(ys)
-    return da.rio.clip_box(minx, miny, maxx, maxy, auto_expand=True)
+    if src_crs is None:
+        logger.debug("Asset has no CRS; skipping bbox pre-crop.")
+        return da
+
+    try:
+        if src_crs.to_epsg() != 4326:
+            transformer = pyproj.Transformer.from_crs(
+                "EPSG:4326", src_crs, always_xy=True
+            )
+            xs, ys = transformer.transform(
+                [minx, maxx, minx, maxx], [miny, miny, maxy, maxy]
+            )
+            minx, maxx = min(xs), max(xs)
+            miny, maxy = min(ys), max(ys)
+        return da.rio.clip_box(minx, miny, maxx, maxy, auto_expand=True)
+    except Exception as exc:  # noqa: BLE001 - reprojecting unclipped still works
+        logger.debug("Asset bbox pre-crop failed (%s); using the full asset.", exc)
+        return da
 
 
 def _pick_overview_level(href: str, grid) -> Optional[int]:
@@ -272,16 +416,24 @@ def _pick_overview_level(href: str, grid) -> Optional[int]:
                 return None
             native_res_x = src.res[0]
             src_crs = src.crs
-    except Exception:
+    except Exception:  # noqa: BLE001 - overviews are an optimization only
         return None
 
     tgt_res = abs(grid.transform.a)
+    if tgt_res <= 0:
+        return None
     if grid.crs.to_epsg() == 4326:
         lat = (grid.bbox_wgs84[1] + grid.bbox_wgs84[3]) / 2
         tgt_res_m = tgt_res * 111_320 * max(0.1, math.cos(math.radians(lat)))
     else:
         tgt_res_m = tgt_res
-    native_res_m = native_res_x * 111_320 if (src_crs and src_crs.to_epsg() == 4326) else native_res_x
+    native_res_m = (
+        native_res_x * 111_320
+        if (src_crs is not None and src_crs.to_epsg() == 4326)
+        else native_res_x
+    )
+    if native_res_m <= 0:
+        return None
 
     decimation_needed = tgt_res_m / native_res_m
     if decimation_needed <= 1:
@@ -297,8 +449,14 @@ def _pick_overview_level(href: str, grid) -> Optional[int]:
 
 
 def _fetch_asset_mosaic(
-    items: list, asset: str, grid, template, resampling_enum,
-    collection_id: str, lang: str, verbose: bool,
+    items: list,
+    asset: str,
+    grid,
+    template,
+    resampling_enum,
+    collection_id: str,
+    lang: str,
+    verbose: bool,
 ) -> tuple[np.ndarray, list[str]]:
     """Merge one asset across candidate items onto the target grid.
 
@@ -306,19 +464,33 @@ def _fetch_asset_mosaic(
     each contributes only where the mosaic still has gaps (first-valid-wins),
     stopping early once the grid is fully covered.
     """
+    _require_rioxarray()
     out = np.full(grid.shape, np.nan, dtype=np.float32)
     used_ids: list[str] = []
+
+    if not items:
+        raise ValueError(
+            lcz_msg("pc_no_items_found", lang, collection=collection_id, date_range="")
+        )
 
     for item in items:
         if np.isfinite(out).all():
             break
-        if asset not in item.assets:
+        item_assets = getattr(item, "assets", {}) or {}
+        if asset not in item_assets:
             continue
 
-        href = item.assets[asset].href  # signed already (catalog modifier=sign_inplace)
+        href = item_assets[asset].href  # signed already (catalog modifier=sign_inplace)
         try:
             overview_level = _pick_overview_level(href, grid)
-            with rioxarray.open_rasterio(href, masked=True, overview_level=overview_level) as src:
+            try:
+                src_ctx = rioxarray.open_rasterio(
+                    href, masked=True, overview_level=overview_level
+                )
+            except TypeError:  # older rioxarray without overview_level support
+                src_ctx = rioxarray.open_rasterio(href, masked=True)
+
+            with src_ctx as src:
                 da = src
                 if "band" in da.dims:
                     da = da.isel(band=0, drop=True)
@@ -330,23 +502,46 @@ def _fetch_asset_mosaic(
                 # still warps from full native resolution over the network
                 # (measured: 50s/band vs. ~4s with the matching overview).
                 da = _clip_to_grid_bbox(da, grid)
-                regridded = da.rio.reproject_match(template, resampling=resampling_enum)
-                vals = regridded.values.astype(np.float32)
-        except Exception as e:
-            logger.warning(f"Planetary Computer asset '{asset}' failed for item {item.id}: {e}")
+                regridded = da.rio.reproject_match(
+                    template, resampling=resampling_enum
+                )
+                vals = np.asarray(regridded.values, dtype=np.float32)
+        except Exception as exc:  # noqa: BLE001 - try the next item
+            logger.warning(
+                "Planetary Computer asset '%s' failed for item %s: %s",
+                asset,
+                getattr(item, "id", "?"),
+                exc,
+            )
             continue
 
-        fill_mask = np.isnan(out) & ~np.isnan(vals)
+        vals = np.where(np.isfinite(vals), vals, np.nan).astype(np.float32)
+        if vals.shape != out.shape:
+            logger.warning(
+                "Asset '%s' for item %s reprojected to %s, expected %s; skipping.",
+                asset,
+                getattr(item, "id", "?"),
+                vals.shape,
+                out.shape,
+            )
+            continue
+        fill_mask = np.isnan(out) & np.isfinite(vals)
         if not fill_mask.any():
             continue
         out[fill_mask] = vals[fill_mask]
-        used_ids.append(item.id)
+        used_ids.append(str(item.id))
 
     if not used_ids:
         available = ", ".join(sorted(items[0].assets)) if items else ""
-        raise ValueError(lcz_msg(
-            "pc_asset_missing", lang, asset=asset, collection=collection_id, available=available,
-        ))
+        raise ValueError(
+            lcz_msg(
+                "pc_asset_missing",
+                lang,
+                asset=asset,
+                collection=collection_id,
+                available=available,
+            )
+        )
     if verbose and np.isnan(out).any():
         logger.info(lcz_msg("pc_asset_partial", lang, asset=asset, n_items=len(used_ids)))
 
@@ -355,10 +550,34 @@ def _fetch_asset_mosaic(
 
 # ── Stack assembly / writing ──────────────────────────────────────────────────
 
+
 def _write_pc_stack(
-    path: str, stack: np.ndarray, band_names: list[str], grid,
-    collection_id: str, item_ids: list[str],
+    path: str,
+    stack: np.ndarray,
+    band_names: list[str],
+    grid,
+    collection_id: str,
+    item_ids: list[str],
 ) -> None:
+    """Write an (n_assets, H, W) stack as a multi-band GeoTIFF, atomically."""
+    stack = np.asarray(stack, dtype=np.float32)
+    if stack.ndim != 3:
+        raise ValueError(f"stack must be 3-D (n_assets, H, W), got shape {stack.shape}")
+    if stack.shape[0] != len(band_names):
+        raise ValueError(
+            f"stack has {stack.shape[0]} bands but {len(band_names)} names were given"
+        )
+    if tuple(stack.shape[1:]) != tuple(grid.shape):
+        raise ValueError(
+            f"stack grid {stack.shape[1:]} does not match the LCZ grid {grid.shape}"
+        )
+
+    path = os.path.abspath(str(path))
+    out_dir = os.path.dirname(path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(suffix=".tif", dir=out_dir)
+    os.close(fd)
+
     profile = {
         "driver": "GTiff",
         "height": grid.shape[0],
@@ -372,17 +591,26 @@ def _write_pc_stack(
         "predictor": 3,
         "BIGTIFF": "IF_SAFER",
     }
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(stack)
-        dst.update_tags(collection=collection_id, items=",".join(item_ids))
-        for i, name in enumerate(band_names, start=1):
-            dst.set_band_description(i, name)
+    try:
+        with rasterio.open(tmp_path, "w", **profile) as dst:
+            dst.write(stack)
+            dst.update_tags(collection=collection_id, items=",".join(item_ids))
+            for i, name in enumerate(band_names, start=1):
+                dst.set_band_description(i, str(name))
+        os.replace(tmp_path, path)
+    except Exception:
+        _unlink(tmp_path)
+        raise
 
 
 def _cache_key(
-    collection_id: str, assets: list[str], grid,
-    start_date: Optional[str], end_date: Optional[str],
-    max_cloud_cover: Optional[float], max_items: int,
+    collection_id: str,
+    assets: list[str],
+    grid,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    max_cloud_cover: Optional[float],
+    max_items: int,
 ) -> str:
     bbox = ",".join(f"{v:.4f}" for v in grid.bbox_wgs84)
     raw = (
@@ -392,7 +620,23 @@ def _cache_key(
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _read_cached_stack(cache_path: str) -> tuple[np.ndarray, list[str], list[str]]:
+    """Read a cached PC stack, raising on corrupt/empty files."""
+    with rasterio.open(cache_path) as src:
+        if src.count < 1:
+            raise ValueError("cached Planetary Computer stack has no bands")
+        array = src.read()
+        desc = list(src.descriptions)
+        tags = src.tags()
+    bands = [d or f"band_{i + 1}" for i, d in enumerate(desc)]
+    if len(bands) != array.shape[0]:
+        bands = [f"band_{i + 1}" for i in range(array.shape[0])]
+    item_ids = [t for t in tags.get("items", "").split(",") if t] if tags.get("items") else []
+    return array, bands, item_ids
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
+
 
 def lcz_get_planetary_computer(
     x: Union[str, Path],
@@ -409,6 +653,7 @@ def lcz_get_planetary_computer(
     cache_dir: str = DEFAULT_CACHE_DIR,
     lang: str = "en",
     verbose: bool = True,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> LCZPCResult:
     """Download Microsoft Planetary Computer products cropped to an LCZ map's footprint.
 
@@ -459,6 +704,9 @@ def lcz_get_planetary_computer(
         Message language ("en"/"pt"/"es"/"zh").
     verbose : bool
         Log progress and partial-coverage warnings.
+    max_workers : int
+        Maximum concurrent per-asset downloads/regrids. Default
+        ``min(8, os.cpu_count())``.
 
     Returns
     -------
@@ -466,7 +714,7 @@ def lcz_get_planetary_computer(
         ``array`` is (n_assets, H, W) float32, NaN outside the LCZ map's
         valid pixels or wherever no scene covered a pixel; ``bands[i]``
         names the asset for band ``i``; ``item_ids`` lists the STAC items
-        that contributed to the mosaic.
+        that contributed to the mosaic (sorted).
 
     Examples
     --------
@@ -480,67 +728,181 @@ def lcz_get_planetary_computer(
     >>> # Static, global, no dates needed:
     >>> bio = lcz_get_planetary_computer("LCZ4r_output/lcz_map.tif", collection="biodiversity")
     """
+    try:
+        max_items = int(max_items)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_items must be an integer >= 1") from exc
     if max_items < 1:
         raise ValueError("max_items must be >= 1")
 
+    workers = _coerce_workers(max_workers)
+
+    if isinstance(assets, str):
+        assets = [assets]
     grid = _load_target_grid(x)
     collection_id, resolved_assets, cfg_cloud_prop, time_varying, default_resampling = (
         _resolve_collection(collection, assets, lang)
     )
+    resolved_assets = list(dict.fromkeys(resolved_assets))  # dedupe, keep order
+    if not resolved_assets:
+        raise ValueError("assets must contain at least one asset key")
+
     effective_cloud_prop = cloud_cover_property or cfg_cloud_prop
+    if max_cloud_cover is not None:
+        try:
+            max_cloud_cover = float(max_cloud_cover)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_cloud_cover must be a number or None") from exc
+        if not np.isfinite(max_cloud_cover) or max_cloud_cover < 0:
+            raise ValueError("max_cloud_cover must be a non-negative number")
 
     resampling = resampling or default_resampling
-    resampling_enum = getattr(rasterio.enums.Resampling, resampling, None)
+    resampling_enum = getattr(rasterio.enums.Resampling, str(resampling), None)
     if resampling_enum is None:
         raise ValueError(f"Unknown resampling method: {resampling!r}")
 
-    cache_dir = os.path.expanduser(cache_dir)
-    key = _cache_key(collection_id, resolved_assets, grid, start_date, end_date,
-                      max_cloud_cover, max_items)
+    cache_path = ""
     safe_id = collection_id.replace("/", "_")
-    cache_path = os.path.join(cache_dir, f"pc_{safe_id}_{key}.tif")
+    if cache:
+        cache_root = os.path.expanduser(str(cache_dir))
+        key = _cache_key(
+            collection_id,
+            resolved_assets,
+            grid,
+            start_date,
+            end_date,
+            max_cloud_cover,
+            max_items,
+        )
+        cache_path = os.path.join(cache_root, f"pc_{safe_id}_{key}.tif")
 
-    if cache and _is_valid_raster(cache_path):
-        with rasterio.open(cache_path) as src:
-            array = src.read()
-            bands = [src.descriptions[i] or resolved_assets[i] for i in range(src.count)]
-            tags = src.tags()
-        item_ids = tags.get("items", "").split(",") if tags.get("items") else []
+    array: Optional[np.ndarray] = None
+    bands: list[str] = []
+    item_ids: list[str] = []
+    from_cache = False
+
+    if cache and cache_path and _is_valid_raster(cache_path):
+        try:
+            array, bands, item_ids = _read_cached_stack(cache_path)
+            if array.shape[1:] != grid.shape:
+                raise ValueError(
+                    f"cached stack is {array.shape[1:]} but the LCZ grid is "
+                    f"{grid.shape}; re-downloading"
+                )
+            if array.shape[0] != len(resolved_assets):
+                raise ValueError(
+                    f"cached stack has {array.shape[0]} bands but "
+                    f"{len(resolved_assets)} assets were requested; re-downloading"
+                )
+            from_cache = True
+            if verbose:
+                logger.info("Using cached Planetary Computer stack: %s", cache_path)
+        except Exception as exc:  # noqa: BLE001 - corrupt cache is re-downloaded
+            logger.warning("Ignoring unreadable PC cache %s: %s", cache_path, exc)
+            array = None
+
+    if array is None:
         if verbose:
-            logger.info(f"Using cached Planetary Computer stack: {cache_path}")
-    else:
-        if verbose:
-            logger.info(f"Searching '{collection_id}' on Planetary Computer...")
+            logger.info("Searching '%s' on Planetary Computer...", collection_id)
         items = _search_items(
-            collection_id, grid, start_date, end_date, time_varying,
-            effective_cloud_prop, max_cloud_cover, max_items, lang,
+            collection_id,
+            grid,
+            start_date,
+            end_date,
+            time_varying,
+            effective_cloud_prop,
+            max_cloud_cover,
+            max_items,
+            lang,
         )
         if verbose:
-            logger.info(f"Found {len(items)} candidate item(s); fetching {len(resolved_assets)} asset(s).")
+            logger.info(
+                "Found %d candidate item(s); fetching %d asset(s).",
+                len(items),
+                len(resolved_assets),
+            )
 
         template = _rio_template(grid)
-        band_arrays: list[np.ndarray] = []
-        item_ids_used: set[str] = set()
-        for asset in resolved_assets:
-            arr, used_ids = _fetch_asset_mosaic(
-                items, asset, grid, template, resampling_enum, collection_id, lang, verbose,
-            )
-            band_arrays.append(arr)
-            item_ids_used.update(used_ids)
+        n_tasks = max(1, min(workers, len(resolved_assets)))
+        results: list[Optional[tuple[np.ndarray, list[str]]]] = [None] * len(
+            resolved_assets
+        )
+        errors: dict[int, BaseException] = {}
 
-        array = np.stack(band_arrays).astype(np.float32)
-        array = np.where(grid.valid_mask[None, :, :], array, np.nan).astype(np.float32)
+        def _run(index: int, asset: str) -> None:
+            try:
+                results[index] = _fetch_asset_mosaic(
+                    items,
+                    asset,
+                    grid,
+                    template.copy(),  # isolated per task
+                    resampling_enum,
+                    collection_id,
+                    lang,
+                    verbose,
+                )
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                errors[index] = exc
+
+        if n_tasks > 1 and len(resolved_assets) > 1:
+            with ThreadPoolExecutor(
+                max_workers=n_tasks, thread_name_prefix="lcz-pc"
+            ) as pool:
+                futures = [
+                    pool.submit(_run, i, asset)
+                    for i, asset in enumerate(resolved_assets)
+                ]
+                for future in futures:
+                    future.result()
+        else:
+            for i, asset in enumerate(resolved_assets):
+                _run(i, asset)
+
+        if errors:
+            # Report in deterministic asset order, not thread-completion order.
+            first_index = min(errors)
+            failed_asset = resolved_assets[first_index]
+            first_error = errors[first_index]
+            if isinstance(first_error, (ValueError, ImportError)):
+                raise first_error
+            raise RuntimeError(
+                f"Planetary Computer asset '{failed_asset}' failed: {first_error}"
+            ) from first_error
+
+        band_arrays = [r[0] for r in results if r is not None]
+        if len(band_arrays) != len(resolved_assets):
+            raise RuntimeError(
+                "Planetary Computer asset download produced an incomplete stack"
+            )
+        item_ids_used: set[str] = set()
+        for r in results:
+            if r is not None:
+                item_ids_used.update(r[1])
+
+        array = np.stack(band_arrays).astype(np.float32, copy=False)
+        array = np.where(
+            grid.valid_mask[None, :, :], array, np.nan
+        ).astype(np.float32)
         bands = resolved_assets
         item_ids = sorted(item_ids_used)
 
-        if cache:
-            os.makedirs(cache_dir, exist_ok=True)
-            _write_pc_stack(cache_path, array, bands, grid, collection_id, item_ids)
+        if cache and cache_path:
+            try:
+                os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+                _write_pc_stack(
+                    cache_path, array, bands, grid, collection_id, item_ids
+                )
+            except Exception as exc:  # noqa: BLE001 - caching is best-effort
+                logger.warning(
+                    "Could not write the Planetary Computer cache %s: %s",
+                    cache_path,
+                    exc,
+                )
 
     if isave:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, f"lcz_pc_{safe_id}_stack.tif")
-        if cache and os.path.exists(cache_path):
+        if from_cache and cache_path and os.path.exists(cache_path):
             _atomic_copy_raster(cache_path, out_path)
         else:
             _write_pc_stack(out_path, array, bands, grid, collection_id, item_ids)
@@ -548,7 +910,7 @@ def lcz_get_planetary_computer(
             logger.info("Saved: %s", os.path.abspath(out_path))
 
     return LCZPCResult(
-        path=cache_path if cache else None,
+        path=cache_path if cache and cache_path and os.path.exists(cache_path) else None,
         array=array,
         bands=bands,
         collection=collection_id,
@@ -556,4 +918,9 @@ def lcz_get_planetary_computer(
     )
 
 
-__all__ = ["lcz_get_planetary_computer", "lcz_list_pc_assets", "LCZPCResult", "PC_COLLECTIONS"]
+__all__ = [
+    "lcz_get_planetary_computer",
+    "lcz_list_pc_assets",
+    "LCZPCResult",
+    "PC_COLLECTIONS",
+]

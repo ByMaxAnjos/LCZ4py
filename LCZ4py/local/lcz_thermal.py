@@ -5,22 +5,28 @@ Thermal comfort and anthropogenic heat estimation for LCZ analysis.
 
 - lcz_utci: Universal Thermal Climate Index (Fiala et al. 2012, ISO 7243)
 - lcz_anthropogenic_heat: Anthropogenic heat flux Q_F (W/m²) from LCZ classes
+
+The UTCI implementation here is a *simplified polynomial screening model*
+(centred 2nd-order expansion), not the official 6th-order UTCI regression
+table shipped by the UTCI operational code — use it for relative comparisons
+between LCZ classes, not as a certified comfort assessment.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Optional, Union, Literal
+from typing import Any, Literal, Optional, Union
 
 import numpy as np
 
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-from LCZ4py._internal.lcz_parameters_data import (
-    LCZ_TABLE, LCZ_NAMES, LCZ_IDS, get_lcz_names,
-)
+from LCZ4py._internal.lcz_parameters_data import get_lcz_names
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal.lcz_theme import finalize_export, add_map_furniture
+
+logger = logging.getLogger(__name__)
 
 # ── UTCI thermal stress categories ───────────────────────────────────────────
 
@@ -50,15 +56,22 @@ UTCI_CATEGORY_COLORS = {
     "Extreme heat stress": "#CC0000",
 }
 
+_UTCI_BOUNDS = np.array([cat[0] for cat in UTCI_CATEGORIES], dtype=np.float64)
+_UTCI_LABELS = [cat[2] for cat in UTCI_CATEGORIES]
+_UTCI_CATEGORY_INDEX = {label: i for i, label in enumerate(_UTCI_LABELS)}
+_UTCI_NA_LABEL = "N/A"
 
-# ── UTCI polynomial coefficients (UMET-LS UTKK model) ───────────────────────
+
+# ── UTCI polynomial coefficients (simplified UTKK-style expansion) ───────────
 
 def _utci_poly(ta: np.ndarray, tmrt: np.ndarray, vas: np.ndarray, es: np.ndarray) -> np.ndarray:
-    """Compute UTCI using the Fiala et al. 2012 polynomial approximation.
+    """Compute a UTCI approximation from a centred 2nd-order expansion.
 
-    This is a numerically stable implementation of the UTCI regression model
-    from the UTKK bioclimate model (ISO 7243). The polynomial uses a 6th-order
-    expansion in four input variables with proper centering to avoid overflow.
+    This is a numerically stable *screening* approximation of the UTCI
+    (Fiala et al. 2012) response surface. It is monotonic in the expected
+    directions (warmer air / higher radiant load / higher humidity raise UTCI,
+    wind lowers it) and is internally consistent, but it is **not** the
+    official operative-temperature regression table.
 
     Parameters
     ----------
@@ -78,8 +91,6 @@ def _utci_poly(ta: np.ndarray, tmrt: np.ndarray, vas: np.ndarray, es: np.ndarray
     va_c = np.clip(vas, 0, 30)
     es_c = es - 15.0    # centered at ~15 hPa
 
-    # UTCI approximation using the validated Fiala coefficients
-    # Applied to centered variables for numerical stability
     utci = (
         25.0  # base temperature
         + 0.8467 * ta_c
@@ -95,14 +106,15 @@ def _utci_poly(ta: np.ndarray, tmrt: np.ndarray, vas: np.ndarray, es: np.ndarray
         - 0.0002 * dt_c * va_c
         + 0.0001 * es_c * va_c
     )
-
     return utci
 
 
-# ── UTCI category classification ─────────────────────────────────────────────
-
 def _utci_category(values: np.ndarray) -> np.ndarray:
     """Classify UTCI values into thermal stress categories.
+
+    Bins are closed at the lower edge, matching the UTCI convention. Values
+    that are NaN/inf are labelled ``"N/A"`` (they used to be left as
+    uninitialised object cells).
 
     Parameters
     ----------
@@ -112,21 +124,25 @@ def _utci_category(values: np.ndarray) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        Category labels (strings).
+        Category labels (object dtype of strings).
     """
-    bounds = [cat[0] for cat in UTCI_CATEGORIES] + [999.0]
-    labels = [cat[2] for cat in UTCI_CATEGORIES]
-    cats = np.empty(values.shape, dtype=object)
-    for i, label in enumerate(labels):
-        mask = (values >= bounds[i]) & (values < bounds[i + 1])
-        cats[mask] = label
-    return cats
+    arr = np.asarray(values, dtype=np.float64)
+    flat = arr.ravel()
+    with np.errstate(invalid="ignore"):
+        idx = np.searchsorted(_UTCI_BOUNDS, flat, side="right") - 1
+    idx = np.clip(idx, 0, len(_UTCI_LABELS) - 1)
+    out = np.asarray(_UTCI_LABELS, dtype=object)[idx]
+    out = np.where(np.isfinite(flat), out, _UTCI_NA_LABEL)
+    return out.reshape(arr.shape)
 
 
 # ── Water vapor pressure from humidity ────────────────────────────────────────
 
 def _saturation_vapor_pressure(ta: np.ndarray) -> np.ndarray:
     """Buck equation for saturation vapor pressure (hPa).
+
+    The denominator is guarded so extreme (unphysical) temperatures cannot
+    raise a division-by-zero / overflow warning.
 
     Parameters
     ----------
@@ -138,7 +154,9 @@ def _saturation_vapor_pressure(ta: np.ndarray) -> np.ndarray:
     np.ndarray
         Saturation vapor pressure (hPa).
     """
-    return 6.1121 * np.exp((18.678 - ta / 234.5) * ta / (257.14 + ta))
+    ta = np.asarray(ta, dtype=np.float64)
+    denom = np.maximum(257.14 + ta, 1e-6)
+    return 6.1121 * np.exp((18.678 - ta / 234.5) * ta / denom)
 
 
 def _vapor_pressure(ta: np.ndarray, rh: np.ndarray) -> np.ndarray:
@@ -156,7 +174,7 @@ def _vapor_pressure(ta: np.ndarray, rh: np.ndarray) -> np.ndarray:
     np.ndarray
         Water vapor pressure (hPa).
     """
-    return _saturation_vapor_pressure(ta) * rh / 100.0
+    return _saturation_vapor_pressure(ta) * np.clip(rh, 0.0, 100.0) / 100.0
 
 
 # ── Mean radiant temperature estimation ──────────────────────────────────────
@@ -183,14 +201,23 @@ def _estimate_tmrt_from_svf(
     np.ndarray
         Estimated mean radiant temperature (°C).
     """
-    return ta + (1.0 - svf) * 15.0
+    return ta + (1.0 - np.clip(svf, 0.0, 1.0)) * 15.0
 
 
 # ── Return types ──────────────────────────────────────────────────────────────
 
 @dataclass
 class UTCIResult:
-    """Return type for lcz_utci."""
+    """Return type for lcz_utci.
+
+    Attributes
+    ----------
+    values : UTCI index values (°C), flattened to 1-D.
+    categories : Stress labels, same shape as ``values``.
+    stats : Summary statistics (mean/min/max/std/percentiles/category %).
+    plot : Plotly figure (map for 2-D input, histogram for 1-D).
+    """
+
     values: np.ndarray
     categories: np.ndarray
     stats: dict
@@ -199,13 +226,52 @@ class UTCIResult:
 
 @dataclass
 class AnthropogenicHeatResult:
-    """Return type for lcz_anthropogenic_heat."""
+    """Return type for lcz_anthropogenic_heat.
+
+    Attributes
+    ----------
+    array : Q_F values (W/m²), same shape as the input class array.
+    stats : Per-class and area-weighted summary statistics.
+    plot : Plotly figure (heatmap for 2-D input, bar chart for 1-D).
+    """
+
     array: np.ndarray
     stats: dict
     plot: Optional[go.Figure] = None
 
 
 # ── Public entry points ───────────────────────────────────────────────────────
+
+def _broadcast_thermal_inputs(
+    air_temp, wind_speed, relative_humidity, mean_radiant_temp,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Broadcast the four thermal inputs to a common shape, with validation."""
+    try:
+        ta, vas, rh = np.broadcast_arrays(
+            np.asarray(air_temp, dtype=np.float64),
+            np.asarray(wind_speed, dtype=np.float64),
+            np.asarray(relative_humidity, dtype=np.float64),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "air_temp, wind_speed and relative_humidity must have compatible "
+            f"shapes; got {np.shape(air_temp)}, {np.shape(wind_speed)}, "
+            f"{np.shape(relative_humidity)}"
+        ) from exc
+
+    tmrt = None
+    if mean_radiant_temp is not None:
+        try:
+            tmrt = np.broadcast_to(
+                np.asarray(mean_radiant_temp, dtype=np.float64), ta.shape
+            ).copy()
+        except ValueError as exc:
+            raise ValueError(
+                "mean_radiant_temp must broadcast to the shape of air_temp "
+                f"({ta.shape}); got {np.shape(mean_radiant_temp)}"
+            ) from exc
+    return ta, vas, rh, tmrt
+
 
 def lcz_utci(
     air_temp: Union[float, np.ndarray],
@@ -216,89 +282,148 @@ def lcz_utci(
     lc_z: Optional[np.ndarray] = None,
     output: Literal["category", "index"] = "category",
     lang: str = "en",
+    transform: Optional[Any] = None,
+    crs: Optional[Any] = None,
+    style: str = "default",
 ) -> UTCIResult:
     """Compute the Universal Thermal Climate Index (UTCI).
 
-    Implements the UTCI polynomial approximation from the UTKK model
-    (Fiala et al. 2012, ISO 7243). When mean_radiant_temp is not provided,
-    it is estimated from the LCZ sky view factor if lc_z is given, otherwise
-    assumed equal to air temperature.
+    Uses a simplified polynomial approximation of the UTCI response surface
+    (after Fiala et al. 2012 / ISO 7243) — see :func:`_utci_poly`. When
+    ``mean_radiant_temp`` is not provided, it is estimated from the LCZ sky
+    view factor if ``lc_z`` is given, otherwise assumed equal to air
+    temperature.
 
     Parameters
     ----------
     air_temp : float or np.ndarray
         Air temperature (°C).
     wind_speed : float or np.ndarray
-        Wind speed at 10 m height (m/s).
+        Wind speed at 10 m height (m/s). Clipped to 0-30 m/s.
     relative_humidity : float or np.ndarray
-        Relative humidity (%).
+        Relative humidity (%). Clipped to 0-100 %.
     mean_radiant_temp : float or np.ndarray, optional
         Mean radiant temperature (°C). If None, estimated from LCZ SVF
         (requires lc_z) or assumed equal to air_temp.
     lc_z : np.ndarray, optional
         2D array of LCZ classes (1–17). Used to look up sky view factor
-        when mean_radiant_temp is None.
+        when mean_radiant_temp is None. Nodata (0 or non-finite) yields NaN
+        UTCI rather than a made-up class.
     output : {"category", "index"}
-        Return thermal stress categories or numeric UTCI values.
+        Selects the primary map rendering: discrete stress categories
+        (default) or a continuous UTCI index map. Both are always returned in
+        the result object.
     lang : str
         Language for category labels ("en", "pt", "es", "zh").
+    transform : rasterio.Affine, optional
+        Georeferencing of the 2-D input, so the map can be drawn with real
+        coordinates, a scale bar and a north arrow. Added for publication
+        figures; ignored for 1-D input.
+    crs : rasterio CRS, optional
+        CRS matching ``transform``. Axis labels and map furniture adapt to
+        geographic vs. projected CRS.
+    style : str
+        Publication style preset: "default", "nature", "science", or
+        "generic_bw" (see :mod:`LCZ4py._internal.lcz_theme`).
 
     Returns
     -------
     UTCIResult
         values: UTCI index (°C), categories: stress labels,
         stats: summary statistics, plot: Plotly figure.
-    """
-    ta = np.asarray(air_temp, dtype=np.float64)
-    vas = np.asarray(wind_speed, dtype=np.float64)
-    rh = np.asarray(relative_humidity, dtype=np.float64)
 
-    # Clamp wind speed to valid range
+    Raises
+    ------
+    ValueError
+        On incompatible input shapes, an unknown ``output`` value, a ``lc_z``
+        that does not match ``air_temp``, or a non-finite air temperature.
+    """
+    if output not in ("category", "index"):
+        raise ValueError(f"output must be 'category' or 'index', got {output!r}")
+    if lang not in ("en", "pt", "es", "zh"):
+        lang = "en"
+
+    ta, vas, rh, tmrt = _broadcast_thermal_inputs(
+        air_temp, wind_speed, relative_humidity, mean_radiant_temp
+    )
+
+    n_out_of_range = int(np.sum(np.isfinite(rh) & ((rh < 0) | (rh > 100))))
+    if n_out_of_range:
+        logger.warning(
+            "%d relative-humidity value(s) outside 0-100%% were clipped.",
+            n_out_of_range,
+        )
+    n_wind = int(np.sum(np.isfinite(vas) & (vas < 0)))
+    if n_wind:
+        logger.warning("%d negative wind-speed value(s) were clipped to 0.", n_wind)
     vas = np.clip(vas, 0.0, 30.0)
 
     # Estimate mean radiant temperature if not provided
-    if mean_radiant_temp is not None:
-        tmrt = np.asarray(mean_radiant_temp, dtype=np.float64)
-    elif lc_z is not None:
+    if tmrt is None and lc_z is not None:
+        lcz_arr = np.asarray(lc_z)
+        try:
+            lcz_b = np.broadcast_to(lcz_arr, ta.shape)
+        except ValueError as exc:
+            raise ValueError(
+                f"lc_z must broadcast to air_temp shape {ta.shape}; "
+                f"got {lcz_arr.shape}"
+            ) from exc
+        lookup = _get_lookup_table()
         _, names = _get_parameter_lookup_cached()
         svf_idx = names.index("svf_mean")
-        lookup = _get_lookup_table()
-        lcz_safe = np.clip(lc_z.astype(np.int32), 0, 17)
-        svf = lookup[lcz_safe, svf_idx]
+        lcz_safe = np.clip(np.nan_to_num(lcz_b, nan=0.0).astype(np.int32), 0, 17)
+        svf = lookup[lcz_safe, svf_idx].astype(np.float64)
+        svf = np.where((lcz_safe >= 1) & np.isfinite(svf), svf, np.nan)
         tmrt = _estimate_tmrt_from_svf(ta, svf)
-    else:
+    elif tmrt is None:
         tmrt = ta.copy()
 
-    # Compute water vapor pressure
     es = _vapor_pressure(ta, rh)
+    utci_values = np.asarray(_utci_poly(ta, tmrt, vas, es), dtype=np.float64).ravel()
+    categories = np.asarray(_utci_category(utci_values)).ravel()
 
-    # Compute UTCI polynomial
-    utci_values = _utci_poly(ta, tmrt, vas, es).ravel()
-
-    # Compute categories
-    categories = _utci_category(utci_values)
-
-    # Build stats
-    valid = ~np.isnan(utci_values)
+    valid = np.isfinite(utci_values)
     utci_valid = utci_values[valid]
     cat_valid = categories[valid]
+    n_valid = int(valid.sum())
 
-    cat_labels = [cat[2] for cat in UTCI_CATEGORIES]
-    cat_pcts = {}
-    for label in cat_labels:
-        count = np.sum(cat_valid == label)
-        cat_pcts[label] = float(count / max(valid.sum(), 1) * 100)
-
-    stats = {
-        "mean": float(np.mean(utci_valid)) if utci_valid.size else 0.0,
-        "min": float(np.min(utci_valid)) if utci_valid.size else 0.0,
-        "max": float(np.max(utci_valid)) if utci_valid.size else 0.0,
-        "std": float(np.std(utci_valid)) if utci_valid.size else 0.0,
-        "category_percentages": cat_pcts,
+    cat_pcts = {
+        label: (
+            float(np.sum(cat_valid == label) / n_valid * 100) if n_valid else 0.0
+        )
+        for label in _UTCI_LABELS
     }
 
-    # Build plot
-    fig = _plot_utci_map(utci_values, categories, lang)
+    if n_valid:
+        stats = {
+            "mean": float(np.mean(utci_valid)),
+            "min": float(np.min(utci_valid)),
+            "max": float(np.max(utci_valid)),
+            "std": float(np.std(utci_valid)),
+            "p05": float(np.percentile(utci_valid, 5)),
+            "p50": float(np.percentile(utci_valid, 50)),
+            "p95": float(np.percentile(utci_valid, 95)),
+            "n_valid": n_valid,
+            "category_percentages": cat_pcts,
+        }
+    else:
+        logger.warning("lcz_utci: no finite UTCI values were produced.")
+        stats = {
+            "mean": float("nan"), "min": float("nan"), "max": float("nan"),
+            "std": float("nan"), "p05": float("nan"), "p50": float("nan"),
+            "p95": float("nan"), "n_valid": 0,
+            "category_percentages": cat_pcts,
+        }
+
+    fig = _plot_utci_map(
+        utci_values.reshape(ta.shape) if ta.ndim else utci_values,
+        categories.reshape(ta.shape) if ta.ndim else categories,
+        lang,
+        mode=output,
+        transform=transform,
+        crs=crs,
+        style=style,
+    )
 
     return UTCIResult(
         values=utci_values,
@@ -308,35 +433,70 @@ def lcz_utci(
     )
 
 
+def _coerce_class_array(lcz_classes) -> np.ndarray:
+    """Convert an LCZ class array to int32, mapping nodata/NaN to 0."""
+    arr = np.asarray(lcz_classes)
+    if arr.dtype == object or np.issubdtype(arr.dtype, np.floating):
+        arr_f = np.asarray(arr, dtype=np.float64)
+        finite = np.isfinite(arr_f)
+        rounded = np.where(finite, np.rint(np.nan_to_num(arr_f, nan=0.0)), 0)
+        out = rounded.astype(np.int32)
+        n_nan = int((~finite).sum())
+        if n_nan:
+            logger.info(
+                "lcz_anthropogenic_heat: %d non-finite class value(s) treated "
+                "as nodata (0).", n_nan,
+            )
+        return out
+    return arr.astype(np.int32)
+
+
 def lcz_anthropogenic_heat(
     lcz_classes: np.ndarray,
     *,
     method: Literal["simple", "detailed"] = "simple",
     params: Optional[dict] = None,
     lang: str = "en",
+    transform: Optional[Any] = None,
+    crs: Optional[Any] = None,
+    style: str = "default",
 ) -> AnthropogenicHeatResult:
     """Estimate anthropogenic heat flux Q_F (W/m²) from LCZ classes.
 
     Parameters
     ----------
     lcz_classes : np.ndarray
-        2D or 1D array of LCZ class codes (1–17).
+        2D or 1D array of LCZ class codes (1–17). Nodata (0) and non-finite
+        values yield Q_F = 0 (and are excluded from the statistics).
     method : {"simple", "detailed"}
-        "simple": literature-derived Q_F ranges per class.
+        "simple": literature-derived Q_F ranges per class (midpoint).
         "detailed": energy balance from LCZ parameters (BSF, ISF, HRE).
     params : dict, optional
         Custom Q_F overrides for "simple" method. Keys are LCZ class
         codes (int), values are (min, max) tuples in W/m².
     lang : str
         Language for i18n messages.
+    transform : rasterio.Affine, optional
+        Georeferencing for the 2-D heatmap (publication maps).
+    crs : rasterio CRS, optional
+        CRS matching ``transform``.
+    style : str
+        Publication style preset (see :mod:`LCZ4py._internal.lcz_theme`).
 
     Returns
     -------
     AnthropogenicHeatResult
         array: Q_F values (W/m²), stats: per-class and area-weighted
-        means, plot: Plotly heatmap.
+        means, plot: Plotly heatmap (or bar chart for 1-D input).
+
+    Raises
+    ------
+    ValueError
+        On an unknown ``method``, malformed ``params``, or empty input.
     """
-    classes = np.asarray(lcz_classes, dtype=np.int32)
+    classes = _coerce_class_array(lcz_classes)
+    if classes.size == 0:
+        raise ValueError("lcz_classes is empty.")
     original_shape = classes.shape
     flat = classes.ravel()
 
@@ -362,7 +522,23 @@ def lcz_anthropogenic_heat(
     }
 
     if params:
-        default_qf_ranges.update(params)
+        for key, value in params.items():
+            try:
+                cls = int(key)
+                lo, hi = (float(v) for v in value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "params must map LCZ class codes (int) to (min, max) "
+                    f"tuples, got {key!r}: {value!r}"
+                ) from None
+            if not (np.isfinite(lo) and np.isfinite(hi)) or lo > hi:
+                raise ValueError(
+                    f"params[{key!r}] must be a finite (min <= max) pair, "
+                    f"got ({lo}, {hi})"
+                )
+            if not 1 <= cls <= 17:
+                raise ValueError(f"params key {cls} is not an LCZ class (1-17).")
+            default_qf_ranges[cls] = (lo, hi)
 
     if method == "simple":
         qf = _qf_simple(flat, default_qf_ranges)
@@ -372,12 +548,10 @@ def lcz_anthropogenic_heat(
         raise ValueError(f"method must be 'simple' or 'detailed', got {method!r}")
 
     qf_array = qf.reshape(original_shape)
-
-    # Stats
     stats = _build_qf_stats(qf, flat, default_qf_ranges, lang)
-
-    # Plot
-    fig = _plot_qf_heatmap(qf_array, original_shape, lang)
+    fig = _plot_qf_heatmap(
+        qf_array, classes, lang, transform=transform, crs=crs, style=style,
+    )
 
     return AnthropogenicHeatResult(
         array=qf_array,
@@ -404,12 +578,13 @@ def _qf_simple(
     flat: np.ndarray,
     qf_ranges: dict[int, tuple[float, float]],
 ) -> np.ndarray:
-    """Compute Q_F using mean of literature ranges per LCZ class."""
-    qf = np.zeros_like(flat, dtype=np.float64)
+    """Compute Q_F as the midpoint of each LCZ class range (lookup table)."""
+    lut = np.zeros(18, dtype=np.float64)
     for cls, (lo, hi) in qf_ranges.items():
-        mask = flat == cls
-        qf[mask] = (lo + hi) / 2.0
-    return qf
+        if 1 <= int(cls) <= 17:
+            lut[int(cls)] = (float(lo) + float(hi)) / 2.0
+    safe = np.where((flat >= 1) & (flat <= 17), flat, 0)
+    return lut[safe]
 
 
 def _qf_detailed(flat: np.ndarray) -> np.ndarray:
@@ -422,10 +597,14 @@ def _qf_detailed(flat: np.ndarray) -> np.ndarray:
     - Q_F,people = urban_fraction * 5.0  (W/m², simplified)
     """
     table, names = _get_parameter_lookup_cached()
-
-    bsf_idx = names.index("BSF_mean")
-    isf_idx = names.index("ISF_mean")
-    hre_idx = names.index("HRE_mean")
+    try:
+        bsf_idx = names.index("BSF_mean")
+        isf_idx = names.index("ISF_mean")
+        hre_idx = names.index("HRE_mean")
+    except ValueError as exc:
+        raise ValueError(
+            f"Parameter lookup is missing {exc.args[0]!r}; available: {names}"
+        ) from exc
 
     safe = np.clip(flat, 0, 17)
     bsf = table[safe, bsf_idx]   # %
@@ -451,226 +630,307 @@ def _build_qf_stats(
     qf_ranges: dict[int, tuple[float, float]],
     lang: str,
 ) -> dict:
-    """Build summary statistics for Q_F output."""
+    """Build summary statistics for Q_F output (one bincount pass)."""
     valid = (flat >= 1) & (flat <= 17)
     qf_valid = qf[valid]
-    flat_valid = flat[valid]
+    codes = np.where(valid, flat, 0)
 
-    per_class = {}
+    counts = np.bincount(codes, minlength=18)
+    sums = np.bincount(codes, weights=np.where(valid, qf, 0.0), minlength=18)
+
+    per_class: dict[int, dict[str, float]] = {}
     for cls in range(1, 18):
-        mask = flat_valid == cls
-        if mask.any():
-            per_class[int(cls)] = {
-                "mean": float(np.mean(qf[mask])),
-                "min": float(np.min(qf[mask])),
-                "max": float(np.max(qf[mask])),
-                "count": int(mask.sum()),
-            }
+        if counts[cls] == 0:
+            continue
+        mask = codes == cls
+        values = qf[mask]
+        per_class[cls] = {
+            "mean": float(sums[cls] / counts[cls]),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+            "count": int(counts[cls]),
+        }
 
     total_mean = float(np.mean(qf_valid)) if qf_valid.size else 0.0
-
     return {
         "per_class": per_class,
         "total_mean": total_mean,
         "total_pixels": int(valid.sum()),
+        "units": "W/m²",
     }
 
 
 # ── Plotly helpers ────────────────────────────────────────────────────────────
 
+def _format_utci_hover(values: np.ndarray) -> np.ndarray:
+    """Object array of hover strings (``'21.4 °C'`` or ``'N/A'``)."""
+    out = np.empty(np.shape(values), dtype=object)
+    finite = np.isfinite(values)
+    out[finite] = [f"{v:.1f} °C" for v in np.asarray(values)[finite].ravel()]
+    out[~finite] = _UTCI_NA_LABEL
+    return out
+
+
+def _yaxis_kwargs(ylab: str, georeferenced: bool) -> dict:
+    """Y-axis layout; keeps a 1:1 aspect only for georeferenced maps."""
+    kwargs: dict[str, Any] = dict(
+        title=ylab, gridcolor="#e0e0e0", autorange="reversed",
+    )
+    if georeferenced:
+        kwargs["scaleanchor"] = "x"
+        kwargs["scaleratio"] = 1
+    return kwargs
+
+
 def _plot_utci_map(
     values: np.ndarray,
     categories: np.ndarray,
     lang: str,
+    mode: str = "category",
+    transform: Optional[Any] = None,
+    crs: Optional[Any] = None,
+    style: str = "default",
 ) -> go.Figure:
-    """Create a choropleth-style heatmap of UTCI values with stress colors."""
-    if values.ndim == 1:
-        # Cannot make a 2D map from 1D data; use histogram instead
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(
-            x=values,
-            nbinsx=50,
-            marker_color="#4C72B0",
-            marker_line_color="white",
-            marker_line_width=0.5,
-        ))
-        fig.update_layout(
-            title=dict(
-                text=lcz_msg("utci_hist_title", lang),
-                font=dict(size=18),
-                x=0.5,
-                xanchor="center",
+    """UTCI figure: discrete stress map / index map for 2-D, histogram for 1-D."""
+    if np.ndim(values) == 1:
+        return _plot_utci_histogram(values, lang, style=style)
+
+    h, w = np.shape(values)
+    geo_kwargs: dict[str, Any] = {}
+    xlab, ylab = "Column", "Row"
+    if transform is not None:
+        x0, ymax = transform.c, transform.f
+        dx, dy = transform.a, -transform.e
+        geo_kwargs = {"x0": x0, "y0": ymax + h * transform.e, "dx": dx, "dy": dy}
+        geographic = True
+        if crs is not None:
+            try:
+                geographic = bool(crs.is_geographic)
+            except Exception:  # noqa: BLE001
+                geographic = True
+        xlab = "Longitude [°]" if geographic else "Easting [m]"
+        ylab = "Latitude [°]" if geographic else "Northing [m]"
+
+    if mode == "index":
+        finite = np.isfinite(values)
+        z = np.where(finite, values, np.nan)
+        customdata = np.where(finite, categories, _UTCI_NA_LABEL)
+        if transform is not None:
+            # Heatmap y0 is the south edge, so row 0 (north) must go last.
+            z, customdata = np.flipud(z), np.flipud(customdata)
+        fig = go.Figure(go.Heatmap(
+            z=z,
+            colorscale="RdYlBu_r",
+            zmid=9.0,  # 9 °C = lower edge of "no thermal stress"
+            colorbar=dict(title=dict(text="UTCI [°C]", side="right")),
+            customdata=customdata,
+            hovertemplate=(
+                "<b>UTCI: %{z:.1f} °C</b><br>"
+                "%{customdata}<br>"
+                "Row: %{y}<br>Col: %{x}<extra></extra>"
             ),
-            xaxis_title="UTCI [°C]",
-            yaxis_title="Count",
-            plot_bgcolor="#fafafa",
-            paper_bgcolor="white",
-            margin=dict(l=60, r=30, t=60, b=50),
-            width=900,
-            height=500,
-        )
-        return fig
-
-    h, w = values.shape
-
-    # Color by category
-    cat_colors = np.empty(categories.shape, dtype=object)
-    for label, color in UTCI_CATEGORY_COLORS.items():
-        cat_colors[categories == label] = color
-
-    # Build a numeric color array for the heatmap
-    color_numeric = np.zeros(values.shape, dtype=np.float64)
-    for i, (_, _, label) in enumerate(UTCI_CATEGORIES):
-        mask = categories == label
-        color_numeric[mask] = i
-
-    fig = go.Figure(data=go.Heatmap(
-        z=color_numeric,
-        colorscale=[
-            [0.0, "#0000FF"],
-            [0.11, "#0066FF"],
-            [0.22, "#3399FF"],
-            [0.33, "#66CCFF"],
-            [0.44, "#CCFFCC"],
-            [0.55, "#33CC33"],
-            [0.66, "#FFCC00"],
-            [0.77, "#FF6600"],
-            [0.88, "#FF3300"],
-            [1.0, "#CC0000"],
-        ],
-        showscale=False,
-        hovertemplate=(
-            "<b>UTCI: %{z:.1f} °C</b><br>"
-            "Row: %{y}<br>"
-            "Col: %{x}<extra></extra>"
-        ),
-    ))
-
-    # Overlay numeric values as text
-    fig.add_trace(go.Heatmap(
-        z=values,
-        colorscale="RdYlBu_r",
-        showscale=True,
-        colorbar=dict(
-            title="UTCI [°C]",
-            title_side="right",
-            len=0.75,
-        ),
-        opacity=0.0,
-        hoverinfo="skip",
-    ))
+            **geo_kwargs,
+        ))
+    else:
+        # Discrete category raster: z encodes the category index, so the
+        # colorbar can show one tick per stress class.
+        idx = np.zeros((h, w), dtype=np.float64)
+        for label, i in _UTCI_CATEGORY_INDEX.items():
+            idx[categories == label] = i
+        z = np.where(np.isfinite(values), idx, np.nan)
+        hover = _format_utci_hover(values)
+        if transform is not None:
+            z, hover = np.flipud(z), np.flipud(hover)
+        ticks = list(range(len(_UTCI_LABELS)))
+        fig = go.Figure(go.Heatmap(
+            z=z,
+            zmin=-0.5, zmax=len(_UTCI_LABELS) - 0.5,
+            colorscale=[
+                [stop, UTCI_CATEGORY_COLORS[label]]
+                for i, label in enumerate(_UTCI_LABELS)
+                for stop in (i / len(_UTCI_LABELS),
+                             (i + 1) / len(_UTCI_LABELS))
+            ],
+            colorbar=dict(
+                title=dict(text="Stress class", side="right"),
+                tickmode="array",
+                tickvals=ticks,
+                ticktext=_UTCI_LABELS,
+            ),
+            customdata=hover,
+            hovertemplate=(
+                "<b>UTCI: %{customdata}</b><br>"
+                "Row: %{y}<br>Col: %{x}<extra></extra>"
+            ),
+            **geo_kwargs,
+        ))
 
     fig.update_layout(
         title=dict(
             text=lcz_msg("utci_map_title", lang),
-            font=dict(size=18),
-            x=0.5,
-            xanchor="center",
+            font=dict(size=18), x=0.5, xanchor="center",
         ),
-        xaxis=dict(title="Column", gridcolor="#e0e0e0"),
-        yaxis=dict(title="Row", gridcolor="#e0e0e0", autorange="reversed"),
+        xaxis=dict(title=xlab, gridcolor="#e0e0e0"),
+        yaxis=_yaxis_kwargs(ylab, transform is not None),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=60, r=80, t=60, b=50),
-        width=min(1200, max(600, w * 4)),
-        height=min(900, max(400, h * 4)),
+        margin=dict(l=70, r=120, t=70, b=60),
+        width=min(1200, max(600, w * 6)),
+        height=min(900, max(400, h * 6)),
     )
 
-    # Add legend annotations
-    legend_y = 1.0
-    for _, _, label in UTCI_CATEGORIES:
-        color = UTCI_CATEGORY_COLORS[label]
-        fig.add_annotation(
-            text=f"<span style='color:{color}'>■</span> {label}",
-            xref="paper", yref="paper",
-            x=1.02, y=legend_y,
-            showarrow=False,
-            font=dict(size=10),
-            align="left",
-            xanchor="left",
+    if transform is not None:
+        y0 = float(transform.f + h * transform.e)
+        x1 = float(transform.c + w * transform.a)
+        add_map_furniture(
+            fig,
+            bounds=(float(transform.c), y0, x1, float(transform.f)),
+            crs=crs,
         )
-        legend_y -= 0.06
 
-    return fig
+    return finalize_export(fig, style=style, lang=lang)
+
+
+def _plot_utci_histogram(values: np.ndarray, lang: str, style: str = "default") -> go.Figure:
+    """Histogram of UTCI values with mean/median reference lines."""
+    fig = go.Figure()
+    finite = values[np.isfinite(values)]
+    fig.add_trace(go.Histogram(
+        x=finite,
+        nbinsx=50,
+        marker_color="#4C72B0",
+        marker_line_color="white",
+        marker_line_width=0.5,
+        name="UTCI",
+    ))
+    if finite.size:
+        mean = float(np.mean(finite))
+        median = float(np.median(finite))
+        fig.add_vline(x=mean, line_dash="dash", line_color="#B2182B",
+                      annotation_text=f"mean {mean:.1f}", annotation_position="top")
+        fig.add_vline(x=median, line_dash="dot", line_color="#2166AC",
+                      annotation_text=f"median {median:.1f}", annotation_position="bottom")
+    fig.update_layout(
+        title=dict(
+            text=lcz_msg("utci_hist_title", lang),
+            font=dict(size=18), x=0.5, xanchor="center",
+        ),
+        xaxis_title="UTCI [°C]",
+        yaxis_title="Count",
+        bargap=0.02,
+        plot_bgcolor="#fafafa",
+        paper_bgcolor="white",
+        margin=dict(l=70, r=30, t=70, b=55),
+        width=900,
+        height=500,
+        showlegend=False,
+    )
+    return finalize_export(fig, style=style, lang=lang)
 
 
 def _plot_qf_heatmap(
     qf: np.ndarray,
-    shape: tuple,
+    classes: np.ndarray,
     lang: str,
+    transform: Optional[Any] = None,
+    crs: Optional[Any] = None,
+    style: str = "default",
 ) -> go.Figure:
-    """Create a heatmap of anthropogenic heat flux Q_F."""
+    """Anthropogenic heat flux figure: heatmap for 2-D, bar chart for 1-D."""
+    lcz_names = get_lcz_names(lang)
+
     if qf.ndim == 1:
-        # Bar chart for 1D data
-        fig = go.Figure()
-        classes_present = np.unique(qf[qf > 0])
-        fig.add_trace(go.Bar(
-            x=[f"LCZ {int(c)}" for c in range(1, 18)],
-            y=[
-                float(np.mean(qf[np.arange(len(qf)) == c]))
-                if c in classes_present else 0
-                for c in range(1, 18)
-            ],
+        # Mean Q_F per LCZ class, computed from the class codes (a class with
+        # a zero flux is a real value, not "absent" — the old check on qf > 0
+        # silently blanked rural and water classes).
+        classes_flat = classes.ravel()
+        qf_flat = qf.ravel()
+        codes = np.where((classes_flat >= 1) & (classes_flat <= 17), classes_flat, 0)
+        counts = np.bincount(codes, minlength=18)
+        sums = np.bincount(codes, weights=np.where(codes > 0, qf_flat, 0.0), minlength=18)
+        present = [c for c in range(1, 18) if counts[c] > 0]
+        means = [float(sums[c] / counts[c]) if counts[c] else 0.0 for c in present]
+
+        fig = go.Figure(go.Bar(
+            x=[f"LCZ {c}" for c in present],
+            y=means,
             marker_color=[
-                "#CC0000" if c <= 10 else "#228B22"
-                for c in range(1, 18)
+                UTCI_CATEGORY_COLORS["Extreme heat stress"] if c <= 10 else "#1B7837"
+                for c in present
             ],
             marker_line_color="black",
             marker_line_width=0.5,
+            customdata=[[lcz_names[c - 1], int(counts[c])] for c in present],
+            hovertemplate=(
+                "<b>%{x}</b> — %{customdata[0]}<br>"
+                "Q_F: %{y:.1f} W/m²<br>n=%{customdata[1]}<extra></extra>"
+            ),
         ))
         fig.update_layout(
             title=dict(
                 text=lcz_msg("qf_bar_title", lang),
-                font=dict(size=18),
-                x=0.5,
-                xanchor="center",
+                font=dict(size=18), x=0.5, xanchor="center",
             ),
             xaxis_title=lcz_msg("lcz_class_legend", lang),
             yaxis_title="Q_F [W/m²]",
             plot_bgcolor="#fafafa",
             paper_bgcolor="white",
-            margin=dict(l=60, r=30, t=60, b=50),
+            margin=dict(l=80, r=30, t=70, b=60),
             width=1000,
             height=500,
+            showlegend=False,
         )
-        return fig
+        return finalize_export(fig, style=style, lang=lang)
 
-    fig = go.Figure(data=go.Heatmap(
-        z=qf,
+    h, w = qf.shape
+    geo_kwargs: dict[str, Any] = {}
+    xlab, ylab = "Column", "Row"
+    if transform is not None:
+        geo_kwargs = {
+            "x0": transform.c,
+            "y0": transform.f + h * transform.e,
+            "dx": transform.a,
+            "dy": -transform.e,
+        }
+        xlab, ylab = "Easting [m]", "Northing [m]"
+
+    z = np.flipud(qf) if transform is not None else qf
+    fig = go.Figure(go.Heatmap(
+        z=z,
         colorscale="YlOrRd",
-        colorbar=dict(
-            title="Q_F [W/m²]",
-            title_side="right",
-        ),
+        colorbar=dict(title=dict(text="Q_F [W/m²]", side="right")),
         hovertemplate=(
             "<b>Q_F: %{z:.1f} W/m²</b><br>"
-            "Row: %{y}<br>"
-            "Col: %{x}<extra></extra>"
+            "Row: %{y}<br>Col: %{x}<extra></extra>"
         ),
+        **geo_kwargs,
     ))
 
     fig.update_layout(
         title=dict(
             text=lcz_msg("qf_map_title", lang),
-            font=dict(size=18),
-            x=0.5,
-            xanchor="center",
+            font=dict(size=18), x=0.5, xanchor="center",
         ),
-        xaxis=dict(title="Column", gridcolor="#e0e0e0"),
-        yaxis=dict(title="Row", gridcolor="#e0e0e0", autorange="reversed"),
+        xaxis=dict(title=xlab, gridcolor="#e0e0e0"),
+        yaxis=_yaxis_kwargs(ylab, transform is not None),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=60, r=80, t=60, b=50),
-        width=min(1200, max(600, shape[1] * 4)),
-        height=min(900, max(400, shape[0] * 4)),
+        margin=dict(l=70, r=90, t=70, b=60),
+        width=min(1200, max(600, w * 6)),
+        height=min(900, max(400, h * 6)),
     )
 
-    return fig
+    if transform is not None:
+        y0 = float(transform.f + h * transform.e)
+        x1 = float(transform.c + w * transform.a)
+        add_map_furniture(
+            fig,
+            bounds=(float(transform.c), y0, x1, float(transform.f)),
+            crs=crs,
+        )
 
+    return finalize_export(fig, style=style, lang=lang)
 
-# ── i18n keys for this module ─────────────────────────────────────────────────
-# Add these to i18n_messages.py LCZ_MESSAGES dict if needed:
-#   "utci_map_title", "utci_hist_title", "qf_map_title", "qf_bar_title"
 
 __all__ = [
     "lcz_utci",

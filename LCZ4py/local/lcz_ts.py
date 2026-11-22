@@ -2,46 +2,63 @@
 lcz_ts.py — LCZ-stratified time-series visualisation.
 
 Handles large datasets efficiently:
-- Polars lazy groupby for time averaging
+- Polars groupby for time averaging and per-station partitioning (no per-station
+  boolean-filter loops)
 - Plotly WebGL (Scattergl) for smooth panning/zooming
-- Datashader pre-rendering for massive arrays (>4M points), if installed
 - Automatic 10× decimation when a single station exceeds 100k points
+- Line breaks at data gaps (never draws a straight line across missing days)
 """
 
 from __future__ import annotations
 import datetime as _dt_mod
+import logging
 import os
 from typing import Optional, Union
 
-import numpy as np
 import polars as pl
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import rasterio
 
 try:
-    import datashader as ds
-    import datashader.transfer_functions as tf
-    import xarray as xr
+    import datashader as ds  # noqa: F401 - optional, kept for API parity
+    import datashader.transfer_functions as tf  # noqa: F401
+    import xarray as xr  # noqa: F401
     HAS_DATASHADER = True
-except ImportError:
+except ImportError:  # pragma: no cover - depends on the local environment
     HAS_DATASHADER = False
 
 from LCZ4py._internal.lcz_ts_utils import (
     load_lcz_raster, normalise_input_df, normalise_missing,
-    select_by_date, extract_lcz_at_points, OUTPUT_DIR,
-    add_by_column, by_sorted_groups,
+    select_by_date, assign_station_lcz, require_nonempty,
+    add_by_column, by_sorted_groups, gap_threshold_hours,
     _break_gaps_numpy, _daylight_intervals_batch,
 )
 from LCZ4py.general.lcz_plot_parameters import _palette_to_plotly_colorscale
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import finalize_export
 
+logger = logging.getLogger(__name__)
+
+_MAX_POINTS_PER_STATION = 100_000
+_DECIMATION = 10
+_MAX_DAYLIGHT_RECTS = 2000
+
 
 def _station_colors(stations, palette_name: str) -> list[str]:
-    colorscale = _palette_to_plotly_colorscale(palette_name, n=max(len(stations), 2))
-    step = max(1, len(colorscale) // max(len(stations), 1))
-    return [colorscale[min(i * step, len(colorscale) - 1)][1] for i in range(len(stations))]
+    n = max(len(stations), 1)
+    colorscale = _palette_to_plotly_colorscale(palette_name, n=max(n, 2))
+    step = max(1, len(colorscale) // n)
+    return [colorscale[min(i * step, len(colorscale) - 1)][1] for i in range(n)]
+
+
+def _partition_by_station(df: pl.DataFrame) -> dict[str, pl.DataFrame]:
+    """Split once by station, keeping a deterministic (sorted) key order."""
+    if df.is_empty():
+        return {}
+    partitions = df.partition_by("station", as_dict=True, maintain_order=True)
+    return {str(k[0]) if isinstance(k, tuple) else str(k): v
+            for k, v in sorted(partitions.items(), key=lambda kv: str(kv[0]))}
 
 
 def _plot_basic_line(
@@ -50,44 +67,52 @@ def _plot_basic_line(
     title: str,
     xlab: str,
     ylab: str,
+    lang: str = "en",
 ) -> go.Figure:
     fig = go.Figure()
-    stations = df["station"].unique().sort()
+    if df.is_empty():
+        logger.warning("_plot_basic_line: no data to plot.")
+        fig.update_layout(title=dict(text=title))
+        return fig
+
+    partitions = _partition_by_station(df)
+    stations = list(partitions)
     colors = _station_colors(stations, palette_name)
+
     for i, st in enumerate(stations):
-        sub = df.filter(pl.col("station") == st).sort("date")
-        if len(sub) > 100_000:
-            sub = sub.with_columns(pl.col("date").rank(method="ordinal").alias("_rank"))
-            sub = sub.filter((pl.col("_rank") % 10) == 0).drop("_rank")
+        sub = partitions[st].sort("date")
+        if len(sub) > _MAX_POINTS_PER_STATION:
+            sub = sub.gather_every(_DECIMATION)
+            logger.debug("%s: decimated to %d points for display.", st, len(sub))
 
         dates_np = sub["date"].to_numpy()
         vals_np = sub["var_interp"].to_numpy()
-
-        # Break the line at large time gaps to prevent false diagonals
-        if len(dates_np) > 2:
-            diffs_h = np.diff(dates_np.astype("datetime64[s]")).astype(np.float64) / 3600
-            pos = diffs_h[diffs_h > 0]
-            median_step_h = float(np.median(pos)) if len(pos) else 1.0
-            threshold_h = max(2.0 * median_step_h, 1.5)
-        else:
-            threshold_h = 2.0
+        threshold_h = gap_threshold_hours(dates_np)
         dates_plot, vals_plot = _break_gaps_numpy(dates_np, vals_np, threshold_h)
 
         fig.add_trace(go.Scattergl(
             x=dates_plot, y=vals_plot,
             name=st,
+            mode="lines",
             line=dict(color=colors[i], width=1),
-            hovertemplate=f"<b>{st}</b><br>{xlab}: %{{x}}<br>{ylab}: %{{y:.2f}}<extra></extra>",
+            hovertemplate=(
+                f"<b>{st}</b><br>{xlab}: %{{x}}<br>{ylab}: %{{y:.2f}}"
+                "<extra></extra>"
+            ),
         ))
+
     fig.update_layout(
         title=dict(text=title, font=dict(size=20), x=0.5, xanchor="center"),
-        xaxis=dict(title=dict(text=xlab, font=dict(size=14)), tickfont=dict(size=12), gridcolor="#f0f0f0"),
-        yaxis=dict(title=dict(text=ylab, font=dict(size=14)), tickfont=dict(size=12), gridcolor="#f0f0f0"),
+        xaxis=dict(title=dict(text=xlab, font=dict(size=14)),
+                   tickfont=dict(size=12), gridcolor="#f0f0f0"),
+        yaxis=dict(title=dict(text=ylab, font=dict(size=14)),
+                   tickfont=dict(size=12), gridcolor="#f0f0f0"),
         plot_bgcolor="#fafafa",
         paper_bgcolor="white",
         margin=dict(l=80, r=40, t=70, b=60),
         hovermode="x unified",
         hoverlabel=dict(bgcolor="white", font=dict(size=13)),
+        legend=dict(title=dict(text=lcz_msg("lcz_class_legend", lang))),
     )
     return fig
 
@@ -99,7 +124,16 @@ def _plot_heatmap(
     title: str,
     xlab: str,
     ylab: str,
+    lang: str = "en",
 ) -> go.Figure:
+    if facet_var not in df.columns:
+        raise ValueError(
+            f"facet_plot={facet_var!r} is not an aggregated column; "
+            f"choose one of {sorted(df.columns)}."
+        )
+    if df.is_empty():
+        raise ValueError("No data to plot as a heatmap.")
+
     facets = df[facet_var].unique().sort()
     fig = make_subplots(
         rows=len(facets), cols=1,
@@ -115,8 +149,12 @@ def _plot_heatmap(
             y=[str(f)],
             colorscale="Viridis",
             showscale=(i == 0),
+            colorbar=dict(title=dict(text=ylab)) if i == 0 else None,
             name=str(f),
-            hovertemplate=f"{ylab}: %{{y}}<br>{xlab}: %{{x}}<br>Value: %{{z:.2f}}<extra></extra>",
+            hovertemplate=(
+                f"{facet_var}: %{{y}}<br>{xlab}: %{{x}}<br>"
+                f"{ylab}: %{{z:.2f}}<extra></extra>"
+            ),
         ), row=i + 1, col=1)
     fig.update_layout(
         title=dict(text=title, font=dict(size=20), x=0.5, xanchor="center"),
@@ -137,10 +175,11 @@ def _faceted_line_fig(
     chart_title: str,
     x_label: str,
     y_label: str,
+    lang: str = "en",
 ) -> go.Figure:
     """Build a multi-row subplot figure, one row per by-group."""
     fig = make_subplots(
-        rows=len(groups), cols=1,
+        rows=max(len(groups), 1), cols=1,
         subplot_titles=groups,
         shared_xaxes=False,
         vertical_spacing=0.04,
@@ -148,19 +187,20 @@ def _faceted_line_fig(
     seen_stations: set[str] = set()
     for i, g in enumerate(groups, 1):
         sub = avg.filter(pl.col("_by") == g)
-        sub_fig = _plot_basic_line(sub, palette_name, g, x_label, y_label)
+        sub_fig = _plot_basic_line(sub, palette_name, g, x_label, y_label, lang)
         for trace in sub_fig.data:
             trace.showlegend = trace.name not in seen_stations
             seen_stations.add(trace.name)
             fig.add_trace(trace, row=i, col=1)
     fig.update_layout(
         title=dict(text=chart_title, font=dict(size=20), x=0.5, xanchor="center"),
-        height=max(400, 280 * len(groups)),
+        height=max(400, 280 * max(len(groups), 1)),
         plot_bgcolor="#fafafa",
         paper_bgcolor="white",
         margin=dict(l=80, r=40, t=70, b=60),
         hovermode="x unified",
         hoverlabel=dict(bgcolor="white", font=dict(size=13)),
+        legend=dict(title=dict(text=lcz_msg("lcz_class_legend", lang))),
     )
     return fig
 
@@ -173,22 +213,38 @@ def _plot_daylight_unified(
     ylab: str,
     lat: float,
     lon: float,
+    lang: str = "en",
 ) -> go.Figure:
     """Full time series with amber vrects marking each daytime window.
 
     No subplot split — daytime/nighttime are shown on a single axis with
     shaded background regions computed from the NOAA solar elevation formula.
-    Valid for all latitudes (polar day/night handled gracefully).
+    Valid for all latitudes (polar day/night handled gracefully). When the
+    series spans too many days for readable shading, the shading is skipped
+    with a warning instead of silently producing thousands of shapes.
     """
-    fig = _plot_basic_line(df, palette_name, title, xlab, ylab)
+    fig = _plot_basic_line(df, palette_name, title, xlab, ylab, lang)
 
-    # Unique calendar dates present in the dataset
     unique_dates = sorted({
         _dt_mod.date(d.year, d.month, d.day)
         for d in df["date"].to_list()
+        if d is not None
     })
-    intervals_per_day = _daylight_intervals_batch(lat, lon, unique_dates)
+    if len(unique_dates) > _MAX_DAYLIGHT_RECTS // 2:
+        logger.warning(
+            "Daylight shading skipped: %d days would need too many shapes "
+            "(limit %d).",
+            len(unique_dates), _MAX_DAYLIGHT_RECTS,
+        )
+        fig.add_annotation(
+            text=f"Daytime shading omitted ({len(unique_dates)} days)",
+            xref="paper", yref="paper", x=0.99, y=1.02,
+            showarrow=False, xanchor="right",
+            font=dict(size=9, color="gray"),
+        )
+        return fig
 
+    intervals_per_day = _daylight_intervals_batch(lat, lon, unique_dates)
     for d, intervals in zip(unique_dates, intervals_per_day):
         base = _dt_mod.datetime(d.year, d.month, d.day)
         for (rise_h, set_h) in intervals:
@@ -207,6 +263,23 @@ def _plot_daylight_unified(
         name="Daytime",
     ))
     return fig
+
+
+def _parse_time_freq(time_freq: str) -> str:
+    """Translate the public ``time_freq`` value into a Polars duration."""
+    freq_map = {
+        "hour": "1h", "hourly": "1h",
+        "day": "1d", "daily": "1d",
+        "week": "1w", "weekly": "1w",
+        "month": "1mo", "monthly": "1mo",
+        "year": "1y", "yearly": "1y",
+    }
+    freq = freq_map.get(str(time_freq).lower())
+    if freq is None:
+        raise ValueError(
+            f"time_freq must be one of {sorted(set(freq_map))}, got {time_freq!r}"
+        )
+    return freq
 
 
 def lcz_ts(
@@ -243,7 +316,7 @@ def lcz_ts(
         Column name for the meteorological variable.
     station_id : str
         Column name for the station identifier.
-    time_freq : {"hour", "day", "month"}
+    time_freq : {"hour", "day", "week", "month", "year"}
         Time-averaging frequency.
     by : str, optional
         Split the time series into faceted subplots by temporal group.
@@ -256,7 +329,7 @@ def lcz_ts(
     plot_type : {"basic_line", "heatmap"}
         Chart kind.  ``"heatmap"`` is not supported with ``by=``.
     facet_plot : str
-        Column for the heatmap facet variable (heatmap only).
+        Column for the heatmap facet variable (heatmap only); default ``"lcz"``.
     iplot : bool
         If False, return the averaged DataFrame instead of a figure.
     isave : bool
@@ -277,44 +350,54 @@ def lcz_ts(
         Small annotation added below the chart.
     lang : str
         Language for labels — ``"en"``, ``"pt"``, ``"es"``, or ``"zh"``.
+    year, month, day, hour : int or sequence, optional
+        Date/time component filters (validated; out-of-range values raise).
+    start, end : str or datetime, optional
+        Inclusive date range bounds.
 
     Returns
     -------
     go.Figure or pl.DataFrame
+
+    Raises
+    ------
+    ValueError
+        If ``data_frame`` is missing/empty, required columns are absent, no
+        station maps to LCZ class 1-17, or a filter/frequency value is invalid.
     """
     if data_frame is None:
         raise ValueError("data_frame is required.")
 
-    df = normalise_input_df(
-        data_frame.to_pandas() if isinstance(data_frame, pl.DataFrame) else data_frame,
-        var=var, station_id=station_id,
-    )
+    if plot_type not in ("basic_line", "heatmap"):
+        raise NotImplementedError(
+            f"plot_type {plot_type!r} not supported. Use 'basic_line' or 'heatmap'."
+        )
+    if by is not None and plot_type != "basic_line":
+        raise NotImplementedError(
+            f"plot_type={plot_type!r} with by= is not supported; use 'basic_line'."
+        )
+
+    freq = _parse_time_freq(time_freq)
+
+    df = normalise_input_df(data_frame, var=var, station_id=station_id)
     df = select_by_date(
         normalise_missing(df, ("var_interp",)),
         year=year, month=month, day=day, hour=hour, start=start, end=end,
     )
     df = df.filter(pl.col("var_interp").is_not_null())
+    require_nonempty(df, "observations")
 
     ds_raster = load_lcz_raster(x)
-    stations = df.unique(subset=["latitude", "longitude"])
-    lcz_vals, mask = extract_lcz_at_points(
-        ds_raster, stations["longitude"].to_numpy(), stations["latitude"].to_numpy()
-    )
-    stations = stations.with_columns(
-        pl.Series(name="lcz", values=np.where(mask, lcz_vals, 0)).cast(pl.Int32)
-    )
-    df = df.join(stations.select(["latitude", "longitude", "lcz"]), on=["latitude", "longitude"], how="left")
-    df = df.filter(pl.col("lcz").is_between(1, 17))
+    df = assign_station_lcz(df, ds_raster)
+    require_nonempty(df, "observations at stations inside the LCZ raster")
+
     df = df.with_columns(
-        (pl.col("station") + " (" + pl.col("lcz").cast(str) + ")").alias("station"),
-        pl.col("lcz").cast(str),
+        (pl.col("station") + " (" + pl.col("lcz").cast(pl.String) + ")").alias("station"),
+        pl.col("lcz").cast(pl.String),
     )
 
     lat_mean = float(df["latitude"].mean())
     lon_mean = float(df["longitude"].mean())
-
-    freq_map = {"hour": "1h", "day": "1d", "month": "1mo"}
-    freq = freq_map.get(time_freq, "1h")
 
     chart_title = title or lcz_msg("lcz_ts_title", lang)
     x_label = xlab or lcz_msg("time_label", lang)
@@ -328,10 +411,10 @@ def lcz_ts(
               .agg(pl.col("var_interp").mean(), pl.col("lcz").first())
         )
         if not iplot:
-            return avg
+            return avg.sort(["station", "date"])
         fig = _plot_daylight_unified(
             avg, palette, chart_title, x_label, y_label,
-            lat=lat_mean, lon=lon_mean,
+            lat=lat_mean, lon=lon_mean, lang=lang,
         )
 
     elif by is not None:
@@ -342,13 +425,13 @@ def lcz_ts(
               .agg(pl.col("var_interp").mean(), pl.col("lcz").first())
         )
         if not iplot:
-            return avg
-        if plot_type != "basic_line":
-            raise NotImplementedError(
-                f"plot_type={plot_type!r} with by= is not supported; use 'basic_line'."
-            )
+            return avg.sort(["station", "_by", "date"])
         groups = by_sorted_groups(avg["_by"], by)
-        fig = _faceted_line_fig(avg, groups, palette, chart_title, x_label, y_label)
+        if not groups:
+            raise ValueError(f"by={by!r} produced no groups for this dataset.")
+        fig = _faceted_line_fig(
+            avg, groups, palette, chart_title, x_label, y_label, lang
+        )
 
     else:
         avg = (
@@ -357,21 +440,19 @@ def lcz_ts(
               .agg(pl.col("var_interp").mean(), pl.col("lcz").first())
         )
         if not iplot:
-            return avg
+            return avg.sort(["station", "date"])
         if plot_type == "basic_line":
-            fig = _plot_basic_line(avg, palette, chart_title, x_label, y_label)
-        elif plot_type == "heatmap":
-            facet_col = facet_plot.lower() if facet_plot.lower() in avg.columns else facet_plot
-            fig = _plot_heatmap(avg, facet_col, palette, chart_title, x_label, y_label)
+            fig = _plot_basic_line(avg, palette, chart_title, x_label, y_label, lang)
         else:
-            raise NotImplementedError(
-                f"plot_type {plot_type!r} not supported. Use 'basic_line' or 'heatmap'."
+            facet_col = facet_plot.lower() if facet_plot.lower() in avg.columns else facet_plot
+            fig = _plot_heatmap(
+                avg, facet_col, palette, chart_title, x_label, y_label, lang
             )
 
     if caption:
         fig.add_annotation(
             text=caption, xref="paper", yref="paper",
-            x=0.5, y=-0.05, showarrow=False,
+            x=0.5, y=-0.08, showarrow=False,
             font=dict(size=10, color="gray"),
         )
 
