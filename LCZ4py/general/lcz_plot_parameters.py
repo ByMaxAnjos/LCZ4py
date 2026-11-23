@@ -4,15 +4,18 @@ lcz_plot_parameters.py
 LCZ parameter visualization — maps, facets, and (via ``lcz_cal_indices``)
 scatter/radar/correlation charts.
 
-- Plotly WebGL/heatmap rendering for every parameter band
-- Optional Datashader rendering for very large rasters (falls back to Plotly)
-- Colorbars carry the parameter name and its unit range
+- Native static matplotlib/Agg renderer (default) — reproducible PNG/PDF/SVG/
+  TIFF without Plotly, Kaleido, a browser, or a Chromium install
+- Opt-in Plotly WebGL/heatmap renderer (``renderer="plotly"``) for every
+  parameter band, plus the legacy "datashader"/"auto" Plotly accelerators
+- Colorbars carry the parameter name and its unit range from
+  ``lcz_parameters_data.PARAM_UNITS``
 - Colour-blind-friendly palette sets (sequential, no red/green pairs)
-- Consistent typography and >=300 dpi static export via ``lcz_theme``
+- Faceted multi-parameter figures, multiple 300 dpi static exports
 
 Optional dependencies (datashader, geoarrow, xarray/rioxarray) are imported
 behind ``try/except`` guards: importing this module never fails when they are
-missing.
+missing. The static renderer needs only matplotlib + numpy.
 """
 
 from __future__ import annotations
@@ -22,7 +25,10 @@ import math
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Sequence, Union, Literal
+from typing import TYPE_CHECKING, Optional, Sequence, Union, Literal
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    import matplotlib.figure
 
 import numpy as np
 import polars as pl
@@ -82,7 +88,9 @@ from LCZ4py._internal.lcz_parameters_data import (
 from LCZ4py._internal.lcz_theme import (
     METBREWER_PALETTES as _METBREWER_PALETTES,
     add_map_furniture,
+    get_style,
 )
+from LCZ4py._internal import lcz_static
 from LCZ4py.general.lcz_plot_map import _add_caption, _finalize_publication
 
 logger = logging.getLogger(__name__)
@@ -898,6 +906,436 @@ def lcz_msg_or(key: str, lang: str) -> str:
         return "LCZ parameters"
 
 
+# ── Native static renderer (matplotlib/Agg — no Plotly/Kaleido/Chromium) ─────
+
+# Renderer names handled by the historic Plotly path: "datashader" and "auto"
+# are Plotly accelerators, not separate backends, so they keep their meaning.
+_LEGACY_PLOTLY_MODES = ("datashader", "auto")
+
+
+def _resolve_plot_renderer(renderer: Optional[str]) -> tuple[str, str]:
+    """Map a user-facing renderer name to ``(mode, legacy_mode)``.
+
+    ``mode`` is ``"static"`` (matplotlib) or ``"plotly"``. ``legacy_mode`` is
+    what the Plotly branch consumes: ``"plotly"``, ``"datashader"`` or
+    ``"auto"``. Aliases (``"matplotlib"``/``"agg"``/``"native"``) and ``None``
+    resolve through :func:`LCZ4py._internal.lcz_static.resolve_renderer`.
+    """
+    if renderer is None:
+        return "static", "plotly"
+    key = str(renderer).strip().lower()
+    if key in _LEGACY_PLOTLY_MODES:
+        return "plotly", key
+    resolved = lcz_static.resolve_renderer(key)
+    if resolved == "maplibre":
+        raise ValueError(
+            "The MapLibre basemap renderer is not available for parameter "
+            "rasters; use 'static' (default) or 'plotly'."
+        )
+    return resolved, ("plotly" if resolved == "plotly" else "static")
+
+
+@lru_cache(maxsize=64)
+def _mpl_palette_key(name: str) -> str:
+    """Register a MetBrewer palette as a matplotlib colormap; return its key.
+
+    The palettes shipped in ``lcz_theme`` are already colorblind-safe
+    sequential ramps (no red/green pairs), so the static renderer reuses them
+    instead of falling back to a generic default. Registration is cached so
+    every panel shares one colormap object.
+    """
+    key = f"lcz4py_{_resolve_palette(name)}"
+    palette = _METBREWER_PALETTES.get(
+        _resolve_palette(name), _METBREWER_PALETTES[_FALLBACK_PALETTE]
+    )
+    try:
+        import matplotlib
+        from matplotlib.colors import LinearSegmentedColormap
+
+        if key in matplotlib.colormaps:
+            return key
+        cmap = LinearSegmentedColormap.from_list(key, palette, N=256)
+        cmap.set_bad((1.0, 1.0, 1.0, 0.0))
+        matplotlib.colormaps.register(cmap, name=key)
+        return key
+    except Exception as exc:  # noqa: BLE001 - keep plotting on an old matplotlib
+        logger.debug("Cannot register palette %r (%s); using viridis.", name, exc)
+        return "viridis"
+
+
+def _static_palette_for(
+    name: str, inclusive: bool, override: Optional[str] = None
+) -> str:
+    """matplotlib colormap key for one parameter (inclusive => colorblind set)."""
+    palette_map = PARAM_PALETTE_INCLUSIVE if inclusive else PARAM_PALETTE_DEFAULT
+    return _mpl_palette_key(
+        _resolve_palette(override or palette_map.get(_param_code(name)), inclusive=inclusive)
+    )
+
+
+def _static_array_and_extent(
+    arr: np.ndarray, profile: dict
+) -> tuple[np.ndarray, tuple[float, float, float, float], bool]:
+    """Mask nodata and derive ``(array, extent, georeferenced)`` for imshow.
+
+    The static renderer draws with ``origin="upper"``, so raster row 0 is
+    already north — no ``flipud`` (unlike the Plotly path, whose y axis points
+    up). ``extent`` is ``(xmin, xmax, ymin, ymax)`` in the raster's CRS, or
+    pixel coordinates when the data is not georeferenced.
+    """
+    arr = np.asarray(arr, dtype=float)
+    h, w = arr.shape
+    transform = profile.get("transform")
+    if transform is not None:
+        xmin = transform.c
+        ymax = transform.f
+        xmax = xmin + w * transform.a
+        ymin = ymax + h * transform.e
+        extent = (float(xmin), float(xmax), float(ymin), float(ymax))
+    else:
+        extent = (0.0, float(w), 0.0, float(h))
+    masked = np.where((arr == 0) | ~np.isfinite(arr), np.nan, arr)
+    return masked, extent, transform is not None
+
+
+def _static_clim(masked: np.ndarray, name: str) -> tuple[float, float]:
+    """Finite colour limits for one panel, padded when the range is degenerate."""
+    finite = masked[np.isfinite(masked)]
+    if finite.size == 0:
+        logger.warning("Parameter %r has no finite values; plotting an empty map.", name)
+        return 0.0, 1.0
+    zmin, zmax = float(np.min(finite)), float(np.max(finite))
+    if math.isclose(zmin, zmax):
+        pad = abs(zmin) * 0.01 or 0.5
+        zmin, zmax = zmin - pad, zmax + pad
+    return zmin, zmax
+
+
+def _static_plain_axes(ax, *, add_north_arrow: bool = True) -> None:
+    """Frame an un-georeferenced array: no Easting/Northing labels, equal aspect."""
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal", adjustable="box")
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
+    ax.grid(False)
+    if add_north_arrow:
+        # Row 0 is north for every LCZ4py raster (GeoTIFF/COG convention).
+        lcz_static.add_north_arrow(ax)
+
+
+def _static_map_furniture(
+    ax,
+    extent: tuple,
+    crs,
+    *,
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
+) -> bool:
+    """Axis labels + scale bar + north arrow for a georeferenced panel.
+
+    Mirrors ``lcz_plot_map._create_static_map``: it calls the individual
+    ``lcz_static`` helpers rather than ``add_map_furniture_mpl``, whose
+    ``add_scalebar``/``add_north_arrow`` parameters currently shadow the
+    module-level functions of the same name (a ``TypeError`` whenever a scale
+    bar is requested).
+    """
+    is_geo = lcz_static.apply_map_axes(ax, extent, crs)
+    if add_scalebar:
+        lcz_static.add_scalebar(ax, lcz_static.metric_width(extent, crs), is_geo)
+    if add_north_arrow and not is_geo:
+        lcz_static.add_north_arrow(ax)
+    return is_geo
+
+
+def _plot_one_static(
+    arr: np.ndarray,
+    profile: dict,
+    name: str,
+    *,
+    inclusive: bool,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    lang: str = "en",
+    title: Optional[str] = None,
+    subtitle: Optional[str] = None,
+    caption: Optional[str] = None,
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
+    isave: bool = False,
+    save_extension: str = "png",
+    filename: Optional[str] = None,
+    column: Optional[str] = None,
+) -> "matplotlib.figure.Figure":
+    """Render one parameter band as a publication-quality matplotlib figure.
+
+    The colourbar is labelled ``"<Parameter name> <[unit]>"`` (e.g.
+    ``"Mean Sky View Factor [0 - 1]"``), the palette is the parameter's
+    colorblind-safe MetBrewer ramp, and the export goes through
+    :func:`LCZ4py._internal.lcz_static.save_static` at >=300 dpi.
+    """
+    st = lcz_static
+
+    masked, extent, georef = _static_array_and_extent(arr, profile)
+    zmin, zmax = _static_clim(masked, name)
+    palette_key = _static_palette_for(name, inclusive, profile.get("palette"))
+
+    h, w = masked.shape
+    dx = (extent[1] - extent[0]) / max(w, 1)
+    dy = (extent[3] - extent[2]) / max(h, 1)
+    aspect = abs(dy / dx) * h / max(w, 1) if dx else h / max(w, 1)
+
+    header = title or PARAM_NAMES.get(_param_code(name), name)
+    # Explicit geometry: size the figure so the axes box matches the data
+    # aspect exactly (no letterboxing) and the header/footer get known mm.
+    spec0 = get_style(style)
+    width_mm = float(
+        spec0.width_mm.get(column or "single", spec0.width_mm.get("single", 120))
+    )
+    left, right = 0.13, 0.80
+    header_mm = (10.0 if header else 2.0) + (4.0 if subtitle else 0.0)
+    # Tick labels + axis title need room below the axes; the caption goes under.
+    axis_mm = 10.0 if georef else 3.0
+    footer_mm = axis_mm + (7.0 if caption else 0.0)
+    ax_w_mm = (right - left) * width_mm
+    ax_h_mm = ax_w_mm * aspect
+    height_mm = ax_h_mm + header_mm + footer_mm
+    if height_mm > spec0.max_height_mm:
+        scale = spec0.max_height_mm / height_mm
+        width_mm *= scale
+        ax_w_mm *= scale
+        ax_h_mm *= scale
+        height_mm = float(spec0.max_height_mm)
+    bottom = footer_mm / height_mm
+    top = 1.0 - header_mm / height_mm
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style, width_mm=width_mm, height_mm=height_mm, dpi=dpi
+        )
+        # Leave the right margin for the colourbar and its rotated label.
+        ax = st.add_axes(fig, bottom=bottom, top=top, left=left, right=right)
+        image = st.plot_continuous_raster(
+            ax, masked, extent, colorscale=palette_key
+        )
+        image.set_clim(zmin, zmax)
+
+        if georef:
+            _static_map_furniture(
+                ax, extent, profile.get("crs"),
+                add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+            )
+        else:
+            _static_plain_axes(ax, add_north_arrow=add_north_arrow)
+
+        st.add_colorbar(
+            fig, ax, image,
+            units=_param_label(name),
+            fontsize=max(6.0, spec.font_size - 2),
+        )
+        st.add_header(fig, header, subtitle, spec)
+        st.add_footer(fig, caption, None, spec)
+        st.save_static(
+            fig, filename or name,
+            isave=isave, save_extension=save_extension,
+            style=style, dpi=dpi, lang=lang,
+        )
+
+    return fig
+
+
+def _build_static_facet_figure(
+    panels: Sequence[tuple[str, np.ndarray, dict]],
+    *,
+    inclusive: bool,
+    ncols: Optional[int] = None,
+    title: Optional[str] = None,
+    subtitle: Optional[str] = None,
+    caption: Optional[str] = None,
+    lang: str = "en",
+    style: str = "default",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
+    filename: str = "lcz_parameters_facet",
+) -> "matplotlib.figure.Figure":
+    """Combine parameter maps into one faceted matplotlib figure.
+
+    Each panel keeps its own colourbar. The panel title is
+    ``"<Parameter name> <[unit]>"`` and the colourbar repeats the unit range;
+    facets deliberately do **not** use rotated colourbar titles, because a long
+    unit string (e.g. ``[J m-2 s1/2 K-1]``) would collide with the neighbouring
+    panel at print width.
+    """
+    st = lcz_static
+
+    if not panels:
+        raise ValueError("No parameter panels to facet.")
+    n = len(panels)
+    ncols = int(ncols) if ncols else (1 if n == 1 else 2 if n <= 4 else 3)
+    ncols = max(1, min(ncols, n))
+    nrows = int(math.ceil(n / ncols))
+
+    prepared: list[dict] = []
+    for name, arr, profile in panels:
+        masked, extent, georef = _static_array_and_extent(arr, profile)
+        zmin, zmax = _static_clim(masked, name)
+        h, w = masked.shape
+        dx = (extent[1] - extent[0]) / max(w, 1)
+        dy = (extent[3] - extent[2]) / max(h, 1)
+        prepared.append({
+            "name": name,
+            "arr": masked,
+            "extent": extent,
+            "georef": georef,
+            "crs": profile.get("crs"),
+            "zmin": zmin,
+            "zmax": zmax,
+            "aspect": abs(dy / dx) * h / max(w, 1) if dx else h / max(w, 1),
+            "palette": _static_palette_for(name, inclusive, profile.get("palette")),
+        })
+
+    spec = get_style(style)
+    width_mm = float(spec.width_mm.get("double", spec.width_mm.get("single", 120)))
+    panel_aspect = float(np.median([item["aspect"] for item in prepared]))
+    panel_aspect = min(max(panel_aspect, 0.25), 2.5)
+
+    left, right = 0.07, 0.94
+    wspace, hspace = 0.55, 0.30
+    header_mm = 18.0 + (4.0 if subtitle else 0.0)
+    # Outer-row tick labels + axis titles, plus the caption line underneath.
+    footer_mm = 10.0 + (7.0 if caption else 0.0)
+    # Grid geometry: each colourbar takes ~5.5% of its panel's width, so the
+    # drawable panel is slightly narrower than the gridspec cell.
+    ax_w_mm = (
+        (right - left) * width_mm / (ncols + (ncols - 1) * wspace) * 0.945
+    )
+    ax_h_mm = ax_w_mm * panel_aspect
+    height_mm = ax_h_mm * (nrows + (nrows - 1) * hspace) + header_mm + footer_mm
+    # Keep the figure inside the style's max height by scaling both dimensions,
+    # so panels stay square-ish instead of being letterboxed.
+    if height_mm > spec.max_height_mm:
+        scale = spec.max_height_mm / height_mm
+        width_mm *= scale
+        height_mm = float(spec.max_height_mm)
+    bottom = footer_mm / height_mm
+    top = 1.0 - header_mm / height_mm
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style, width_mm=width_mm, height_mm=height_mm, dpi=dpi
+        )
+        axes = fig.subplots(nrows, ncols, squeeze=False)
+        fig.subplots_adjust(
+            left=left, right=right, top=top, bottom=bottom,
+            wspace=wspace, hspace=hspace,
+        )
+
+        for idx, item in enumerate(prepared):
+            row, col = divmod(idx, ncols)
+            ax = axes[row][col]
+            image = st.plot_continuous_raster(
+                ax, item["arr"], item["extent"], colorscale=item["palette"]
+            )
+            image.set_clim(item["zmin"], item["zmax"])
+
+            if item["georef"]:
+                if idx == 0 and (add_scalebar or add_north_arrow):
+                    _static_map_furniture(
+                        ax, item["extent"], item["crs"],
+                        add_scalebar=add_scalebar,
+                        add_north_arrow=add_north_arrow,
+                    )
+                else:
+                    st.apply_map_axes(ax, item["extent"], item["crs"])
+                # Only the outer panels carry tick labels/axis titles.
+                if col:
+                    ax.tick_params(labelleft=False)
+                    ax.set_ylabel("")
+                if row != nrows - 1:
+                    ax.tick_params(labelbottom=False)
+                    ax.set_xlabel("")
+            else:
+                _static_plain_axes(
+                    ax, add_north_arrow=add_north_arrow and idx == 0
+                )
+
+            unit = (PARAM_UNITS.get(_param_code(item["name"]), "") or "").strip()
+            st.add_colorbar(
+                fig, ax, image,
+                units=unit,
+                fontsize=max(5.5, spec.font_size - 2),
+            )
+            ax.set_title(
+                _param_label(item["name"]),
+                fontsize=max(5.5, spec.font_size - 1),
+                pad=2.5, wrap=True,
+            )
+
+        # Blank any unused cells of the last row.
+        for idx in range(n, nrows * ncols):
+            row, col = divmod(idx, ncols)
+            axes[row][col].set_visible(False)
+
+        st.add_header(
+            fig, title or lcz_msg_or("lcz_map_title", lang), subtitle, spec
+        )
+        st.add_footer(fig, caption, None, spec)
+        st.save_static(
+            fig, filename,
+            isave=isave, save_extension=save_extension,
+            style=style, dpi=dpi, lang=lang,
+        )
+
+    return fig
+
+
+def _static_parameter_figures(
+    panels: Sequence[tuple[str, np.ndarray, dict]],
+    *,
+    inclusive: bool,
+    isave: bool,
+    save_extension: str,
+    style: str,
+    dpi: Optional[int],
+    lang: str,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    add_scalebar: bool,
+    add_north_arrow: bool,
+    facet: bool,
+    ncols: Optional[int],
+) -> Union["matplotlib.figure.Figure", list["matplotlib.figure.Figure"]]:
+    """Render panels with the native static backend.
+
+    Return shape mirrors the Plotly path: one ``Figure`` when a single panel is
+    requested or ``facet=True``, otherwise a ``list[Figure]`` in panel order.
+    """
+    if facet:
+        return _build_static_facet_figure(
+            panels, inclusive=inclusive, ncols=ncols,
+            title=title, subtitle=subtitle, caption=caption, lang=lang,
+            style=style, dpi=dpi, isave=isave, save_extension=save_extension,
+            add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+        )
+
+    figures = [
+        _plot_one_static(
+            arr, profile, name,
+            inclusive=inclusive, style=style, dpi=dpi, lang=lang,
+            title=title, subtitle=subtitle, caption=caption,
+            add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+            isave=isave, save_extension=save_extension,
+            column="single",
+        )
+        for name, arr, profile in panels
+    ]
+    return figures if len(figures) > 1 else figures[0]
+
+
 # ── GeoArrow integration for spatial metadata ─────────────────────────────────
 
 def create_geoarrow_metadata(
@@ -970,7 +1408,7 @@ def _plot_from_dataset(
     title: Optional[str],
     subtitle: Optional[str],
     caption: Optional[str],
-    renderer: Literal["plotly", "datashader", "auto"],
+    renderer: Literal["static", "plotly", "datashader", "auto"],
     style: str = "default",
     add_scalebar: bool = True,
     add_north_arrow: bool = True,
@@ -978,12 +1416,18 @@ def _plot_from_dataset(
     dpi: Optional[int] = None,
     facet: bool = False,
     ncols: Optional[int] = None,
-) -> Union[go.Figure, list[go.Figure]]:
+) -> Union[
+    go.Figure, list[go.Figure],
+    "matplotlib.figure.Figure", list["matplotlib.figure.Figure"],
+]:
     """Plot parameters straight from an lcz_get_ucp ``combined_rasters`` Dataset.
 
     Unlike the file-based path, every data variable is a real parameter (no
     leading LCZ-class band to skip), and bands are addressed by name instead
     of position.
+
+    Returns a matplotlib ``Figure`` (single panel) / ``list[Figure]`` for
+    ``renderer="static"``, and the historic Plotly objects otherwise.
     """
     if not HAS_XARRAY or not HAS_RIOXARRAY:  # pragma: no cover - guarded upstream
         raise ImportError(
@@ -1014,6 +1458,15 @@ def _plot_from_dataset(
                 f"Variable {name!r} is not 2-D after squeezing (shape {arr.shape})."
             )
         panels.append((name, arr, {"transform": transform, "crs": crs}))
+
+    if renderer == "static":
+        return _static_parameter_figures(
+            panels, inclusive=inclusive, isave=isave,
+            save_extension=save_extension, style=style, dpi=dpi, lang=lang,
+            title=title, subtitle=subtitle, caption=caption,
+            add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+            facet=facet, ncols=ncols,
+        )
 
     if len(panels) == 1:
         name, arr, profile = panels[0]
@@ -1128,15 +1581,24 @@ def lcz_plot_parameters(
     title: Optional[str] = None,
     subtitle: Optional[str] = None,
     caption: Optional[str] = None,
-    renderer: Literal["plotly", "datashader", "auto"] = "auto",
+    renderer: Optional[str] = "static",
     add_scalebar: bool = True,
     add_north_arrow: bool = True,
     lang: str = "en",
     facet: bool = False,
     ncols: Optional[int] = None,
     dpi: Optional[int] = None,
-) -> Union[go.Figure, list[go.Figure], dict[str, go.Figure]]:
-    """Plot LCZ parameter rasters with publication-quality Plotly figures.
+) -> Union[
+    go.Figure, list[go.Figure],
+    "matplotlib.figure.Figure", list["matplotlib.figure.Figure"],
+]:
+    """Plot LCZ parameter rasters with publication-quality figures.
+
+    The default backend is the native **static** matplotlib/Agg renderer: each
+    parameter becomes a reproducible PNG/PDF/SVG/TIFF that needs no Plotly,
+    Kaleido, Chromium or browser. ``renderer="plotly"`` keeps the interactive
+    WebGL/heatmap figure (and the optional Datashader acceleration) exactly as
+    before.
 
     Parameters
     ----------
@@ -1207,45 +1669,65 @@ def lcz_plot_parameters(
     isave : bool
         Save each rendered figure.
     save_extension : str
-        "html" for interactive, "png"/"pdf"/"svg"/"tiff" for static.
+        Output format for static exports: "png" (static default), "pdf",
+        "svg", "tiff"/"tif", "jpg"/"jpeg", "webp". "html" (the historic
+        default) is coerced to "png" by the static renderer and written as an
+        interactive HTML file by the Plotly renderer.
     style : str
         Publication style preset: "default", "nature", "science", or
-        "generic_bw". Controls font, figure size (mm), DPI, and palette
-        used when ``isave`` and ``save_extension`` != "html".
+        "generic_bw". Controls font, figure size (mm), DPI, and palette.
     max_pixels : int
         Down-sample threshold. Ignored for ``chart_type != "map"``.
     use_datashader : bool
         Use Datashader for large rasters when installed. Ignored for
-        ``chart_type != "map"``; falls back to Plotly when unavailable.
+        ``chart_type != "map"`` and for the static renderer; falls back to
+        Plotly when unavailable.
     title, subtitle, caption : str, optional
         Figure annotations.
-    renderer : {"plotly", "datashader", "auto"}
-        Rendering backend. Ignored for ``chart_type != "map"``.
+    renderer : {"static", "plotly", "datashader", "auto"}, optional
+        Rendering backend. "static" (default, also ``None``/"matplotlib"/
+        "agg"/"native") draws each parameter with matplotlib and returns
+        ``matplotlib.figure.Figure`` object(s) — no Plotly, Kaleido, Chromium
+        or browser involved. "plotly" (also "interactive") returns the
+        interactive WebGL/heatmap Plotly figure. "datashader" and "auto" are
+        Plotly accelerators and keep their historic meaning (Datashader when
+        installed, for large rasters). Ignored for ``chart_type != "map"``.
     add_scalebar, add_north_arrow : bool
         Add a scale bar / north arrow to the rendered map. Only applies to
-        ``chart_type="map"`` (skipped silently for geographic CRSs).
+        ``chart_type="map"`` (skipped silently for geographic CRSs; the scale
+        bar needs a projected CRS). For un-georeferenced arrays only the north
+        arrow is drawn (raster row 0 is north).
     lang : str
-        Message language ("en"/"pt"/"es"/"zh"). Only used for
-        ``chart_type != "map"``.
+        Message language ("en"/"pt"/"es"/"zh"). Used for chart labels and the
+        default figure title.
     facet : bool
         Combine every selected parameter into a single faceted figure
         (one panel + colourbar per parameter) instead of returning one
         figure per band. Default False preserves the historic return type.
+        Static facets are one matplotlib ``Figure``; Plotly facets are one
+        ``go.Figure`` with subplots.
     ncols : int, optional
         Column count for ``facet=True``. Defaults to 2 (up to 4 panels) or
         3 (more).
     dpi : int, optional
-        Resolution for static exports (default >= 300 dpi).
+        Resolution for static exports (never below 300 dpi; the style preset's
+        own resolution is used when higher).
 
     Returns
     -------
-    plotly.graph_objects.Figure, list thereof, or (unused here) dict thereof
+    matplotlib.figure.Figure, list thereof, plotly.graph_objects.Figure, or
+    list thereof
+        ``renderer="static"``: one ``Figure`` when a single parameter is
+        rendered or ``facet=True``; otherwise a ``list[Figure]`` in requested
+        band order (mirroring the Plotly return shape). ``renderer="plotly"``
+        returns the historic Plotly objects.
 
     Examples
     --------
     >>> from LCZ4py.general.lcz_get_indices import lcz_get_indices
     >>> idx = lcz_get_indices(pc_result, indices=["NDVI", "NDBI"])
-    >>> lcz_plot_parameters(idx.path, iselect="NDVI")
+    >>> lcz_plot_parameters(idx.path, iselect="NDVI")                 # static PNG-ready
+    >>> lcz_plot_parameters(idx.path, iselect="NDVI", renderer="plotly")
     >>> lcz_plot_parameters(idx.path, all_params=True, has_class_band=False, facet=True)
     """
     if chart_type != "map":
@@ -1265,21 +1747,27 @@ def lcz_plot_parameters(
         from LCZ4py.general.lcz_cal_indices import lcz_cal_indices
 
         requested = [iselect] if isinstance(iselect, str) else list(iselect) if iselect else None
+        # Propagate the caller's renderer choice (the delegated charts default
+        # to static too). Legacy Plotly accelerators map to "plotly".
+        _legacy = {"plotly", "interactive", "auto", "datashader"}
+        delegate_renderer = (
+            "plotly" if str(renderer).strip().lower() in _legacy else "static"
+        )
         result = lcz_cal_indices(
             lcz_map, x, indices=requested, plot_type=chart_type,
             index_x=index_x, index_y=index_y, size_by=size_by,
             lcz_classes=lcz_classes, normalize_radar=normalize_radar,
             inclusive=inclusive, isave=isave, save_extension=save_extension,
             title=title, subtitle=subtitle, caption=caption, lang=lang,
+            renderer=delegate_renderer, dpi=dpi,
         )
         return result.fig
 
     if x is None:
         raise ValueError("x must be a raster path / dataset / array")
-    if renderer not in ("plotly", "datashader", "auto"):
-        raise ValueError(
-            f"renderer must be 'plotly', 'datashader' or 'auto', got {renderer!r}"
-        )
+    # "static" (default) -> matplotlib/Agg; "plotly" keeps the historic path,
+    # and "datashader"/"auto" stay Plotly-based accelerators.
+    renderer_mode, legacy_renderer = _resolve_plot_renderer(renderer)
     if (save_extension or "").lower().lstrip(".") not in (
         "html", "png", "pdf", "svg", "tiff", "jpg", "jpeg", "webp"
     ):
@@ -1288,6 +1776,9 @@ def lcz_plot_parameters(
             "(use html, png, pdf, svg, tiff, jpg or webp)."
         )
     save_extension = (save_extension or "html").lower().lstrip(".")
+    if renderer_mode == "static" and save_extension == "html":
+        logger.info("Static renderer cannot write HTML; saving PNG instead.")
+        save_extension = "png"
 
     # Accept the dict returned by lcz_get_ucp() directly
     if isinstance(x, dict):
@@ -1302,7 +1793,8 @@ def lcz_plot_parameters(
         return _plot_from_dataset(
             x, iselect=iselect, all_params=all_params, inclusive=inclusive,
             isave=isave, save_extension=save_extension, use_datashader=use_datashader,
-            title=title, subtitle=subtitle, caption=caption, renderer=renderer,
+            title=title, subtitle=subtitle, caption=caption,
+            renderer="static" if renderer_mode == "static" else legacy_renderer,
             style=style, add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
             lang=lang, dpi=dpi, facet=facet, ncols=ncols,
         )
@@ -1360,6 +1852,16 @@ def lcz_plot_parameters(
                     arr, profile = reader.read_band(band=band_idx)
             panels.append((name, arr, profile))
 
+    # ── Native static renderer (default) ─────────────────────────────────────
+    if renderer_mode == "static":
+        return _static_parameter_figures(
+            panels, inclusive=inclusive, isave=isave,
+            save_extension=save_extension, style=style, dpi=dpi, lang=lang,
+            title=title, subtitle=subtitle, caption=caption,
+            add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+            facet=facet, ncols=ncols,
+        )
+
     if facet:
         fig = _build_facet_figure(
             panels, inclusive=inclusive, ncols=ncols,
@@ -1373,8 +1875,8 @@ def lcz_plot_parameters(
     figures = []
     for name, arr, profile in panels:
         # Determine rendering strategy
-        use_ds = (renderer == "datashader") or (
-            renderer == "auto" and use_datashader and
+        use_ds = (legacy_renderer == "datashader") or (
+            legacy_renderer == "auto" and use_datashader and
             arr.shape[0] * arr.shape[1] > 4_000_000
         )
 

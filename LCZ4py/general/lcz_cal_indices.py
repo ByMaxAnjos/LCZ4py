@@ -1,25 +1,34 @@
 """
 lcz_cal_indices.py
 
-Per-LCZ-class statistics and interactive charts for spectral indices
+Per-LCZ-class statistics and charts for spectral indices
 (``lcz_get_indices`` output) — the statistics/visualization counterpart to
 ``lcz_cal_area.py``, generalized from area/count aggregation to arbitrary
 continuous index values.
 
 Two chart kinds, both built from the *same* aggregated statistics table
 (no second pass over raw pixels for plotting):
-- ``"box"``  — per-class distribution (quartiles/whiskers/mean), Plotly's
-  precomputed-statistics Box trace.
+- ``"box"``  — per-class distribution (quartiles/whiskers/mean).
 - ``"bar"``  — per-class mean with a 95% CI error bar (mirrors the R
   package's ``plot_lcz_parameter_comparison``).
 
 When multiple indices are requested, both kinds render as small-multiples
 (one subplot per index) instead of one chart per call.
+
+Rendering
+---------
+The **default** renderer is native static matplotlib/Agg (``renderer="static"``,
+also ``None``/``"matplotlib"``/``"agg"``): box, bar, scatter, radar,
+correlation-heatmap and effect-size charts are drawn with the shared
+``_internal/lcz_static`` helpers and saved at >=300 dpi without Plotly,
+Kaleido, Chromium or a browser. ``renderer="plotly"`` keeps the previous
+interactive figures unchanged.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +52,7 @@ from LCZ4py._internal.lcz_parameters_data import (
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import get_style, save_plotly_figure
+from LCZ4py._internal import lcz_static as _st
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
@@ -637,15 +647,693 @@ def _to_geoarrow(df: pl.DataFrame) -> Optional[pa.Table]:
         return None
 
 
+# ── Native static charts (matplotlib/Agg — no Plotly/Kaleido/browser) ────────
+
+#: Marker cycle giving the scatter a non-colour encoding for every class.
+_MARKER_CYCLE = ("o", "s", "^", "D", "v", "P", "X", "*", "h", "<", ">", "p")
+
+#: ``lcz_msg`` leaves rich markup such as ``{val NDVI}`` for rich printers;
+#: matplotlib titles need the plain text.
+_RICH_MARKUP_RE = re.compile(r"\{(?:val|arg|fn|path|url)\s+([^{}]*)\}")
+
+
+def _plain(text: str) -> str:
+    """Unwrap ``lcz_msg``'s ``{val ...}``-style markup for plain-text titles."""
+    return _RICH_MARKUP_RE.sub(r"\1", text or "")
+
+
+def _finite_or(value: object, fallback: float) -> float:
+    """``float(value)`` when finite, else ``fallback``."""
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    return out if np.isfinite(out) else fallback
+
+
+def _style_axes(ax, spec, *, grid_axis: str = "y", rotate: float = 0.0) -> None:
+    """Consistent panel styling: small ticks, light grid, open frame."""
+    ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2), length=2.5, width=0.6)
+    if rotate:
+        for label in ax.get_xticklabels():
+            label.set_rotation(rotate)
+            label.set_ha("right")
+            label.set_rotation_mode("anchor")
+    ax.grid(axis=grid_axis, color="#e8e8e8", linewidth=0.5)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+
+def _legend_entries(df: pl.DataFrame) -> list:
+    """``(colour, "code: name")`` pairs in class order."""
+    return list(zip(df["color"].to_list(), df["readable"].to_list()))
+
+
+def _class_legend(
+    fig,
+    entries: list,
+    spec,
+    *,
+    lang: str = "en",
+    ncol: int = 3,
+    y: float = 0.02,
+    markers: bool = False,
+) -> None:
+    """Class legend below the panel(s); patches for bars, markers for scatter."""
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    if not entries:
+        return None
+    fontsize = max(5.0, spec.font_size - 2)
+    if markers:
+        handles = [
+            Line2D([], [], linestyle="", marker=_MARKER_CYCLE[i % len(_MARKER_CYCLE)],
+                   markersize=4.5, markerfacecolor=color, markeredgecolor="black",
+                   markeredgewidth=0.3, label=label)
+            for i, (color, label) in enumerate(entries)
+        ]
+    else:
+        handles = [
+            Patch(facecolor=color, edgecolor="black", linewidth=0.3, label=label)
+            for color, label in entries
+        ]
+    return fig.legend(
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, y),
+        ncol=min(int(ncol), max(2, len(handles))),
+        frameon=False,
+        fontsize=fontsize,
+        handlelength=1.1 if not markers else 0.9,
+        columnspacing=1.2,
+        handletextpad=0.4,
+        title=lcz_msg("lcz_class_legend", lang),
+        title_fontsize=fontsize,
+    )
+
+
+def _panel_layout(n_panels: int, style: str, dpi: Optional[int]):
+    """Figure + gridspec sized for ``n_panels`` small multiples."""
+    rows, cols = _subplot_grid(n_panels)
+    column = "single" if cols == 1 else "double"
+    height_mm = 64.0 * rows + 30.0
+    fig, spec, _ = _st.new_figure(
+        style, column=column, height_mm=height_mm, dpi=dpi,
+    )
+    gs = fig.add_gridspec(
+        rows, cols,
+        left=0.085, right=0.985,
+        top=_st.figure_top(True), bottom=0.16,
+        hspace=0.55 if rows > 1 else 0.0,
+        wspace=0.36 if cols > 1 else 0.0,
+    )
+    return fig, spec, gs, (rows, cols)
+
+
+def _draw_box_static(
+    df: pl.DataFrame,
+    params: list[str],
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Precomputed-statistics box plot per LCZ class (one panel per index)."""
+    fig, spec, gs, (rows, cols) = _panel_layout(len(params), style, dpi)
+    multi = cols > 1
+
+    for i, param in enumerate(params):
+        ax = fig.add_subplot(gs[i // cols, i % cols])
+        sub = df.filter(pl.col("parameter") == param)
+        stats_list, colors = [], []
+        for row in sub.iter_rows(named=True):
+            q1 = _finite_or(row["q25"], np.nan)
+            q3 = _finite_or(row["q75"], np.nan)
+            med = _finite_or(row["median"], np.nan)
+            if not (np.isfinite(q1) and np.isfinite(q3) and np.isfinite(med)):
+                continue
+            lo = min(_finite_or(row["min"], q1), q1)
+            hi = max(_finite_or(row["max"], q3), q3)
+            stats_list.append(dict(
+                label=str(int(row["lcz"])), med=med, q1=q1, q3=q3,
+                whislo=lo, whishi=hi, fliers=[],
+                mean=_finite_or(row["mean"], med),
+            ))
+            colors.append(row["color"])
+
+        if not stats_list:  # pragma: no cover - no finite stats for this index
+            ax.set_visible(False)
+            continue
+
+        bxp = ax.bxp(
+            stats_list, showmeans=True, patch_artist=True, widths=0.62,
+            boxprops=dict(linewidth=0.5, edgecolor="black"),
+            medianprops=dict(color="black", linewidth=0.8),
+            whiskerprops=dict(linewidth=0.5),
+            capprops=dict(linewidth=0.5),
+            meanprops=dict(marker="o", markersize=2.6, markerfacecolor="white",
+                           markeredgecolor="black", markeredgewidth=0.5),
+        )
+        for patch, color in zip(bxp["boxes"], colors):
+            patch.set_facecolor(color)
+
+        ax.set_title(param, fontsize=max(6.0, spec.font_size), pad=3)
+        ax.set_xlabel(lcz_msg("lcz_code_label", lang))
+        ax.set_ylabel(_axis_label(param))
+        _style_axes(ax, spec, rotate=90 if multi else 0)
+
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_bar_static(
+    df: pl.DataFrame,
+    params: list[str],
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Per-class mean with a 95% CI error bar (one panel per index)."""
+    fig, spec, gs, (rows, cols) = _panel_layout(len(params), style, dpi)
+    multi = cols > 1
+
+    for i, param in enumerate(params):
+        ax = fig.add_subplot(gs[i // cols, i % cols])
+        sub = df.filter(pl.col("parameter") == param)
+        codes = [str(int(v)) for v in sub["lcz"].to_list()]
+        mean = np.nan_to_num(sub["mean"].to_numpy().astype(float), nan=0.0)
+        lower = np.nan_to_num(sub["ci_lower"].to_numpy().astype(float), nan=0.0)
+        upper = np.nan_to_num(sub["ci_upper"].to_numpy().astype(float), nan=0.0)
+        yerr = np.vstack([np.maximum(mean - lower, 0.0), np.maximum(upper - mean, 0.0)])
+
+        x = np.arange(len(codes), dtype=float)
+        ax.bar(
+            x, mean, yerr=yerr, width=0.74,
+            color=sub["color"].to_list(), edgecolor="black", linewidth=0.4,
+            error_kw=dict(elinewidth=0.6, capsize=1.6, ecolor="#333333"),
+        )
+        ax.set_xticks(x)
+        ax.set_xticklabels(codes)
+        ax.set_title(param, fontsize=max(6.0, spec.font_size), pad=3)
+        ax.set_xlabel(lcz_msg("lcz_code_label", lang))
+        ax.set_ylabel(_axis_label(param))
+        _style_axes(ax, spec, rotate=90 if multi else 0)
+
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _scatter_points(
+    classes: np.ndarray,
+    values: dict[str, np.ndarray],
+    index_x: str,
+    index_y: str,
+    size_by: Optional[str] = None,
+    *,
+    max_points: int = 20_000,
+    seed: int = 0,
+) -> dict[str, np.ndarray]:
+    """Valid (LCZ 1-17) per-pixel samples for the scatter, subsampled."""
+    lcz_flat = np.asarray(classes).ravel()
+    x = np.asarray(values[index_x], dtype=np.float64).ravel()
+    y = np.asarray(values[index_y], dtype=np.float64).ravel()
+    valid = (
+        np.isfinite(lcz_flat) & (lcz_flat >= 1) & (lcz_flat <= 17)
+        & np.isfinite(x) & np.isfinite(y)
+    )
+    sizes = None
+    if size_by:
+        sizes = np.asarray(values[size_by], dtype=np.float64).ravel()
+        valid = valid & np.isfinite(sizes)
+
+    idx = np.where(valid)[0]
+    if idx.size == 0:
+        raise ValueError(
+            f"No valid pixels for the scatter: {index_x}/{index_y} are NaN "
+            "wherever LCZ classes 1-17 are present."
+        )
+    if idx.size > max_points:
+        idx = np.random.default_rng(seed).choice(idx, size=max_points, replace=False)
+
+    out = {"lcz": lcz_flat[idx].astype(int), "x": x[idx], "y": y[idx]}
+    if sizes is not None:
+        out["size"] = sizes[idx]
+    return out
+
+
+def _draw_scatter_static(
+    classes: np.ndarray,
+    values: dict[str, np.ndarray],
+    index_x: str,
+    index_y: str,
+    *,
+    size_by: Optional[str] = None,
+    inclusive: bool = False,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Per-pixel scatter of two indices coloured by LCZ class."""
+    from LCZ4py._internal.lcz_parameters_data import get_lcz_names
+
+    samples = _scatter_points(classes, values, index_x, index_y, size_by)
+    names = get_lcz_names(lang)
+    colors = LCZ_COLORBLIND if inclusive else LCZ_COLORS
+    present = sorted(int(v) for v in np.unique(samples["lcz"]))
+
+    fig, spec, _ = _st.new_figure(
+        style, aspect=0.72, extra_height_mm=36.0, column="single", dpi=dpi,
+    )
+    ax = _st.add_axes(
+        fig, bottom=0.39, top=_st.figure_top(True), left=0.14, right=0.97,
+    )
+
+    sizes = samples.get("size")
+    marker_area = None
+    if sizes is not None and sizes.size:
+        lo, hi = float(np.nanmin(sizes)), float(np.nanmax(sizes))
+        marker_area = 8.0 + 26.0 * (sizes - lo) / (hi - lo + 1e-9)
+
+    for i, lcz_val in enumerate(present):
+        mask = samples["lcz"] == lcz_val
+        ax.scatter(
+            samples["x"][mask], samples["y"][mask],
+            s=marker_area[mask] if marker_area is not None else 10.0,
+            c=colors[lcz_val - 1], marker=_MARKER_CYCLE[i % len(_MARKER_CYCLE)],
+            edgecolors="black", linewidths=0.2, alpha=0.85,
+        )
+
+    ax.set_xlabel(index_x)
+    ax.set_ylabel(index_y)
+    if size_by and marker_area is not None:
+        ax.text(
+            0.99, 0.01, f"marker size ∝ {size_by}", transform=ax.transAxes,
+            ha="right", va="bottom", fontsize=max(5.0, spec.font_size - 3),
+            color="#444444",
+        )
+    _style_axes(ax, spec, grid_axis="both")
+
+    _class_legend(
+        fig,
+        [(colors[c - 1], f"{c}: {names[c - 1]}") for c in present],
+        spec, lang=lang, ncol=3, y=0.02, markers=True,
+    )
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_radar_static(
+    df: pl.DataFrame,
+    params: list[str],
+    *,
+    lcz_classes: Optional[list[int]] = None,
+    normalize: bool = True,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """One polar trace per LCZ class, axes = requested indices."""
+    from matplotlib.lines import Line2D
+
+    present = sorted(int(v) for v in df["lcz"].unique().to_list())
+    classes_to_plot = [c for c in (lcz_classes or present) if c in present]
+    if not classes_to_plot:
+        raise ValueError(
+            f"None of the requested lcz_classes are present. Available: {present}"
+        )
+
+    sub_all = df.filter(
+        pl.col("parameter").is_in(params) & pl.col("lcz").is_in(classes_to_plot)
+    )
+    bounds: dict[str, tuple[float, float]] = {}
+    if normalize:
+        bounds_df = sub_all.group_by("parameter").agg([
+            pl.col("mean").min().alias("pmin"),
+            pl.col("mean").max().alias("pmax"),
+        ])
+        bounds = {
+            r["parameter"]: (r["pmin"], r["pmax"])
+            for r in bounds_df.iter_rows(named=True)
+        }
+
+    fig, spec, _ = _st.new_figure(
+        style, aspect=0.95, extra_height_mm=28.0, column="single", dpi=dpi,
+    )
+    ax = fig.add_axes([0.16, 0.26, 0.68, 0.60], projection="polar")
+
+    theta = np.linspace(0.0, 2.0 * np.pi, len(params), endpoint=False)
+    angles = np.append(theta, theta[0])
+    handles = []
+    vmin, vmax = np.inf, -np.inf
+
+    for lcz_val in classes_to_plot:
+        sub = sub_all.filter(pl.col("lcz") == lcz_val)
+        by_param = {r["parameter"]: r for r in sub.iter_rows(named=True)}
+        values, color, name = [], None, None
+        for param in params:
+            row = by_param.get(param)
+            if row is None:
+                values.append(np.nan)
+                continue
+            if color is None:
+                color, name = row["color"], row["lcz_name"]
+            value = _finite_or(row["mean"], np.nan)
+            if normalize and param in bounds:
+                lo, hi = bounds[param]
+                value = 0.5 if hi == lo else (value - lo) / (hi - lo)
+            values.append(value)
+
+        if color is None:  # pragma: no cover - class has no plotted parameter
+            continue
+        radii = np.asarray(values, dtype=float)
+        finite = radii[np.isfinite(radii)]
+        if finite.size:
+            vmin = min(vmin, float(finite.min()))
+            vmax = max(vmax, float(finite.max()))
+        closed = np.append(radii, radii[0])
+        ax.plot(angles, closed, color=color, linewidth=1.4)
+        ax.fill(angles, closed, color=color, alpha=0.10)
+        handles.append(Line2D([], [], color=color, linewidth=1.6,
+                              label=f"{lcz_val}: {name}"))
+
+    ax.set_xticks(theta)
+    ax.set_xticklabels(params, fontsize=max(5.0, spec.font_size - 3))
+    ax.set_rlabel_position(100.0)
+    ax.tick_params(axis="y", labelsize=max(4.5, spec.font_size - 4))
+    if normalize:
+        ax.set_ylim(0.0, 1.0)
+    elif np.isfinite(vmin) and np.isfinite(vmax) and vmin < vmax:
+        ax.set_ylim(min(0.0, vmin), vmax * 1.05 if vmax > 0 else vmax * 0.95 + 0.05)
+
+    fontsize = max(5.0, spec.font_size - 2)
+    fig.legend(
+        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.02),
+        ncol=min(3, max(2, len(handles))), frameon=False, fontsize=fontsize,
+        handlelength=1.1, columnspacing=1.2, handletextpad=0.4,
+        title=lcz_msg("lcz_class_legend", lang), title_fontsize=fontsize,
+    )
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_correlation_static(
+    classes: np.ndarray,
+    values: dict[str, np.ndarray],
+    params: list[str],
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Annotated Pearson correlation matrix (diverging, colourblind-safe)."""
+    lcz_flat = np.asarray(classes).ravel()
+    valid = np.isfinite(lcz_flat) & (lcz_flat >= 1) & (lcz_flat <= 17)
+    cols = {}
+    for param in params:
+        v = np.asarray(values[param], dtype=np.float64).ravel()
+        valid = valid & np.isfinite(v)
+        cols[param] = v
+    if len(params) < 2:
+        raise ValueError(
+            "plot_type='correlation' needs at least two indices to correlate."
+        )
+    if not valid.any():
+        raise ValueError(
+            "No valid (LCZ 1-17, finite) pixels to correlate — nothing to plot."
+        )
+    corr = pl.DataFrame(cols).filter(pl.Series(valid)).corr()
+    matrix = corr.to_numpy()
+
+    n = len(params)
+    width_mm = max(95.0, 20.0 * n + max(50.0, 6.0 * max(len(p) for p in params)))
+    height_mm = max(95.0, 20.0 * n + 45.0)
+    fig, spec, _ = _st.new_figure(
+        style, width_mm=width_mm, height_mm=height_mm, dpi=dpi,
+    )
+    ax = _st.add_axes(
+        fig, bottom=0.30, top=_st.figure_top(True),
+        left=min(0.42, 0.16 + 0.012 * max(len(p) for p in params)), right=0.95,
+    )
+
+    image = ax.imshow(
+        matrix, cmap=_st.mpl_cmap("RdBu_r"), vmin=-1.0, vmax=1.0, aspect="auto",
+    )
+    ax.set_xticks(np.arange(n))
+    ax.set_yticks(np.arange(n))
+    ax.set_xticklabels(params, rotation=45, ha="right", rotation_mode="anchor")
+    ax.set_yticklabels(params)
+    ax.tick_params(labelsize=max(5.0, spec.font_size - 2), length=2.0, width=0.5)
+
+    cell_font = max(4.5, min(8.0, spec.font_size - 2))
+    for i in range(n):
+        for j in range(n):
+            value = float(matrix[i, j])
+            if not np.isfinite(value):
+                continue
+            ax.text(
+                j, i, f"{value:.2f}", ha="center", va="center", fontsize=cell_font,
+                color="white" if abs(value) > 0.6 else "black",
+            )
+
+    _st.add_colorbar(
+        fig, ax, image, units="Pearson r (dimensionless)",
+        fontsize=max(5.5, spec.font_size - 2),
+    )
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_effect_size_static(
+    cohens_d_df: pl.DataFrame,
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Ranked horizontal bar of Cohen's d per index, with magnitude brackets."""
+    from matplotlib.patches import Patch
+
+    magnitude_order = [
+        lcz_msg("indices_magnitude_negligible", lang),
+        lcz_msg("indices_magnitude_small", lang),
+        lcz_msg("indices_magnitude_medium", lang),
+        lcz_msg("indices_magnitude_large", lang),
+    ]
+    color_map = dict(zip(magnitude_order, _MAGNITUDE_COLOR_ORDER))
+
+    df_sorted = cohens_d_df.filter(pl.col("cohens_d").is_not_nan()).sort(
+        pl.col("cohens_d").abs(), descending=True,
+    )
+    if df_sorted.height == 0:  # pragma: no cover - guarded by the caller
+        raise ValueError("No finite Cohen's d values to plot.")
+
+    n = df_sorted.height
+    height_mm = min(36.0 + 8.0 * n, 200.0)
+    fig, spec, _ = _st.new_figure(
+        style, aspect=height_mm / 120.0, column="single", dpi=dpi,
+    )
+    ax = _st.add_axes(
+        fig, bottom=0.17, top=_st.figure_top(True), left=0.34, right=0.96,
+    )
+
+    y = np.arange(n, dtype=float)
+    values = df_sorted["cohens_d"].to_numpy().astype(float)
+    colors = [color_map.get(m, "#999999") for m in df_sorted["magnitude"].to_list()]
+    ax.barh(y, values, height=0.68, color=colors, edgecolor="black", linewidth=0.4)
+
+    for thr in (0.2, 0.5, 0.8):
+        ax.axvline(thr, linestyle=":", color="gray", linewidth=0.6, zorder=0)
+        ax.axvline(-thr, linestyle=":", color="gray", linewidth=0.6, zorder=0)
+    ax.axvline(0.0, color="black", linewidth=0.8, zorder=1)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(df_sorted["parameter"].to_list())
+    ax.set_xlabel("Cohen's d")
+    ax.invert_yaxis()  # largest |d| at the top
+    _style_axes(ax, spec, grid_axis="x")
+
+    present_magnitudes = [m for m in magnitude_order if m in set(df_sorted["magnitude"].to_list())]
+    if present_magnitudes:
+        ax.legend(
+            handles=[Patch(facecolor=color_map[m], edgecolor="black",
+                           linewidth=0.3, label=m) for m in present_magnitudes],
+            loc="best", frameon=False,
+            fontsize=max(5.0, spec.font_size - 3), title="|d|",
+            title_fontsize=max(5.0, spec.font_size - 3),
+        )
+
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _static_figures(
+    df: pl.DataFrame,
+    values: dict[str, np.ndarray],
+    classes: np.ndarray,
+    plot_type: str,
+    selected: list[str],
+    cohens_d_df: Optional[pl.DataFrame],
+    *,
+    index_x: Optional[str],
+    index_y: Optional[str],
+    size_by: Optional[str],
+    lcz_classes: Optional[list[int]],
+    normalize_radar: bool,
+    inclusive: bool,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Build the requested chart(s) with matplotlib/Agg.
+
+    Returns the same shape as the Plotly path: a single figure, or a dict of
+    figures for ``plot_type="both"``/``"all"``.
+    """
+    common = dict(subtitle=subtitle, caption=caption, lang=lang, style=style, dpi=dpi)
+
+    def _title(default_key: str, **fmt) -> str:
+        return _plain(title or lcz_msg(default_key, lang, **fmt))
+
+    with _st.style_context(style):
+        if plot_type == "box":
+            return _draw_box_static(
+                df, selected, title=_title("indices_stats_title"), **common,
+            )
+        if plot_type == "bar":
+            return _draw_bar_static(
+                df, selected, title=_title("indices_stats_title"), **common,
+            )
+        if plot_type == "both":
+            return {
+                "box": _draw_box_static(
+                    df, selected, title=_title("indices_stats_title"), **common,
+                ),
+                "bar": _draw_bar_static(
+                    df, selected, title=_title("indices_stats_title"), **common,
+                ),
+            }
+        if plot_type == "scatter":
+            return _draw_scatter_static(
+                classes, values, index_x, index_y, size_by=size_by,
+                inclusive=inclusive,
+                title=_title("indices_scatter_title", x=index_x, y=index_y),
+                **common,
+            )
+        if plot_type == "radar":
+            return _draw_radar_static(
+                df, selected, lcz_classes=lcz_classes, normalize=normalize_radar,
+                title=_title("indices_radar_title"), **common,
+            )
+        if plot_type == "correlation":
+            return _draw_correlation_static(
+                classes, values, selected,
+                title=_title("indices_correlation_title"), **common,
+            )
+        if plot_type == "effect_size":
+            return _draw_effect_size_static(
+                cohens_d_df, title=_title("indices_effect_size_title"), **common,
+            )
+
+        # "all": every applicable figure, mirroring the Plotly branch.
+        figs = {
+            "box": _draw_box_static(
+                df, selected, title=_title("indices_stats_title"), **common,
+            ),
+            "bar": _draw_bar_static(
+                df, selected, title=_title("indices_stats_title"), **common,
+            ),
+            "radar": _draw_radar_static(
+                df, selected, lcz_classes=lcz_classes, normalize=normalize_radar,
+                title=_title("indices_radar_title"), **common,
+            ),
+            "correlation": _draw_correlation_static(
+                classes, values, selected,
+                title=_title("indices_correlation_title"), **common,
+            ),
+            "effect_size": _draw_effect_size_static(
+                cohens_d_df, title=_title("indices_effect_size_title"), **common,
+            ),
+        }
+        if index_x and index_y:
+            figs["scatter"] = _draw_scatter_static(
+                classes, values, index_x, index_y, size_by=size_by,
+                inclusive=inclusive,
+                title=_title("indices_scatter_title", x=index_x, y=index_y),
+                **common,
+            )
+        else:
+            logger.info("plot_type='all': skipping scatter (index_x/index_y not given).")
+        return figs
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 @dataclass
 class LCZIndicesStatsResult:
-    """Return type of lcz_cal_indices."""
+    """Return type of lcz_cal_indices.
+
+    ``fig`` is a matplotlib ``Figure`` (or a ``dict`` of them) for the default
+    static renderer, and a Plotly ``go.Figure`` (or a dict of them) when
+    ``renderer="plotly"``.
+    """
     df: pl.DataFrame
-    fig: Optional[Union[go.Figure, dict[str, go.Figure]]] = None
+    fig: Optional[object] = None
     geoarrow_table: Optional[pa.Table] = None
     cohens_d: Optional[pl.DataFrame] = None
+    renderer: str = "static"
+
+    def show(self) -> None:
+        """Display the figure(s) in the active frontend (matplotlib or Plotly)."""
+        figs = self.fig
+        if figs is None:
+            return
+        if isinstance(figs, dict):
+            for figure in figs.values():
+                _show_figure(figure)
+        else:
+            _show_figure(figs)
+
+
+def _show_figure(figure) -> None:
+    """Show one figure, dispatching matplotlib vs Plotly."""
+    if figure is None:
+        return
+    if type(figure).__module__.startswith("matplotlib"):
+        import matplotlib.pyplot as plt
+
+        plt.show()
+    else:
+        figure.show()
 
 
 _PLOT_TYPES = {"box", "bar", "both", "scatter", "radar", "correlation", "effect_size", "all"}
@@ -672,6 +1360,8 @@ def lcz_cal_indices(
     lang: str = "en",
     style: str = "default",
     max_workers: Optional[int] = None,
+    dpi: Optional[int] = None,
+    renderer: Optional[str] = "static",
 ) -> Union[LCZIndicesStatsResult, pl.DataFrame]:
     """Per-LCZ-class descriptive statistics and charts for spectral indices.
 
@@ -725,7 +1415,9 @@ def lcz_cal_indices(
     isave : bool
         Save chart(s) + CSV to ``LCZ4r_output/``.
     save_extension : str
-        "html" for interactive, "png"/"pdf" for static.
+        "png" (default for the static renderer), "pdf", "svg", "tiff", or
+        "html" for the interactive Plotly renderer ("html" is coerced to
+        "png" for the static renderer).
     inclusive : bool
         Use the colorblind-friendly LCZ palette.
     confidence : float
@@ -740,13 +1432,23 @@ def lcz_cal_indices(
     max_workers : int, optional
         Bound on the thread pool used to aggregate indices in parallel.
         Default ``min(8, cpu_count)``. Output row order is independent of it.
+    dpi : int, optional
+        Resolution for static exports. Defaults to 300 dpi (or the style
+        preset's own resolution if higher).
+    renderer : {"static", "plotly"}, optional
+        "static" (default, also ``None``/``"matplotlib"``/``"agg"``) returns
+        matplotlib ``Figure`` object(s) and saves native PNG/PDF/SVG/TIFF with
+        no Plotly, Kaleido, Chromium or browser. "plotly" returns the previous
+        interactive figure(s).
 
     Returns
     -------
     LCZIndicesStatsResult or pl.DataFrame
         Long-format ``df`` has one row per (parameter, lcz) with columns
         ``parameter, lcz, lcz_name, type (Built-up/Natural), count, mean,
-        median, std, min, max, q25, q75, ci_lower, ci_upper``. ``cohens_d``
+        median, std, min, max, q25, q75, ci_lower, ci_upper``. ``fig`` holds
+        matplotlib ``Figure`` object(s) for the default static renderer
+        (Plotly ``go.Figure`` when ``renderer="plotly"``). ``cohens_d``
         is a separate per-parameter table (set when ``plot_type`` is
         ``"effect_size"``/``"all"``, else ``None``).
 
@@ -766,6 +1468,8 @@ def lcz_cal_indices(
     """
     if plot_type not in _PLOT_TYPES:
         raise ValueError(f"plot_type must be one of {_PLOT_TYPES}, got {plot_type!r}")
+    # None / "matplotlib" / "agg" -> the native static renderer (default).
+    renderer = _st.resolve_renderer(renderer)
     if plot_type == "scatter" and not (index_x and index_y):
         raise ValueError("plot_type='scatter' requires both index_x and index_y")
 
@@ -849,7 +1553,15 @@ def lcz_cal_indices(
                 "both built-up (LCZ 1-10) and natural (LCZ 11-17) groups."
             )
 
-    if plot_type == "box":
+    if renderer == "static":
+        fig = _static_figures(
+            df, values, classes, plot_type, selected, cohens_d_df,
+            index_x=index_x, index_y=index_y, size_by=size_by,
+            lcz_classes=lcz_classes, normalize_radar=normalize_radar,
+            inclusive=inclusive, title=title, subtitle=subtitle, caption=caption,
+            lang=lang, style=style, dpi=dpi,
+        )
+    elif plot_type == "box":
         fig = _plot_box_interactive(df, selected, lang=lang)
     elif plot_type == "bar":
         fig = _plot_bar_interactive(df, selected, lang=lang)
@@ -888,19 +1600,22 @@ def lcz_cal_indices(
             logger.info("plot_type='all': skipping scatter (index_x/index_y not given).")
 
     figs = fig if isinstance(fig, dict) else {"_": fig}
-    for f in figs.values():
-        if title or subtitle:
-            title_text = title or lcz_msg("indices_stats_title", lang)
-            if subtitle:
-                title_text += f"<br><sup>{subtitle}</sup>"
-            f.update_layout(title=dict(text=title_text))
-        if caption:
-            f.add_annotation(
-                text=caption, xref="paper", yref="paper", x=0.5, y=-0.08,
-                showarrow=False, font=dict(size=10, color="gray"),
-            )
-        # Publication style: consistent fonts/margins/ticks across figures.
-        f.update_layout(template=spec.template)
+    if renderer != "static":
+        # Plotly-only annotations/template (the static builders drew the
+        # header/footer themselves).
+        for f in figs.values():
+            if title or subtitle:
+                title_text = title or lcz_msg("indices_stats_title", lang)
+                if subtitle:
+                    title_text += f"<br><sup>{subtitle}</sup>"
+                f.update_layout(title=dict(text=title_text))
+            if caption:
+                f.add_annotation(
+                    text=caption, xref="paper", yref="paper", x=0.5, y=-0.08,
+                    showarrow=False, font=dict(size=10, color="gray"),
+                )
+            # Publication style: consistent fonts/margins/ticks across figures.
+            f.update_layout(template=spec.template)
 
     geoarrow_table = _to_geoarrow(df.drop("color"))
 
@@ -908,6 +1623,12 @@ def lcz_cal_indices(
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         for key, f in figs.items():
             suffix = "" if key == "_" else f"_{key}"
+            if renderer == "static":
+                _st.save_static(
+                    f, f"lcz4r_indices{suffix}", isave=True,
+                    save_extension=save_extension, style=style, dpi=dpi, lang=lang,
+                )
+                continue
             plot_path = os.path.join(OUTPUT_DIR, f"lcz4r_indices{suffix}.{save_extension}")
             if save_extension == "html":
                 f.write_html(plot_path, include_plotlyjs="cdn")
@@ -926,7 +1647,8 @@ def lcz_cal_indices(
         logger.info("Saved to: %s", os.path.abspath(OUTPUT_DIR))
 
     return LCZIndicesStatsResult(
-        df=df.drop("color"), fig=fig, geoarrow_table=geoarrow_table, cohens_d=cohens_d_df,
+        df=df.drop("color"), fig=fig, geoarrow_table=geoarrow_table,
+        cohens_d=cohens_d_df, renderer=renderer,
     )
 
 

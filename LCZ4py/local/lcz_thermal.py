@@ -6,6 +6,11 @@ Thermal comfort and anthropogenic heat estimation for LCZ analysis.
 - lcz_utci: Universal Thermal Climate Index (Fiala et al. 2012, ISO 7243)
 - lcz_anthropogenic_heat: Anthropogenic heat flux Q_F (W/m²) from LCZ classes
 
+Both functions draw with the native static matplotlib/Agg backend by default
+(``renderer="static"``) and save a >=300 dpi PNG/PDF/SVG/TIFF, so they need no
+Plotly, Kaleido, Chromium or browser. ``renderer="plotly"`` keeps the original
+interactive figures unchanged.
+
 The UTCI implementation here is a *simplified polynomial screening model*
 (centred 2nd-order expansion), not the official 6th-order UTCI regression
 table shipped by the UTCI operational code — use it for relative comparisons
@@ -24,6 +29,8 @@ import plotly.graph_objects as go
 
 from LCZ4py._internal.lcz_parameters_data import get_lcz_names
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 from LCZ4py._internal.lcz_theme import finalize_export, add_map_furniture
 
 logger = logging.getLogger(__name__)
@@ -215,13 +222,22 @@ class UTCIResult:
     values : UTCI index values (°C), flattened to 1-D.
     categories : Stress labels, same shape as ``values``.
     stats : Summary statistics (mean/min/max/std/percentiles/category %).
-    plot : Plotly figure (map for 2-D input, histogram for 1-D).
+    plot : matplotlib ``Figure`` for the default static renderer, Plotly
+        ``go.Figure`` for ``renderer="plotly"`` (map for 2-D input, histogram
+        for 1-D).
+    renderer : Which renderer produced ``plot`` ("static" or "plotly").
     """
 
     values: np.ndarray
     categories: np.ndarray
     stats: dict
-    plot: Optional[go.Figure] = None
+    plot: Optional[object] = None
+    renderer: str = "static"
+
+    @property
+    def fig(self):
+        """Alias for ``plot`` (matches ``LCZPlotResult.fig`` elsewhere)."""
+        return self.plot
 
 
 @dataclass
@@ -232,12 +248,21 @@ class AnthropogenicHeatResult:
     ----------
     array : Q_F values (W/m²), same shape as the input class array.
     stats : Per-class and area-weighted summary statistics.
-    plot : Plotly figure (heatmap for 2-D input, bar chart for 1-D).
+    plot : matplotlib ``Figure`` for the default static renderer, Plotly
+        ``go.Figure`` for ``renderer="plotly"`` (heatmap for 2-D input, bar
+        chart for 1-D).
+    renderer : Which renderer produced ``plot`` ("static" or "plotly").
     """
 
     array: np.ndarray
     stats: dict
-    plot: Optional[go.Figure] = None
+    plot: Optional[object] = None
+    renderer: str = "static"
+
+    @property
+    def fig(self):
+        """Alias for ``plot`` (matches ``LCZPlotResult.fig`` elsewhere)."""
+        return self.plot
 
 
 # ── Public entry points ───────────────────────────────────────────────────────
@@ -285,6 +310,10 @@ def lcz_utci(
     transform: Optional[Any] = None,
     crs: Optional[Any] = None,
     style: str = "default",
+    isave: bool = False,
+    save_extension: str = "png",
+    dpi: Optional[int] = None,
+    renderer: Optional[str] = "static",
 ) -> UTCIResult:
     """Compute the Universal Thermal Climate Index (UTCI).
 
@@ -325,12 +354,24 @@ def lcz_utci(
     style : str
         Publication style preset: "default", "nature", "science", or
         "generic_bw" (see :mod:`LCZ4py._internal.lcz_theme`).
+    isave : bool
+        Save the figure under ``LCZ4r_output/``.
+    save_extension : str
+        Static output format: "png" (default), "pdf", "svg", "tiff"/"tif",
+        "jpg"/"jpeg" or "webp". "html" is coerced to "png" for the static
+        renderer and only meaningful for ``renderer="plotly"``.
+    dpi : int, optional
+        Export resolution; never below 300 dpi for static output.
+    renderer : {"static", "plotly"}, optional
+        "static" (default, also ``None``/``"matplotlib"``/``"agg"``) returns a
+        matplotlib ``Figure`` and saves a native raster/vector file without
+        Plotly or Kaleido. "plotly" returns the interactive Plotly figure.
 
     Returns
     -------
     UTCIResult
         values: UTCI index (°C), categories: stress labels,
-        stats: summary statistics, plot: Plotly figure.
+        stats: summary statistics, plot: figure (static by default).
 
     Raises
     ------
@@ -342,6 +383,7 @@ def lcz_utci(
         raise ValueError(f"output must be 'category' or 'index', got {output!r}")
     if lang not in ("en", "pt", "es", "zh"):
         lang = "en"
+    renderer = resolve_renderer(renderer)
 
     ta, vas, rh, tmrt = _broadcast_thermal_inputs(
         air_temp, wind_speed, relative_humidity, mean_radiant_temp
@@ -423,6 +465,10 @@ def lcz_utci(
         transform=transform,
         crs=crs,
         style=style,
+        renderer=renderer,
+        dpi=dpi,
+        isave=isave,
+        save_extension=save_extension,
     )
 
     return UTCIResult(
@@ -430,6 +476,7 @@ def lcz_utci(
         categories=categories,
         stats=stats,
         plot=fig,
+        renderer=renderer,
     )
 
 
@@ -460,6 +507,10 @@ def lcz_anthropogenic_heat(
     transform: Optional[Any] = None,
     crs: Optional[Any] = None,
     style: str = "default",
+    isave: bool = False,
+    save_extension: str = "png",
+    dpi: Optional[int] = None,
+    renderer: Optional[str] = "static",
 ) -> AnthropogenicHeatResult:
     """Estimate anthropogenic heat flux Q_F (W/m²) from LCZ classes.
 
@@ -482,12 +533,23 @@ def lcz_anthropogenic_heat(
         CRS matching ``transform``.
     style : str
         Publication style preset (see :mod:`LCZ4py._internal.lcz_theme`).
+    isave : bool
+        Save the figure under ``LCZ4r_output/``.
+    save_extension : str
+        Static output format: "png" (default), "pdf", "svg", "tiff"/"tif",
+        "jpg"/"jpeg" or "webp" ("html" is coerced to "png" for static).
+    dpi : int, optional
+        Export resolution; never below 300 dpi for static output.
+    renderer : {"static", "plotly"}, optional
+        "static" (default) returns a matplotlib ``Figure`` and saves a native
+        file with no Plotly/Kaleido dependency; "plotly" returns the original
+        interactive figure.
 
     Returns
     -------
     AnthropogenicHeatResult
         array: Q_F values (W/m²), stats: per-class and area-weighted
-        means, plot: Plotly heatmap (or bar chart for 1-D input).
+        means, plot: static heatmap (or bar chart for 1-D input) by default.
 
     Raises
     ------
@@ -497,6 +559,7 @@ def lcz_anthropogenic_heat(
     classes = _coerce_class_array(lcz_classes)
     if classes.size == 0:
         raise ValueError("lcz_classes is empty.")
+    renderer = resolve_renderer(renderer)
     original_shape = classes.shape
     flat = classes.ravel()
 
@@ -551,12 +614,15 @@ def lcz_anthropogenic_heat(
     stats = _build_qf_stats(qf, flat, default_qf_ranges, lang)
     fig = _plot_qf_heatmap(
         qf_array, classes, lang, transform=transform, crs=crs, style=style,
+        renderer=renderer, dpi=dpi, isave=isave,
+        save_extension=save_extension,
     )
 
     return AnthropogenicHeatResult(
         array=qf_array,
         stats=stats,
         plot=fig,
+        renderer=renderer,
     )
 
 
@@ -690,10 +756,23 @@ def _plot_utci_map(
     transform: Optional[Any] = None,
     crs: Optional[Any] = None,
     style: str = "default",
-) -> go.Figure:
+    renderer: str = "static",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
     """UTCI figure: discrete stress map / index map for 2-D, histogram for 1-D."""
     if np.ndim(values) == 1:
-        return _plot_utci_histogram(values, lang, style=style)
+        return _plot_utci_histogram(
+            values, lang, style=style, renderer=renderer, dpi=dpi,
+            isave=isave, save_extension=save_extension,
+        )
+    if resolve_renderer(renderer) == "static":
+        return _plot_utci_map_static(
+            values, categories, lang, mode=mode, transform=transform,
+            crs=crs, style=style, dpi=dpi, isave=isave,
+            save_extension=save_extension,
+        )
 
     h, w = np.shape(values)
     geo_kwargs: dict[str, Any] = {}
@@ -791,8 +870,21 @@ def _plot_utci_map(
     return finalize_export(fig, style=style, lang=lang)
 
 
-def _plot_utci_histogram(values: np.ndarray, lang: str, style: str = "default") -> go.Figure:
+def _plot_utci_histogram(
+    values: np.ndarray,
+    lang: str,
+    style: str = "default",
+    renderer: str = "static",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
     """Histogram of UTCI values with mean/median reference lines."""
+    if resolve_renderer(renderer) == "static":
+        return _plot_utci_histogram_static(
+            values, lang, style=style, dpi=dpi, isave=isave,
+            save_extension=save_extension,
+        )
     fig = go.Figure()
     finite = values[np.isfinite(values)]
     fig.add_trace(go.Histogram(
@@ -835,8 +927,18 @@ def _plot_qf_heatmap(
     transform: Optional[Any] = None,
     crs: Optional[Any] = None,
     style: str = "default",
-) -> go.Figure:
+    renderer: str = "static",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
     """Anthropogenic heat flux figure: heatmap for 2-D, bar chart for 1-D."""
+    if resolve_renderer(renderer) == "static":
+        return _plot_qf_static(
+            qf, classes, lang, transform=transform, crs=crs, style=style,
+            dpi=dpi, isave=isave, save_extension=save_extension,
+        )
+
     lcz_names = get_lcz_names(lang)
 
     if qf.ndim == 1:
@@ -930,6 +1032,388 @@ def _plot_qf_heatmap(
         )
 
     return finalize_export(fig, style=style, lang=lang)
+
+
+# ── Native static (matplotlib/Agg) renderers ─────────────────────────────────
+
+def _static_plane_extent(
+    shape: tuple, transform: Optional[Any],
+) -> tuple[float, float, float, float]:
+    """Map extent ``(xmin, xmax, ymin, ymax)`` for a static axes.
+
+    With a geotransform the extent is in map units (row 0 north); without one
+    it falls back to pixel indices, mirroring the Plotly helper above.
+    """
+    h, w = int(shape[0]), int(shape[1])
+    if transform is None:
+        return (0.0, float(w), 0.0, float(h))
+    x0 = float(transform.c)
+    ymax = float(transform.f)
+    x1 = x0 + w * float(transform.a)
+    ymin = ymax + h * float(transform.e)
+    return (x0, x1, ymin, ymax)
+
+
+def _static_map_furniture(
+    ax,
+    extent: tuple,
+    crs,
+    *,
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
+) -> bool:
+    """Axis labels + scale bar + north arrow for a georeferenced panel.
+
+    Calls the individual :mod:`lcz_static` helpers rather than
+    ``add_map_furniture_mpl``, whose ``add_scalebar``/``add_north_arrow``
+    keyword arguments shadow the module-level functions of the same name
+    (same workaround as ``lcz_plot_map._create_static_map``).
+    """
+    st = lcz_static
+    is_geo = st.apply_map_axes(ax, extent, crs)
+    if add_scalebar:
+        st.add_scalebar(ax, st.metric_width(extent, crs), is_geo)
+    if add_north_arrow and not is_geo:
+        st.add_north_arrow(ax)
+    return is_geo
+
+
+def _static_pixel_axes(ax) -> None:
+    """Label a non-georeferenced raster axes in pixel indices."""
+    ax.set_xlabel("Column")
+    ax.set_ylabel("Row")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.tick_params(length=0)
+    # The figure is already sized to the raster's aspect, so equal data-unit
+    # scaling keeps cells square without wasting space.
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _utci_category_cmap():
+    """Discrete colormap + norm over the UTCI stress categories."""
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+
+    colors = [UTCI_CATEGORY_COLORS[label] for label in _UTCI_LABELS]
+    cmap = ListedColormap(colors, name="utci")
+    cmap.set_bad((1.0, 1.0, 1.0, 0.0))
+    norm = BoundaryNorm(np.arange(-0.5, len(colors) + 0.5, 1.0), cmap.N)
+    return cmap, norm
+
+
+def _utci_category_legend(fig, categories: np.ndarray, spec):
+    """Legend of the UTCI stress categories present in ``categories``."""
+    from matplotlib.patches import Patch
+
+    present = [lbl for lbl in _UTCI_LABELS if bool(np.any(categories == lbl))]
+    if not present:
+        return None
+    handles = [
+        Patch(
+            facecolor=UTCI_CATEGORY_COLORS[lbl],
+            edgecolor="black",
+            linewidth=0.3,
+            label=lbl,
+        )
+        for lbl in present
+    ]
+    return fig.legend(
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=min(3, max(1, len(handles))),
+        frameon=False,
+        fontsize=max(5.5, spec.font_size - 2),
+        handlelength=1.1,
+        columnspacing=1.0,
+        handletextpad=0.5,
+    )
+
+
+def _plot_utci_map_static(
+    values: np.ndarray,
+    categories: np.ndarray,
+    lang: str,
+    mode: str = "category",
+    transform: Optional[Any] = None,
+    crs: Optional[Any] = None,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
+    """Publication-quality UTCI map drawn with matplotlib (no browser needed)."""
+    st = lcz_static
+    h, w = np.shape(values)
+    extent = _static_plane_extent((h, w), transform)
+    aspect = h / max(w, 1)
+    categorical = mode != "index"
+    if categorical:
+        n_present = sum(1 for lbl in _UTCI_LABELS if bool(np.any(categories == lbl)))
+        legend_rows = max(1, int(np.ceil(n_present / 3)))
+        extra_mm = 10.0 + 8.0 * legend_rows
+        bottom = min(0.30, 0.12 + 0.04 * legend_rows)
+    else:
+        legend_rows = 0
+        extra_mm = 16.0
+        bottom = 0.14
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style, aspect=aspect, extra_height_mm=extra_mm, dpi=dpi,
+        )
+        ax = st.add_axes(
+            fig,
+            bottom=bottom,
+            top=st.figure_top(True),
+        )
+
+        if categorical:
+            cmap, norm = _utci_category_cmap()
+            idx = np.full((h, w), np.nan, dtype=np.float64)
+            for label, i in _UTCI_CATEGORY_INDEX.items():
+                idx[categories == label] = i
+            idx = np.where(np.isfinite(values), idx, np.nan)
+            ax.imshow(
+                np.ma.masked_invalid(idx),
+                extent=extent,
+                origin="upper",
+                cmap=cmap,
+                norm=norm,
+                interpolation="nearest",
+                aspect="auto",
+            )
+            _utci_category_legend(fig, categories, spec)
+        else:
+            arr = np.where(np.isfinite(values), values, np.nan)
+            image = st.plot_continuous_raster(
+                ax, arr, extent, colorscale="RdYlBu_r",
+            )
+            st.add_colorbar(fig, ax, image, units="°C", fontsize=spec.font_size)
+
+        if transform is not None:
+            _static_map_furniture(ax, extent, crs)
+        else:
+            _static_pixel_axes(ax)
+
+        st.add_header(fig, lcz_msg("utci_map_title", lang), None, spec)
+        st.save_static(
+            fig,
+            "lcz_utci_map",
+            isave=isave,
+            save_extension=save_extension,
+            style=style,
+            dpi=dpi,
+            lang=lang,
+        )
+
+    return fig
+
+
+def _plot_utci_histogram_static(
+    values: np.ndarray,
+    lang: str,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
+    """UTCI histogram with bars coloured by thermal-stress category."""
+    st = lcz_static
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+
+    n_bins = 50
+    if finite.size:
+        counts, edges = np.histogram(finite, bins=n_bins)
+    else:
+        counts, edges = np.histogram([], bins=n_bins, range=(0.0, 1.0))
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    widths = np.diff(edges)
+    bin_labels = _utci_category(centers) if finite.size else np.array([], dtype=object)
+    colors = [
+        UTCI_CATEGORY_COLORS.get(str(lbl), "#888888") for lbl in bin_labels
+    ]
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style, aspect=0.55, extra_height_mm=26.0, dpi=dpi,
+        )
+        ax = st.add_axes(fig, bottom=st.figure_bottom(True), top=st.figure_top(True))
+
+        ax.bar(
+            centers, counts, width=widths, align="center",
+            color=colors, edgecolor="white", linewidth=0.3,
+        )
+        ax.set_axisbelow(True)
+        ax.yaxis.grid(True, linewidth=0.4, color="#dddddd")
+        ax.xaxis.grid(False)
+        ax.set_xlabel("UTCI [°C]")
+        ax.set_ylabel("Count")
+        ax.tick_params(labelsize=max(6, spec.font_size - 2), length=3, width=0.6)
+
+        if finite.size:
+            mean = float(np.mean(finite))
+            median = float(np.median(finite))
+            ax.axvline(mean, linestyle="--", linewidth=1.1, color="#B2182B")
+            ax.axvline(median, linestyle=":", linewidth=1.1, color="#2166AC")
+            y_top = float(counts.max()) if counts.size and counts.max() > 0 else 1.0
+            ax.annotate(
+                f"mean {mean:.1f}", xy=(mean, y_top), xytext=(4, -2),
+                textcoords="offset points", ha="left", va="top",
+                fontsize=max(5.5, spec.font_size - 2), color="#B2182B",
+            )
+            ax.annotate(
+                f"median {median:.1f}", xy=(median, y_top), xytext=(-4, -12),
+                textcoords="offset points", ha="right", va="top",
+                fontsize=max(5.5, spec.font_size - 2), color="#2166AC",
+            )
+            _utci_category_legend(fig, _utci_category(finite), spec)
+
+        st.add_header(fig, lcz_msg("utci_hist_title", lang), None, spec)
+        st.save_static(
+            fig,
+            "lcz_utci_histogram",
+            isave=isave,
+            save_extension=save_extension,
+            style=style,
+            dpi=dpi,
+            lang=lang,
+        )
+
+    return fig
+
+
+def _plot_qf_static(
+    qf: np.ndarray,
+    classes: np.ndarray,
+    lang: str,
+    transform: Optional[Any] = None,
+    crs: Optional[Any] = None,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
+    """Q_F figure drawn with matplotlib: cividis heatmap or per-class bar chart."""
+    st = lcz_static
+
+    if qf.ndim == 1:
+        return _plot_qf_bar_static(
+            qf, classes, lang, style=style, dpi=dpi, isave=isave,
+            save_extension=save_extension,
+        )
+
+    h, w = np.shape(qf)
+    extent = _static_plane_extent((h, w), transform)
+    aspect = h / max(w, 1)
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style, aspect=aspect, extra_height_mm=16.0, dpi=dpi,
+        )
+        ax = st.add_axes(fig, bottom=0.14, top=st.figure_top(True))
+
+        image = st.plot_continuous_raster(ax, qf, extent, colorscale="cividis")
+        st.add_colorbar(fig, ax, image, units="W/m²", fontsize=spec.font_size)
+
+        if transform is not None:
+            _static_map_furniture(ax, extent, crs)
+        else:
+            _static_pixel_axes(ax)
+
+        st.add_header(fig, lcz_msg("qf_map_title", lang), None, spec)
+        st.save_static(
+            fig,
+            "lcz_anthropogenic_heat_map",
+            isave=isave,
+            save_extension=save_extension,
+            style=style,
+            dpi=dpi,
+            lang=lang,
+        )
+
+    return fig
+
+
+def _plot_qf_bar_static(
+    qf: np.ndarray,
+    classes: np.ndarray,
+    lang: str,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
+    """Mean Q_F per LCZ class as a colourblind-safe sequential bar chart."""
+    st = lcz_static
+
+    classes_flat = np.asarray(classes).ravel()
+    qf_flat = np.asarray(qf).ravel()
+    codes = np.where(
+        (classes_flat >= 1) & (classes_flat <= 17), classes_flat, 0,
+    )
+    counts = np.bincount(codes, minlength=18)
+    sums = np.bincount(
+        codes, weights=np.where(codes > 0, qf_flat, 0.0), minlength=18,
+    )
+    present = [c for c in range(1, 18) if counts[c] > 0]
+    means = np.array(
+        [float(sums[c] / counts[c]) if counts[c] else 0.0 for c in present],
+        dtype=np.float64,
+    )
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style, aspect=0.58, extra_height_mm=10.0, dpi=dpi,
+        )
+        ax = st.add_axes(
+            fig,
+            bottom=0.28 if len(present) > 8 else 0.24,
+            top=st.figure_top(True),
+        )
+
+        if means.size:
+            lo, hi = float(means.min()), float(means.max())
+            if hi <= lo:
+                hi = lo + 1.0
+            bar_colors = st.mpl_cmap("cividis")(
+                (means - lo) / (hi - lo) if hi > lo else np.zeros_like(means)
+            )
+        else:
+            bar_colors = "#888888"
+
+        ax.bar(
+            np.arange(len(present)), means, color=bar_colors,
+            edgecolor="black", linewidth=0.5, width=0.8,
+        )
+        ax.set_axisbelow(True)
+        ax.yaxis.grid(True, linewidth=0.4, color="#dddddd")
+        ax.xaxis.grid(False)
+        ax.set_xticks(np.arange(len(present)))
+        ax.set_xticklabels(
+            [f"LCZ {c}" for c in present],
+            rotation=90 if len(present) > 8 else 0,
+            fontsize=max(5.5, spec.font_size - 2),
+        )
+        ax.set_xlabel(lcz_msg("lcz_class_legend", lang))
+        ax.set_ylabel("Q_F [W/m²]")
+        ax.tick_params(
+            axis="y", labelsize=max(6, spec.font_size - 2), length=3, width=0.6,
+        )
+
+        st.add_header(fig, lcz_msg("qf_bar_title", lang), None, spec)
+        st.save_static(
+            fig,
+            "lcz_anthropogenic_heat_bar",
+            isave=isave,
+            save_extension=save_extension,
+            style=style,
+            dpi=dpi,
+            lang=lang,
+        )
+
+    return fig
 
 
 __all__ = [

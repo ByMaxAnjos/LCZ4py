@@ -1,20 +1,30 @@
 """
 lcz_anomaly.py — per-station temperature anomaly relative to the overall mean.
 
-Uses Polars groupby for O(N) anomaly math and Plotly for interactive charts
-coloured by LCZ class. All connectors (dot plot, lollipop) are drawn as a
-single vectorised trace instead of one figure shape per station.
+Rendering backends
+------------------
+- ``renderer="static"`` *(default)* — native matplotlib/Agg figure saved as a
+  300 dpi PNG/PDF/SVG/TIFF. No Plotly, Kaleido, Chromium or browser needed.
+- ``renderer="plotly"`` — the interactive figure.
+
+Uses Polars groupby for O(N) anomaly math. All connectors (dot plot,
+lollipop) are drawn as one vectorised call instead of one figure shape per
+station.
 """
 
 from __future__ import annotations
 import logging
 import os
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import polars as pl
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import rasterio
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from matplotlib.figure import Figure
 
 from LCZ4py._internal.lcz_ts_utils import (
     load_lcz_raster, normalise_input_df, normalise_missing,
@@ -23,6 +33,8 @@ from LCZ4py._internal.lcz_ts_utils import (
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import finalize_export
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +386,303 @@ _PLOT_FNS = {
 }
 
 
+# ── Native static renderer (matplotlib/Agg — no Plotly/Kaleido/Chromium) ─────
+
+def _panel_axes(fig, n: int, *, has_header: bool, has_legend: bool,
+                gap: float = 0.055, left: float = 0.22,
+                bottom: Optional[float] = None, top_trim: float = 0.0):
+    """Stacked full-width axes inside ``fig`` (top panel first)."""
+    top = lcz_static.figure_top(has_header) - float(top_trim)
+    bottom = lcz_static.figure_bottom(has_legend) if bottom is None else float(bottom)
+    n = max(int(n), 1)
+    span = max(top - bottom - gap * (n - 1), 0.10)
+    height = span / n
+    axes = []
+    for i in range(n):
+        bottom_i = top - (i + 1) * height - i * gap
+        axes.append(fig.add_axes([left, bottom_i, 0.965 - left, height]))
+    return axes
+
+
+def _legend_bottom(fig, fontsize: float, rows: int, *, with_title: bool = True,
+                   xlabel: bool = True) -> float:
+    """Fraction of the figure height to reserve below the axes for a legend."""
+    fig_h = max(float(fig.get_figheight()), 0.5)
+    line_in = (float(fontsize) * 1.75) / 72.0
+    legend_in = max(int(rows), 0) * line_in + (0.22 if with_title else 0.12)
+    extra_in = 0.58 if xlabel else 0.18
+    return float(min(0.45, max(0.14, (legend_in + extra_in) / fig_h)))
+
+
+def _style_axis(ax, *, spec, grid_axis: str = "x") -> None:
+    """Shared tick/spine styling for the static anomaly charts."""
+    ax.grid(True, axis=grid_axis, lw=0.35, color="0.88", zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2.5),
+                   length=3, width=0.6)
+
+
+def _static_class_legend(fig, classes, *, inclusive: bool, lang: str,
+                         spec, title: Optional[str] = None,
+                         extra_handles: Optional[list] = None):
+    """LCZ class swatch legend shared by the static anomaly charts."""
+    from matplotlib.patches import Patch
+
+    from LCZ4py._internal.lcz_parameters_data import (
+        LCZ_COLORBLIND, LCZ_COLORS, get_lcz_names,
+    )
+
+    present = sorted({int(c) for c in classes if c is not None})
+    if not present and not extra_handles:
+        return None
+    colors = LCZ_COLORBLIND if inclusive else LCZ_COLORS
+    names = get_lcz_names(lang)
+    handles = [
+        Patch(facecolor=colors[c - 1], edgecolor="black", linewidth=0.3,
+              label=f"{c}: {names[c - 1]}")
+        for c in present
+    ]
+    handles.extend(extra_handles or [])
+    fontsize = max(5.5, spec.font_size - 2.5)
+    return fig.legend(
+        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.006),
+        ncol=min(len(handles), 4), frameon=False, fontsize=fontsize,
+        handlelength=1.1, columnspacing=1.0,
+        title=title if title is not None else lcz_msg("lcz_class_legend", lang),
+        title_fontsize=fontsize,
+    )
+
+
+def _static_anomaly_axes(ax, adf: pl.DataFrame, kind: str, xlab: str,
+                         colors: dict, lang: str, spec) -> None:
+    """Draw one anomaly panel on ``ax`` for the requested ``kind``."""
+    stations = [str(s) for s in adf["station"].to_list()]
+    anomalies = np.asarray(adf["anomaly"].to_numpy(), dtype=float)
+    means = np.asarray(adf["mean_value"].to_numpy(), dtype=float)
+    lcz_vals = adf["lcz"].to_list()
+    bar_colors = [colors.get(str(int(v)), "#888888") for v in lcz_vals]
+    label_size = max(6.0, spec.font_size - 1.5)
+    annotate = len(stations) <= 40
+
+    if kind == "diverging_bar":
+        ypos = np.arange(len(stations))
+        ax.barh(ypos, anomalies, color=bar_colors, edgecolor="black",
+                linewidth=0.4, height=0.72, zorder=3)
+        ax.set_yticks(ypos)
+        ax.set_yticklabels(stations, fontsize=max(5.0, spec.font_size - 3.0))
+        ax.axvline(0, color="#666666", lw=0.8, zorder=2)
+        ax.set_xlabel(xlab, fontsize=label_size)
+        _style_axis(ax, spec=spec, grid_axis="x")
+        if annotate:
+            span = float(np.nanmax(np.abs(anomalies))) if anomalies.size else 1.0
+            pad = 0.03 * (span if span > 0 else 1.0)
+            for yi, value in zip(ypos, anomalies):
+                ax.text(
+                    value + (pad if value >= 0 else -pad), yi, f"{value:+.2f}",
+                    va="center", ha="left" if value >= 0 else "right",
+                    fontsize=max(4.5, spec.font_size - 3.5), zorder=4,
+                )
+            ax.margins(x=0.16)
+        return
+
+    if kind == "bar":
+        xpos = np.arange(len(stations))
+        warm = anomalies >= 0
+        if warm.any():
+            ax.bar(xpos[warm], anomalies[warm], color=_WARM_COLOR,
+                   edgecolor="black", linewidth=0.4, width=0.78, zorder=3,
+                   label=_xmsg("warmer_label", lang))
+        cool = ~warm
+        if cool.any():
+            ax.bar(xpos[cool], anomalies[cool], color=_COOL_COLOR,
+                   edgecolor="black", linewidth=0.4, width=0.78, zorder=3,
+                   label=_xmsg("cooler_label", lang))
+        ax.axhline(0, color="#666666", lw=0.8, zorder=2)
+        ax.set_xticks(xpos)
+        rotation = 90 if len(stations) > 8 else 0
+        ax.set_xticklabels(
+            stations, fontsize=max(5.0, spec.font_size - 3.0),
+            rotation=rotation, ha="center",
+        )
+        ax.set_ylabel(xlab, fontsize=label_size)
+        _style_axis(ax, spec=spec, grid_axis="y")
+        return
+
+    if kind == "dot":
+        reference = float(adf["reference_value"][0])
+        ypos = np.arange(len(stations))
+        for yi, (ref, mean) in enumerate(zip(adf["reference_value"].to_list(), means)):
+            ax.plot([float(ref), float(mean)], [yi, yi], color="#cccccc",
+                    lw=1.1, zorder=2, solid_capstyle="round")
+        ax.scatter([reference] * len(stations), ypos, s=22, color="#999999",
+                   zorder=3)
+        ax.scatter(means, ypos, s=34, c=bar_colors, edgecolors="black",
+                   linewidths=0.5, zorder=4)
+        ax.set_yticks(ypos)
+        ax.set_yticklabels(stations, fontsize=max(5.0, spec.font_size - 3.0))
+        ax.set_xlabel(lcz_msg("temperature_label", lang), fontsize=label_size)
+        _style_axis(ax, spec=spec, grid_axis="x")
+        return
+
+    if kind == "lollipop":
+        xpos = np.arange(len(stations))
+        ax.vlines(xpos, 0.0, anomalies, color="#999999", lw=1.0, zorder=2)
+        ax.scatter(xpos, anomalies, s=46, c=bar_colors, edgecolors="black",
+                   linewidths=0.7, zorder=3)
+        ax.axhline(0, color="#666666", lw=0.8, zorder=1)
+        ax.set_xticks(xpos)
+        rotation = 90 if len(stations) > 8 else 0
+        ax.set_xticklabels(
+            stations, fontsize=max(5.0, spec.font_size - 3.0),
+            rotation=rotation, ha="center" if rotation else "left",
+        )
+        ax.set_ylabel(xlab, fontsize=label_size)
+        _style_axis(ax, spec=spec, grid_axis="y")
+        return
+
+    # kind == "scatter": LCZ class (x) vs mean temperature (y)
+    classes = sorted({int(v) for v in lcz_vals if v is not None})
+    rank: dict[int, int] = {}
+    total_per_class: dict[int, int] = {}
+    for v in lcz_vals:
+        if v is None:
+            continue
+        total_per_class[int(v)] = total_per_class.get(int(v), 0) + 1
+    xs = []
+    for v in lcz_vals:
+        if v is None:
+            xs.append(np.nan)
+            continue
+        idx = rank.get(int(v), 0)
+        rank[int(v)] = idx + 1
+        n_here = total_per_class.get(int(v), 1)
+        offset = 0.0 if n_here <= 1 else (idx / (n_here - 1) - 0.5) * 0.55
+        xs.append(classes.index(int(v)) + offset)
+    xs = np.asarray(xs, dtype=float)
+    sizes = np.maximum(20.0, np.abs(anomalies) * 60.0)
+    ax.scatter(xs, means, s=sizes, c=bar_colors, edgecolors="black",
+               linewidths=0.5, alpha=0.9, zorder=3)
+    if len(stations) <= 12:
+        for xi, yi, name in zip(xs, means, stations):
+            ax.annotate(name, (xi, yi), textcoords="offset points",
+                        xytext=(0, 5), ha="center",
+                        fontsize=max(4.5, spec.font_size - 3.5))
+    reference = float(adf["reference_value"][0])
+    ax.axhline(reference, color="0.45", lw=0.8, ls="--", zorder=2)
+    ax.set_xticks(np.arange(len(classes)))
+    ax.set_xticklabels([f"{c}" for c in classes],
+                       fontsize=max(5.0, spec.font_size - 2.5))
+    ax.set_xlabel(lcz_msg("lcz_code_label", lang), fontsize=label_size)
+    ax.set_ylabel(lcz_msg("temperature_label", lang), fontsize=label_size)
+    ax.margins(x=0.07, y=0.16)
+    _style_axis(ax, spec=spec, grid_axis="y")
+
+
+def _static_anomaly_figure(
+    kind: str,
+    panels: list,
+    *,
+    title: Optional[str],
+    xlab: str,
+    lang: str = "en",
+    inclusive: bool = False,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    caption: Optional[str] = None,
+    isave: bool = False,
+    save_extension: str = "html",
+    filename: str = "lcz4r_anomaly_plot",
+):
+    """Publication-quality anomaly figure (one axes per ``by=`` facet)."""
+    st = lcz_static
+    colors = lcz_palette(inclusive=inclusive)
+    panels = list(panels) or [("", pl.DataFrame({"station": [], "anomaly": []}))]
+    n = len(panels)
+    total_rows = sum(max(sub.height, 1) for _, sub in panels)
+
+    if kind in ("diverging_bar", "dot"):
+        height_mm = 3.0 * total_rows + 26.0 * n + 22.0
+    else:
+        height_mm = 2.2 * total_rows + 30.0 * n + 24.0
+
+    classes = sorted({
+        int(v)
+        for _, adf in panels if not adf.is_empty()
+        for v in adf["lcz"].to_list()
+        if v is not None
+    })
+    has_class_legend = kind in ("diverging_bar", "dot", "lollipop", "scatter") and bool(classes)
+    has_warm_cool = kind == "bar"
+    has_legend = has_class_legend or has_warm_cool
+    legend_rows = max(1, -(-len(classes) // 4)) if has_class_legend else 1
+    height_mm += 7.0 * max(legend_rows - 1, 0)
+    height_mm = float(min(max(height_mm, 70.0), 195.0))
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=height_mm, dpi=dpi)
+        axes = _panel_axes(
+            fig, n,
+            has_header=bool(title),
+            has_legend=has_legend,
+            bottom=(
+                _legend_bottom(
+                    fig, max(5.5, spec.font_size - 2.5), legend_rows,
+                    with_title=has_class_legend,
+                ) if has_legend
+                else lcz_static.figure_bottom(False)
+            ),
+            top_trim=0.03 if any(label for label, _ in panels) else 0.0,
+        )
+        for ax, (label, adf) in zip(axes, panels):
+            if label:
+                ax.set_title(str(label), fontsize=max(6.5, spec.font_size - 1.5),
+                             loc="left", pad=2.5)
+            if adf.is_empty():
+                continue
+            _static_anomaly_axes(ax, adf, kind, xlab, colors, lang, spec)
+
+        if has_class_legend:
+            extra = None
+            if kind == "dot":
+                from matplotlib.lines import Line2D
+
+                temp_label = lcz_msg("temperature_label", lang)
+                extra = [
+                    Line2D([], [], marker="o", ls="", ms=4.2, color="#999999",
+                           label=f"{temp_label} (ref)"),
+                    Line2D([], [], marker="o", ls="", ms=4.6, color="#444444",
+                           markeredgecolor="black", markeredgewidth=0.4,
+                           label=temp_label),
+                ]
+            _static_class_legend(fig, classes, inclusive=inclusive, lang=lang,
+                                 spec=spec, extra_handles=extra)
+        elif has_warm_cool:
+            from matplotlib.patches import Patch
+
+            fontsize = max(5.5, spec.font_size - 2.5)
+            fig.legend(
+                handles=[
+                    Patch(facecolor=_WARM_COLOR, edgecolor="black", linewidth=0.4,
+                          label=_xmsg("warmer_label", lang)),
+                    Patch(facecolor=_COOL_COLOR, edgecolor="black", linewidth=0.4,
+                          label=_xmsg("cooler_label", lang)),
+                ],
+                loc="lower center", bbox_to_anchor=(0.5, 0.008), ncol=2,
+                frameon=False, fontsize=fontsize, handlelength=1.3,
+                columnspacing=1.6,
+            )
+
+        st.add_header(fig, title, None, spec)
+        st.add_footer(fig, caption, None, spec)
+        st.save_static(
+            fig, filename, isave=isave, save_extension=save_extension,
+            style=style, dpi=dpi, lang=lang,
+        )
+    return fig
+
+
 def lcz_anomaly(
     x: Union[str, os.PathLike, rasterio.io.DatasetReader],
     data_frame,
@@ -391,7 +700,9 @@ def lcz_anomaly(
     caption: Optional[str] = None,
     lang: str = "en",
     year=None, month=None, day=None, hour=None, start=None, end=None,
-) -> Union[go.Figure, pl.DataFrame]:
+    renderer: Optional[str] = "static",
+    dpi: Optional[int] = None,
+) -> Union[go.Figure, pl.DataFrame, "Figure"]:
     """Compute per-station temperature anomaly and render an anomaly chart.
 
     Parameters
@@ -443,12 +754,22 @@ def lcz_anomaly(
         Date/time component filters (validated; out-of-range values raise).
     start, end : str or datetime, optional
         Inclusive date range bounds.
+    renderer : {"static", "plotly"}, optional
+        ``"static"`` (default, also ``None``/``"matplotlib"``/``"agg"``)
+        returns a matplotlib ``Figure`` drawn with the Agg canvas — no Plotly,
+        Kaleido, Chromium or browser needed — and saves a >=300 dpi PNG (or
+        PDF/SVG/TIFF) via ``lcz_static.save_static``. ``"plotly"`` returns the
+        interactive figure.
+    dpi : int, optional
+        Export resolution for the static renderer (never below 300 dpi).
 
     Returns
     -------
-    go.Figure or pl.DataFrame
-        DataFrame columns: ``station, lcz, mean_value, reference_value,
-        anomaly, n, latitude, longitude``.
+    matplotlib.figure.Figure, go.Figure or pl.DataFrame
+        A matplotlib ``Figure`` for the default static renderer, a Plotly
+        ``go.Figure`` for ``renderer="plotly"``, or the anomaly DataFrame when
+        ``iplot=False``. DataFrame columns: ``station, lcz, mean_value,
+        reference_value, anomaly, n, latitude, longitude``.
 
     Raises
     ------
@@ -458,6 +779,9 @@ def lcz_anomaly(
     """
     if plot_type not in _PLOT_FNS:
         raise ValueError(f"plot_type must be one of {_VALID_PLOT_TYPES!r}, got {plot_type!r}")
+
+    renderer = resolve_renderer(renderer)
+    static = renderer == "static"
 
     df = normalise_input_df(data_frame, var=var, station_id=station_id)
     df = select_by_date(
@@ -517,33 +841,54 @@ def lcz_anomaly(
                 "anomaly can be computed."
             )
 
-        fig = make_subplots(
-            rows=len(usable), cols=1,
-            subplot_titles=[g for g, _ in usable],
-            shared_xaxes=False,
-            vertical_spacing=0.05,
-        )
-        for i, (g, sub) in enumerate(usable, 1):
-            adf = _compute_anomaly(sub)
-            sub_fig = plot_fn(adf, colors, g, xlab, lang)
-            for trace in sub_fig.data:
-                trace.showlegend = False
-                fig.add_trace(trace, row=i, col=1)
-        fig.update_layout(
-            title=dict(text=chart_title, font=dict(size=20), x=0.5, xanchor="center"),
-            height=max(500, 350 * len(usable)),
-            plot_bgcolor="#fafafa",
-            paper_bgcolor="white",
-            margin=dict(l=160, r=80, t=70, b=60),
-            hoverlabel=dict(bgcolor="white", font=dict(size=13)),
-        )
+        if static:
+            fig = _static_anomaly_figure(
+                plot_type,
+                [(g, _compute_anomaly(sub)) for g, sub in usable],
+                title=chart_title, xlab=xlab, lang=lang, inclusive=inclusive,
+                style=style, dpi=dpi, caption=caption, isave=isave,
+                save_extension=save_extension,
+            )
+        else:
+            fig = make_subplots(
+                rows=len(usable), cols=1,
+                subplot_titles=[g for g, _ in usable],
+                shared_xaxes=False,
+                vertical_spacing=0.05,
+            )
+            for i, (g, sub) in enumerate(usable, 1):
+                adf = _compute_anomaly(sub)
+                sub_fig = plot_fn(adf, colors, g, xlab, lang)
+                for trace in sub_fig.data:
+                    trace.showlegend = False
+                    fig.add_trace(trace, row=i, col=1)
+            fig.update_layout(
+                title=dict(text=chart_title, font=dict(size=20), x=0.5, xanchor="center"),
+                height=max(500, 350 * len(usable)),
+                plot_bgcolor="#fafafa",
+                paper_bgcolor="white",
+                margin=dict(l=160, r=80, t=70, b=60),
+                hoverlabel=dict(bgcolor="white", font=dict(size=13)),
+            )
     else:
         anomaly_df = _compute_anomaly(df)
         if anomaly_df.is_empty():
             raise ValueError(
                 "No anomaly could be computed — every station mean is missing."
             )
-        fig = plot_fn(anomaly_df, colors, chart_title, xlab, lang)
+        if static:
+            fig = _static_anomaly_figure(
+                plot_type, [("", anomaly_df)],
+                title=chart_title, xlab=xlab, lang=lang, inclusive=inclusive,
+                style=style, dpi=dpi, caption=caption, isave=isave,
+                save_extension=save_extension,
+            )
+        else:
+            fig = plot_fn(anomaly_df, colors, chart_title, xlab, lang)
+
+    if static:
+        # Captions and saving are handled inside the static builder.
+        return fig
 
     if caption:
         fig.add_annotation(

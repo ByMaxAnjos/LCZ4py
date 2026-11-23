@@ -3,10 +3,12 @@ lcz_plot_map.py
 
 Publication-quality LCZ map visualization.
 
-- Plotly WebGL traces for smooth panning/zooming on large rasters
-- Optional MapLibre/OSM basemap renderer
+- Native static matplotlib/Agg renderer (default) — reproducible PNG/PDF/SVG/TIFF
+  without Plotly, Kaleido, a browser, or a Chromium install
+- Opt-in Plotly WebGL renderer for smooth panning/zooming on large rasters
+- Opt-in MapLibre/OSM basemap renderer
 - LCZ legend ordered by class, labelled from ``lcz_parameters_data``
-- North arrow + scale bar for projected CRSs (via ``lcz_theme``)
+- North arrow + scale bar for projected CRSs
 - 300 dpi static export with the journal style presets
 
 Optional dependencies (duckdb, geoarrow) are guarded with ``HAS_*`` flags and
@@ -65,6 +67,8 @@ from LCZ4py._internal.lcz_theme import (
     get_style,
     save_plotly_figure,
 )
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
@@ -798,19 +802,126 @@ def _resolve_band(src: rasterio.io.DatasetReader, band: Union[int, str, None]) -
     raise ValueError(f"No band with description {band!r}. Available: {list(src.descriptions)}")
 
 
+# ── Native static renderer (matplotlib/Agg — no Plotly/Kaleido/Chromium) ─────
+
+def _create_static_map(
+    arr: np.ndarray,
+    extent: tuple,
+    crs_obj,
+    *,
+    is_continuous: bool,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    attribution: Optional[str],
+    style: str,
+    dpi: Optional[int],
+    lang: str,
+    show_legend: bool,
+    inclusive: bool,
+    colorscale: str,
+    units: str,
+    add_scalebar: bool,
+    add_north_arrow: bool,
+    isave: bool,
+    save_extension: str,
+    filename: str,
+    column: Optional[str] = None,
+):
+    """Build a publication-quality map with matplotlib (no browser needed)."""
+    st = lcz_static
+
+    aspect = arr.shape[0] / max(arr.shape[1], 1)
+    has_legend = (
+        not is_continuous
+        and bool(show_legend)
+        and bool(np.any((arr >= 1) & (arr <= 17)))
+    )
+    extra_mm = 26.0 if has_legend else 14.0
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style,
+            aspect=aspect,
+            extra_height_mm=extra_mm,
+            column=column,
+            dpi=dpi,
+        )
+        has_header = bool(title or subtitle)
+        ax = st.add_axes(
+            fig,
+            bottom=st.figure_bottom(has_legend),
+            top=st.figure_top(has_header),
+        )
+
+        if is_continuous:
+            image = st.plot_continuous_raster(
+                ax, arr, extent, colorscale=colorscale
+            )
+        else:
+            image = st.plot_lcz_raster(
+                ax, arr, extent, inclusive=inclusive
+            )
+
+        is_geo = st.apply_map_axes(ax, extent, crs_obj)
+
+        if is_continuous:
+            st.add_colorbar(fig, ax, image, units=units, fontsize=spec.font_size)
+        elif has_legend:
+            st.class_legend(
+                fig,
+                arr,
+                inclusive=inclusive,
+                lang=lang,
+                fontsize=max(5.5, spec.font_size - 1),
+                bbox_to_anchor=(0.5, 0.085),
+            )
+
+        if add_scalebar or add_north_arrow:
+            if add_scalebar:
+                st.add_scalebar(ax, st.metric_width(extent, crs_obj), is_geo)
+            if add_north_arrow and not is_geo:
+                st.add_north_arrow(ax)
+
+        st.add_header(fig, title, subtitle, spec)
+        st.add_footer(fig, caption, attribution, spec)
+        st.save_static(
+            fig,
+            filename,
+            isave=isave,
+            save_extension=save_extension,
+            style=style,
+            dpi=dpi,
+            lang=lang,
+        )
+
+    return fig
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 @dataclass
 class LCZPlotResult:
-    """Return type for advanced LCZ map plotting."""
-    fig: Optional[go.Figure] = None
+    """Return type for advanced LCZ map plotting.
+
+    ``fig`` is a matplotlib ``Figure`` for the default static renderer and a
+    Plotly ``go.Figure`` for ``renderer="plotly"``/``"maplibre"``.
+    """
+    fig: Optional[object] = None
     geoarrow_table: Optional[pa.Table] = None
     legend_df: Optional[pl.DataFrame] = None
     html: Optional[str] = None  # MapLibre renderer output
+    renderer: str = "static"
 
     def show(self) -> None:
-        """Display the map. Both renderers return a go.Figure, so this always works."""
-        if self.fig is not None:
+        """Display the figure in the active frontend (matplotlib or Plotly)."""
+        if self.fig is None:
+            return
+        if type(self.fig).__module__.startswith("matplotlib"):
+            import matplotlib.pyplot as plt
+
+            plt.show()
+        else:
             self.fig.show()
 
 
@@ -828,7 +939,7 @@ def lcz_plot_map(
     subtitle: Optional[str] = None,
     caption: Optional[str] = None,
     max_pixels: int = 10_000_000,
-    renderer: Literal["plotly", "maplibre"] = "plotly",
+    renderer: Optional[Literal["static", "plotly", "maplibre"]] = "static",
     opacity: float = 0.8,
     lang: str = "en",
     data_type: Literal["auto", "lcz", "continuous"] = "auto",
@@ -848,9 +959,12 @@ def lcz_plot_map(
         continuous multi-band stack such as the GeoTIFF returned by
         ``lcz_get_lst`` (float LST values, one band per date).
     isave : bool
-        Save the figure.
+        Save the figure. With the default static renderer this writes a
+        native matplotlib file (PNG by default) — no Kaleido/Chromium needed.
     save_extension : str
-        "html" for interactive, "png"/"pdf"/"svg"/"tiff" for static.
+        File extension for static output: "png" (default), "pdf", "svg",
+        "tiff"/"tif", "jpg"/"jpeg" or "webp". "html" is accepted for the
+        Plotly renderer and coerced to "png" for the static renderer.
     style : str
         Publication style preset: "default", "nature", "science", or
         "generic_bw". Controls font, figure size (mm), DPI, and palette
@@ -870,11 +984,13 @@ def lcz_plot_map(
         Figure annotations.
     max_pixels : int
         Down-sample threshold.
-    renderer : {"plotly", "maplibre"}
-        "plotly" (default) returns a Plotly figure; "maplibre" returns a
-        MapLibre GL JS HTML page overlaid on an OpenStreetMap basemap.
-        Use ``result.show()`` to display either renderer in a notebook.
-        Continuous data only supports "plotly".
+    renderer : {"static", "plotly", "maplibre"}, optional
+        "static" (default, also ``None``/``"matplotlib"``/``"agg"``) returns a
+        matplotlib ``Figure`` and saves native PNG/PDF/SVG/TIFF — it never
+        needs Plotly, Kaleido, Chromium or a browser. "plotly" returns an
+        interactive WebGL Plotly figure; "maplibre" returns a Plotly mapbox
+        figure overlaid on an OpenStreetMap basemap. Continuous data supports
+        both "static" and "plotly".
     opacity : float
         Raster overlay opacity for the MapLibre renderer (0–1, default 0.8).
     lang : {"en", "pt", "es", "zh"}
@@ -911,8 +1027,8 @@ def lcz_plot_map(
         raise ValueError(
             f"data_type must be 'auto', 'lcz' or 'continuous', got {data_type!r}"
         )
-    if renderer not in ("plotly", "maplibre"):
-        raise ValueError(f"renderer must be 'plotly' or 'maplibre', got {renderer!r}")
+    # None / "matplotlib" / "agg" -> the native static renderer (default).
+    renderer = resolve_renderer(renderer)
     if not 0.0 <= float(opacity) <= 1.0:
         raise ValueError(f"opacity must be between 0 and 1, got {opacity!r}")
     if (save_extension or "").lower().lstrip(".") not in (
@@ -979,6 +1095,19 @@ def lcz_plot_map(
             arr = np.where(arr == nodata, np.nan, arr)
         band_suffix = f" — {band_label}" if band_label else ""
         map_title = title or f"Land Surface Temperature{band_suffix}"
+        if renderer == "static":
+            fig = _create_static_map(
+                arr, extent, crs_obj,
+                is_continuous=True,
+                title=map_title, subtitle=subtitle, caption=caption,
+                attribution=credit, style=style, dpi=dpi, lang=lang,
+                show_legend=False, inclusive=inclusive,
+                colorscale=colorscale, units=units,
+                add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+                isave=isave, save_extension=save_extension,
+                filename="lcz_plot_lst",
+            )
+            return LCZPlotResult(fig=fig, renderer="static")
         fig = _create_continuous_map(
             arr, extent, units, title=map_title, colorscale=colorscale,
             attribution=credit,
@@ -995,12 +1124,28 @@ def lcz_plot_map(
             fig, style=style, isave=isave, save_extension=save_extension,
             filename="lcz_plot_lst", dpi=dpi, lang=lang,
         )
-        return LCZPlotResult(fig=fig)
+        return LCZPlotResult(fig=fig, renderer="plotly")
 
     # Keep nodata (0) as 0 — transparent in the plot, not Water.
     # Water bodies are stored as class 17 in the source LCZ raster.
     arr = np.asarray(arr)
     arr = np.where((arr >= 1) & (arr <= 17), arr, 0)
+
+    # ── Native static renderer (default) ─────────────────────────────────────
+    if renderer == "static":
+        fig = _create_static_map(
+            arr, extent, crs_obj,
+            is_continuous=False,
+            title=title or lcz_msg("lcz_map_title", lang),
+            subtitle=subtitle, caption=caption, attribution=credit,
+            style=style, dpi=dpi, lang=lang,
+            show_legend=show_legend, inclusive=inclusive,
+            colorscale=colorscale, units="",
+            add_scalebar=add_scalebar, add_north_arrow=add_north_arrow,
+            isave=isave, save_extension=save_extension,
+            filename="lcz_plot_map",
+        )
+        return LCZPlotResult(fig=fig, renderer="static")
 
     # ── MapLibre renderer (Plotly mapbox + OSM basemap) ──────────────────────
     if renderer == "maplibre":
@@ -1020,7 +1165,7 @@ def lcz_plot_map(
             fig, style=style, isave=isave, save_extension="html",
             filename="lcz_plot_map_maplibre", lang=lang,
         )
-        return LCZPlotResult(fig=fig)
+        return LCZPlotResult(fig=fig, renderer="maplibre")
 
     # ── Plotly renderer (default) ────────────────────────────────────────────
     fig = _create_interactive_lcz_map(
@@ -1066,6 +1211,7 @@ def lcz_plot_map(
         fig=fig,
         geoarrow_table=geoarrow_table,
         legend_df=legend_df,
+        renderer="plotly",
     )
 
 

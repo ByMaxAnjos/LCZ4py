@@ -56,6 +56,16 @@ separate rural-boundary polygon or PySAL-style vector weights):
 
 All per-class reductions use ``np.bincount`` on a precomputed class index
 instead of one full-raster boolean mask per class per date.
+
+Rendering backends
+------------------
+Every figure-producing branch supports two renderers:
+
+- ``renderer="static"`` *(default)* — native matplotlib/Agg figures saved as
+  >=300 dpi PNG/PDF/SVG/TIFF through ``lcz_static.save_static``. Maps use
+  ``plot_continuous_raster`` + ``add_map_furniture_mpl`` + ``add_colorbar``,
+  so a north arrow/scale bar appear only for projected (metric) CRSs.
+- ``renderer="plotly"`` — the interactive Plotly figures.
 """
 
 from __future__ import annotations
@@ -63,6 +73,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Union
@@ -81,6 +93,8 @@ from LCZ4py._internal.lcz_parameters_data import (
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import finalize_export, add_map_furniture
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 
 logger = logging.getLogger(__name__)
 OUTPUT_DIR = "LCZ4r_output"
@@ -840,14 +854,412 @@ def _category_counts(cats: np.ndarray, valid: np.ndarray) -> pl.DataFrame:
     ).sort("category")
 
 
+# ── Native static renderer (matplotlib/Agg — no Plotly/Kaleido/Chromium) ─────
+
+# ``lcz_msg`` keeps R's rich markup (``{val {date}}`` / ``{val 2024-01-04}``)
+# for rich printers; a printed figure needs the plain value.
+_PLAIN_MARKUP_RE = re.compile(
+    r"\{(?:val|arg|fn|path|url)\s*(?:\{([^{}]*)\}|([^{}]*))\}",
+)
+
+
+def _plain(text: Optional[str], width: int = 62) -> Optional[str]:
+    """Flatten ``lcz_msg`` rich markup and wrap long titles for print."""
+    if not text:
+        return text
+    value = _PLAIN_MARKUP_RE.sub(
+        lambda m: (m.group(1) or m.group(2) or "").strip(), str(text),
+    )
+    return textwrap.fill(value, width=width) if len(value) > width else value
+
+
+def _header(fig, title: Optional[str], spec) -> None:
+    """Figure title with rich-markup removed and long titles wrapped."""
+    txt = _plain(title)
+    y = 0.988 if (txt and "\n" in txt) else 0.965
+    lcz_static.add_header(fig, txt, None, spec, y=y)
+
+
+def _mpl_date_numbers(values) -> np.ndarray:
+    """ISO strings / datetime64 / datetime / None → matplotlib date numbers."""
+    import datetime as _dt
+    import matplotlib.dates as mdates
+
+    out = np.full(len(values), np.nan, dtype=float)
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        if isinstance(v, str):
+            v = np.datetime64(v)
+        if isinstance(v, np.datetime64):
+            if np.isnat(v):
+                continue
+            v = v.astype("datetime64[us]").astype(_dt.datetime)
+        elif isinstance(v, _dt.date) and not isinstance(v, _dt.datetime):
+            v = _dt.datetime(v.year, v.month, v.day)
+        out[i] = mdates.date2num(v)
+    return out
+
+
+def _finite_float(values) -> np.ndarray:
+    """None-tolerant float conversion so gaps become NaN (a broken line)."""
+    return np.array([np.nan if v is None else float(v) for v in values], dtype=float)
+
+
+def _static_axes(fig, *, has_header: bool, has_legend: bool = False,
+                 left: float = 0.115, right: float = 0.975,
+                 bottom: Optional[float] = None):
+    """One full-width axes with explicit fractional margins."""
+    top = lcz_static.figure_top(has_header)
+    bottom = lcz_static.figure_bottom(has_legend) if bottom is None else bottom
+    return fig.add_axes([left, bottom, right - left, max(top - bottom, 0.10)])
+
+
+def _legend_bottom(fig, fontsize: float, rows: int, *, with_title: bool = True,
+                   xlabel: bool = True) -> float:
+    """Fraction of the figure height to reserve below the axes for a legend."""
+    fig_h = max(float(fig.get_figheight()), 0.5)
+    line_in = (float(fontsize) * 1.75) / 72.0
+    legend_in = max(int(rows), 0) * line_in + (0.22 if with_title else 0.12)
+    extra_in = 0.55 if xlabel else 0.18
+    return float(min(0.45, max(0.14, (legend_in + extra_in) / fig_h)))
+
+
+def _style_time_axis(ax, spec) -> None:
+    """Date formatting, light y-grid and open spines for a chart axes."""
+    import matplotlib.dates as mdates
+
+    ax.grid(True, axis="y", lw=0.35, color="0.88", zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    locator = mdates.AutoDateLocator(minticks=3, maxticks=7)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2.5),
+                   length=3, width=0.6)
+
+
+def _static_timeseries(
+    df: pl.DataFrame, y_col: str, title: Optional[str], ylabel: str,
+    lang: str = "en", style: str = "default", dpi: Optional[int] = None,
+    caption: Optional[str] = None,
+):
+    """SUHI intensity time series with a zero reference line."""
+    st = lcz_static
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=85.0, dpi=dpi)
+        ax = _static_axes(fig, has_header=bool(title), bottom=0.20)
+        if df.is_empty():
+            logger.warning("_static_timeseries: %s is empty; empty chart drawn.", y_col)
+        else:
+            d, v = _break_date_gaps(df["date"].to_list(), df[y_col].to_list())
+            ax.plot(_mpl_date_numbers(d), _finite_float(v), color="#333333",
+                    lw=1.1, marker="o", ms=2.6, zorder=3)
+        ax.axhline(0, color="0.45", lw=0.8, ls="--", zorder=2)
+        ax.set_ylabel(ylabel, fontsize=max(6.0, spec.font_size - 1.5))
+        ax.set_xlabel(lcz_msg("time_label", lang),
+                      fontsize=max(6.0, spec.font_size - 1.5))
+        _style_time_axis(ax, spec)
+        _header(fig, title, spec)
+        st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _static_value_by_lcz_bar(
+    df: pl.DataFrame, value_col: str, lang: str, inclusive: bool,
+    ylab: str, title: Optional[str], style: str = "default",
+    dpi: Optional[int] = None, caption: Optional[str] = None,
+):
+    """Mean ± 95% CI bar per LCZ class (LCZ colours from the central palette)."""
+    st = lcz_static
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=90.0, dpi=dpi)
+        ax = _static_axes(fig, has_header=bool(title), bottom=0.20)
+
+        if value_col not in df.columns:
+            raise ValueError(f"Column {value_col!r} not found; available: {df.columns}")
+
+        if df.is_empty():
+            logger.warning(
+                "_static_value_by_lcz_bar: %s is empty; empty chart drawn.", value_col,
+            )
+        else:
+            if "date" in df.columns:
+                agg = (
+                    df.group_by("lcz")
+                    .agg([
+                        pl.col(value_col).mean().alias("mean_value"),
+                        pl.col(value_col).std().alias("std_value"),
+                        pl.len().alias("n"),
+                    ])
+                    .sort("lcz")
+                )
+            else:
+                agg = (
+                    df.rename({value_col: "mean_value"})
+                    .select(["lcz", "mean_value"])
+                    .with_columns(
+                        std_value=pl.lit(0.0, dtype=pl.Float64),
+                        n=pl.lit(1, dtype=pl.Int64),
+                    )
+                    .sort("lcz")
+                )
+
+            meta = _lcz_meta_frame(lang, inclusive)
+            agg = agg.with_columns(pl.col("lcz").cast(pl.Int32)).join(
+                meta, on="lcz", how="left"
+            )
+            n = np.maximum(agg["n"].to_numpy().astype(float), 1.0)
+            std = np.asarray(agg["std_value"].fill_null(0.0).to_numpy(), dtype=float)
+            se = std / np.sqrt(n)
+            tcrit = spstats.t.ppf(0.975, np.maximum(n - 1.0, 1.0))
+            err = np.where(n > 1, tcrit * se, 0.0)
+
+            positions = np.arange(1, agg.height + 1, dtype=float)
+            ax.bar(
+                positions, agg["mean_value"].to_numpy(),
+                width=0.72,
+                color=agg["color"].fill_null("#888888").to_list(),
+                edgecolor="black", linewidth=0.45, zorder=3,
+            )
+            ax.errorbar(positions, agg["mean_value"].to_numpy(), yerr=err,
+                        fmt="none", ecolor="0.25", elinewidth=0.7,
+                        capsize=1.8, zorder=4)
+            ax.set_xticks(positions)
+            ax.set_xticklabels(
+                [f"LCZ {int(v)}" for v in agg["lcz"].to_list()],
+                fontsize=max(5.5, spec.font_size - 2.5),
+            )
+            ax.set_xlim(0.4, agg.height + 0.6)
+
+        ax.axhline(0, color="0.45", lw=0.8, ls="--", zorder=2)
+        ax.set_xlabel(lcz_msg("lcz_code_label", lang),
+                      fontsize=max(6.0, spec.font_size - 1.5))
+        ax.set_ylabel(ylab, fontsize=max(6.0, spec.font_size - 1.5))
+        ax.grid(True, axis="y", lw=0.35, color="0.88", zorder=0)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2.5),
+                       length=3, width=0.6)
+        _header(fig, title, spec)
+        st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _map_furniture(ax, extent: tuple, crs=None) -> bool:
+    """Axis labels + scale bar + north arrow; returns ``is_geographic``.
+
+    Delegates to :func:`lcz_static.add_map_furniture_mpl`. In builds where that
+    helper's ``add_scalebar`` *parameter* shadows its ``add_scalebar``
+    *function* (a name clash inside ``lcz_static``, not in this module), the
+    same primitives it documents are applied directly instead.
+    """
+    st = lcz_static
+    try:
+        return st.add_map_furniture_mpl(ax, extent, crs)
+    except TypeError:  # pragma: no cover - depends on the lcz_static build
+        is_geo = st.apply_map_axes(ax, extent, crs)
+        st.add_scalebar(ax, st.metric_width(extent, crs), is_geo)
+        if not is_geo:
+            st.add_north_arrow(ax)
+        return is_geo
+
+
+def _static_spatial_heatmap(
+    arr: np.ndarray, transform: rasterio.Affine, title: Optional[str],
+    colorscale: str = "RdBu_r", zmid: Optional[float] = None,
+    zmin: Optional[float] = None, zmax: Optional[float] = None,
+    colorbar_title: str = "", crs: Optional[rasterio.crs.CRS] = None,
+    style: str = "default", dpi: Optional[int] = None,
+    caption: Optional[str] = None,
+):
+    """Continuous raster map with colorbar, metric axes and map furniture."""
+    from matplotlib.colors import TwoSlopeNorm
+
+    st = lcz_static
+    h, w = arr.shape
+    xmin = float(transform.c)
+    ymax = float(transform.f)
+    xmax = xmin + w * float(transform.a)
+    ymin = ymax + h * float(transform.e)
+    extent = (xmin, xmax, ymin, ymax)
+
+    finite = np.asarray(arr, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    lo = zmin if zmin is not None else (float(finite.min()) if finite.size else 0.0)
+    hi = zmax if zmax is not None else (float(finite.max()) if finite.size else 1.0)
+    if lo == hi:
+        lo, hi = lo - 0.5, hi + 0.5
+
+    aspect = arr.shape[0] / max(arr.shape[1], 1)
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(
+            style, aspect=aspect, extra_height_mm=16.0, dpi=dpi,
+        )
+        ax = st.add_axes(fig, bottom=0.16, top=st.figure_top(bool(title)), right=0.88)
+        image = st.plot_continuous_raster(
+            ax, np.asarray(arr, dtype=float), extent, colorscale=colorscale,
+        )
+        image.set_clim(lo, hi)
+        if zmid is not None and lo < float(zmid) < hi:
+            image.set_norm(TwoSlopeNorm(vmin=lo, vcenter=float(zmid), vmax=hi))
+
+        _map_furniture(ax, extent, crs)
+        st.add_colorbar(fig, ax, image, units=colorbar_title or "Value",
+                        fontsize=spec.font_size)
+        _header(fig, title, spec)
+        st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _static_utfvi_category_bar(
+    cat_counts: pl.DataFrame, lang: str, style: str = "default",
+    dpi: Optional[int] = None, caption: Optional[str] = None,
+):
+    """Share of pixels in each UTFVI ecological-effect category."""
+    st = lcz_static
+    present = [c for c in _UTFVI_CATEGORY_ORDER if c in cat_counts["category"].to_list()]
+    ordered = cat_counts.filter(pl.col("category").is_in(present))
+    order_idx = {c: i for i, c in enumerate(present)}
+    if present:
+        ordered = ordered.with_columns(
+            pl.col("category").replace_strict(order_idx).alias("_order")
+        ).sort("_order")
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=80.0, dpi=dpi)
+        ax = _static_axes(fig, has_header=True, bottom=0.22)
+        if not ordered.is_empty():
+            positions = np.arange(1, ordered.height + 1, dtype=float)
+            ax.bar(
+                positions, ordered["percent"].to_numpy(), width=0.7,
+                color=[_UTFVI_CATEGORY_COLORS[c] for c in ordered["category"]],
+                edgecolor="black", linewidth=0.45, zorder=3,
+            )
+            ax.set_xticks(positions)
+            ax.set_xticklabels(ordered["category"].to_list(),
+                               fontsize=max(5.5, spec.font_size - 2.0))
+            ax.set_xlim(0.4, ordered.height + 0.6)
+        ax.set_xlabel(lcz_msg("uhi_utfvi_category_label", lang),
+                      fontsize=max(6.0, spec.font_size - 1.5))
+        ax.set_ylabel(lcz_msg("uhi_percent_pixels_label", lang),
+                      fontsize=max(6.0, spec.font_size - 1.5))
+        ax.grid(True, axis="y", lw=0.35, color="0.88", zorder=0)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2.5),
+                       length=3, width=0.6)
+        _header(fig, lcz_msg("uhi_utfvi_category_title", lang), spec)
+        st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _static_transect(
+    df: pl.DataFrame, lang: str, style: str = "default",
+    dpi: Optional[int] = None, caption: Optional[str] = None,
+):
+    """Urban–rural LST anomaly profile, one line per date (≤8) or the mean."""
+    import matplotlib
+
+    st = lcz_static
+    dates_n = int(df["date"].n_unique()) if not df.is_empty() else 0
+    rows = max(1, -(-dates_n // 4)) if 0 < dates_n <= 8 else 1
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=90.0 + 6.0 * max(rows - 1, 0),
+                                     dpi=dpi)
+        fontsize = max(5.5, spec.font_size - 2.5)
+        ax = _static_axes(
+            fig, has_header=True, has_legend=True,
+            bottom=_legend_bottom(fig, fontsize, rows),
+        )
+        if df.is_empty():
+            logger.warning("_static_transect: no bins to plot.")
+        else:
+            dates = sorted(df["date"].unique().to_list())
+            if len(dates) <= 8:
+                cmap = matplotlib.colormaps["viridis"]
+                for i, d in enumerate(dates):
+                    sub = df.filter(pl.col("date") == d).sort("bin_km")
+                    ax.plot(
+                        sub["bin_km"].to_numpy(), sub["mean_anomaly"].to_numpy(),
+                        marker="o", ms=3.0, lw=1.0,
+                        color=cmap(i / max(len(dates) - 1, 1)),
+                        label=str(d), zorder=3,
+                    )
+                fig.legend(
+                    loc="lower center", bbox_to_anchor=(0.5, 0.006),
+                    ncol=min(len(dates), 4), frameon=False, fontsize=fontsize,
+                    title=lcz_msg("time_label", lang), title_fontsize=fontsize,
+                    handlelength=1.6,
+                )
+            else:
+                agg = (
+                    df.group_by("bin_km")
+                    .agg(pl.col("mean_anomaly").mean())
+                    .sort("bin_km")
+                )
+                ax.plot(agg["bin_km"].to_numpy(), agg["mean_anomaly"].to_numpy(),
+                        marker="o", ms=3.2, lw=1.1, color="#333333", zorder=3,
+                        label="mean")
+                fig.legend(loc="lower center", bbox_to_anchor=(0.5, 0.006),
+                           ncol=1, frameon=False, fontsize=fontsize)
+
+        ax.axhline(0, color="0.45", lw=0.8, ls="--", zorder=2)
+        ax.set_xlabel(lcz_msg("uhi_distance_label", lang),
+                      fontsize=max(6.0, spec.font_size - 1.5))
+        ax.set_ylabel(lcz_msg("uhi_delta_label", lang),
+                      fontsize=max(6.0, spec.font_size - 1.5))
+        ax.grid(True, axis="y", lw=0.35, color="0.88", zorder=0)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2.5),
+                       length=3, width=0.6)
+        _header(fig, lcz_msg("uhi_transect_title", lang), spec)
+        st.add_footer(fig, caption, None, spec)
+    return fig
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 @dataclass
 class LCZUHISurfaceResult:
-    """Return type of lcz_uhi_surface for a single method."""
+    """Return type of lcz_uhi_surface for a single method.
+
+    ``fig`` is a matplotlib ``Figure``/dict of figures for the default static
+    renderer and a Plotly ``go.Figure``/dict of figures for
+    ``renderer="plotly"``.
+    """
     df: Optional[pl.DataFrame] = None
-    fig: Optional[Union[go.Figure, dict[str, go.Figure]]] = None
+    fig: Optional[object] = None
     array: Optional[np.ndarray] = None
+    renderer: str = "static"
+
+    def show(self) -> None:
+        """Display the figure(s) in the active frontend (matplotlib/Plotly)."""
+        if self.fig is None:
+            return
+        if isinstance(self.fig, dict):
+            if not self.fig:
+                return
+            first = next(iter(self.fig.values()))
+            if _is_mpl(first):
+                import matplotlib.pyplot as plt
+
+                plt.show()
+                return
+            for figure in self.fig.values():
+                figure.show()
+            return
+        if _is_mpl(self.fig):
+            import matplotlib.pyplot as plt
+
+            plt.show()
+        else:
+            self.fig.show()
 
 
 _METHOD_ORDER: tuple[str, ...] = (
@@ -857,16 +1269,28 @@ _METHOD_ORDER: tuple[str, ...] = (
 _METHODS = frozenset(_METHOD_ORDER + ("all",))
 
 
+def _is_mpl(fig) -> bool:
+    """True when ``fig`` is a matplotlib Figure."""
+    return type(fig).__module__.split(".")[0] == "matplotlib"
+
+
 def _save_result(
     name: str, result: LCZUHISurfaceResult, save_extension: str,
-    style: str = "default", lang: str = "en",
+    style: str = "default", lang: str = "en", dpi: Optional[int] = None,
 ) -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     figs = result.fig if isinstance(result.fig, dict) else ({"_": result.fig} if result.fig else {})
     for key, f in figs.items():
         suffix = "" if key == "_" else f"_{key}"
-        finalize_export(f, style=style, isave=True, save_extension=save_extension,
-                         filename=f"lcz4r_uhi_surface_{name}{suffix}", lang=lang)
+        stem = f"lcz4r_uhi_surface_{name}{suffix}"
+        if _is_mpl(f):
+            lcz_static.save_static(
+                f, stem, isave=True, save_extension=save_extension,
+                style=style, dpi=dpi, lang=lang,
+            )
+        else:
+            finalize_export(f, style=style, isave=True, save_extension=save_extension,
+                            filename=stem, lang=lang)
     if result.df is not None and not result.df.is_empty():
         result.df.write_csv(os.path.join(OUTPUT_DIR, f"lcz4r_uhi_surface_{name}.csv"))
 
@@ -892,6 +1316,8 @@ def lcz_uhi_surface(
     title: Optional[str] = None,
     caption: Optional[str] = None,
     lang: str = "en",
+    renderer: Optional[str] = "static",
+    dpi: Optional[int] = None,
 ) -> Union[LCZUHISurfaceResult, dict[str, LCZUHISurfaceResult], pl.DataFrame, dict[str, pl.DataFrame]]:
     """Surface Urban Heat Island (SUHI) intensity from LST, stratified by LCZ.
 
@@ -958,6 +1384,13 @@ def lcz_uhi_surface(
         Figure annotations.
     lang : str
         Message language ("en"/"pt"/"es"/"zh").
+    renderer : {"static", "plotly"}, optional
+        ``"static"`` (default, also ``None``/``"matplotlib"``/``"agg"``)
+        returns matplotlib ``Figure`` objects drawn with the Agg canvas — no
+        Plotly, Kaleido, Chromium or browser needed. ``"plotly"`` returns the
+        interactive Plotly figures.
+    dpi : int, optional
+        Export resolution for the static renderer (never below 300 dpi).
 
     Returns
     -------
@@ -1009,6 +1442,9 @@ def lcz_uhi_surface(
                                    or int(date_index) < 0):
         raise ValueError(f"date_index must be a non-negative integer, got {date_index!r}")
 
+    renderer = resolve_renderer(renderer)
+    static = renderer == "static"
+
     classes = _load_classes(lcz_map)
     lst_stack, dates, units, profile = _load_lst_stack(lst_x)
 
@@ -1043,9 +1479,12 @@ def lcz_uhi_surface(
                 f"reference LCZ {reference_lcz}), or the LST stack may be all "
                 "nodata for the selected dates."
             )
-        if title or caption:
-            figs = fig if isinstance(fig, dict) else ({"_": fig} if fig else {})
+        if (title or caption) and fig is not None:
+            figs = fig if isinstance(fig, dict) else ({"_": fig})
             for f in figs.values():
+                if _is_mpl(f):
+                    # Titles/captions are already drawn by the static builders.
+                    continue
                 if title:
                     f.update_layout(title=dict(text=title))
                 if caption:
@@ -1053,33 +1492,54 @@ def lcz_uhi_surface(
                         text=caption, xref="paper", yref="paper", x=0.5, y=-0.08,
                         showarrow=False, font=dict(size=10, color="gray"),
                     )
-        result = LCZUHISurfaceResult(df=df, fig=fig)
+        result = LCZUHISurfaceResult(df=df, fig=fig, renderer=renderer)
         if isave:
-            _save_result(name, result, save_extension, style=style, lang=lang)
+            _save_result(name, result, save_extension, style=style, lang=lang,
+                         dpi=dpi)
         return result
 
     def _run(name: str, strict: bool = True) -> LCZUHISurfaceResult:
         if name == "urban_rural":
             df = _urban_rural_series(lst_stack, classes, dates)
-            fig = _plot_timeseries(
-                df, "suhi", lcz_msg("uhi_surface_title", lang), lcz_msg("uhi_delta_label", lang), lang,
-            ) if iplot else None
+            ttl = title or lcz_msg("uhi_surface_title", lang)
+            ylab = lcz_msg("uhi_delta_label", lang)
+            if not iplot:
+                fig = None
+            elif static:
+                fig = _static_timeseries(df, "suhi", ttl, ylab, lang=lang,
+                                         style=style, dpi=dpi, caption=caption)
+            else:
+                fig = _plot_timeseries(df, "suhi", ttl, ylab, lang)
             return _finalize(name, df, fig, strict)
 
         if name == "percentile":
             df = _urban_rural_series(lst_stack, classes, dates, percentile=percentile)
-            fig = _plot_timeseries(
-                df, "suhi", lcz_msg("uhi_surface_percentile_title", lang, p=percentile),
-                lcz_msg("uhi_delta_label", lang), lang,
-            ) if iplot else None
+            ttl = title or lcz_msg("uhi_surface_percentile_title", lang, p=percentile)
+            ylab = lcz_msg("uhi_delta_label", lang)
+            if not iplot:
+                fig = None
+            elif static:
+                fig = _static_timeseries(df, "suhi", ttl, ylab, lang=lang,
+                                         style=style, dpi=dpi, caption=caption)
+            else:
+                fig = _plot_timeseries(df, "suhi", ttl, ylab, lang)
             return _finalize(name, df, fig, strict)
 
         if name == "lcz":
             df = _lcz_delta_table(lst_stack, classes, dates, reference_lcz)
-            fig = _plot_value_by_lcz_bar(
-                df, "delta_t", lang, inclusive, lcz_msg("uhi_delta_label", lang),
-                lcz_msg("uhi_lcz_title", lang, ref=reference_lcz),
-            ) if iplot else None
+            ttl = title or lcz_msg("uhi_lcz_title", lang, ref=reference_lcz)
+            ylab = lcz_msg("uhi_delta_label", lang)
+            if not iplot:
+                fig = None
+            elif static:
+                fig = _static_value_by_lcz_bar(
+                    df, "delta_t", lang, inclusive, ylab, ttl,
+                    style=style, dpi=dpi, caption=caption,
+                )
+            else:
+                fig = _plot_value_by_lcz_bar(
+                    df, "delta_t", lang, inclusive, ylab, ttl,
+                )
             return _finalize(name, df, fig, strict)
 
         if name == "utfvi":
@@ -1094,7 +1554,21 @@ def lcz_uhi_surface(
             cats = _classify_utfvi_array(band)
             df = _category_counts(cats, finite)
             array = np.where(valid_mask, band, np.nan)
-            if iplot:
+            ttl = title or lcz_msg("uhi_utfvi_title", lang, date=dates[di])
+            if not iplot:
+                fig = None
+            elif static:
+                fig = {
+                    "map": _static_spatial_heatmap(
+                        array, transform, ttl, colorscale="RdYlGn_r", zmid=0.0,
+                        colorbar_title="UTFVI", crs=crs, style=style, dpi=dpi,
+                        caption=caption,
+                    ),
+                    "bar": _static_utfvi_category_bar(
+                        df, lang, style=style, dpi=dpi, caption=caption,
+                    ),
+                }
+            else:
                 fig = {
                     "map": _plot_spatial_heatmap(
                         array, transform, lcz_msg("uhi_utfvi_title", lang, date=dates[di]),
@@ -1103,8 +1577,6 @@ def lcz_uhi_surface(
                     ),
                     "bar": _plot_utfvi_category_bar(df, lang),
                 }
-            else:
-                fig = None
             result = _finalize(name, df, fig, strict)
             result.array = array
             return result
@@ -1121,19 +1593,35 @@ def lcz_uhi_surface(
                 )
             df = _category_counts(cats, finite)
             array = np.where(valid_mask, gi, np.nan)
-            fig = _plot_spatial_heatmap(
-                array, transform, lcz_msg("uhi_hotspot_title", lang, date=dates[di]),
-                colorscale="RdBu_r", zmid=0.0, colorbar_title="Gi* z-score",
-                categories=np.where(valid_mask, cats, ""),
-                crs=crs,
-            ) if iplot else None
+            ttl = title or lcz_msg("uhi_hotspot_title", lang, date=dates[di])
+            if not iplot:
+                fig = None
+            elif static:
+                fig = _static_spatial_heatmap(
+                    array, transform, ttl, colorscale="RdBu_r", zmid=0.0,
+                    colorbar_title="Gi* z-score", crs=crs, style=style,
+                    dpi=dpi, caption=caption,
+                )
+            else:
+                fig = _plot_spatial_heatmap(
+                    array, transform, lcz_msg("uhi_hotspot_title", lang, date=dates[di]),
+                    colorscale="RdBu_r", zmid=0.0, colorbar_title="Gi* z-score",
+                    categories=np.where(valid_mask, cats, ""),
+                    crs=crs,
+                )
             result = _finalize(name, df, fig, strict)
             result.array = array
             return result
 
         if name == "transect":
             df = _transect_table(lst_stack, classes, dates, transform, crs, n_bins=int(n_bins))
-            fig = _plot_transect(df, lang) if iplot else None
+            if not iplot:
+                fig = None
+            elif static:
+                fig = _static_transect(df, lang, style=style, dpi=dpi,
+                                       caption=caption)
+            else:
+                fig = _plot_transect(df, lang)
             return _finalize(name, df, fig, strict)
 
         # "persistence"
@@ -1142,7 +1630,25 @@ def lcz_uhi_surface(
         )
         array = np.where(valid_mask, persistence, np.nan)
         df = _persistence_by_class(array, classes)
-        if iplot:
+        if not iplot:
+            fig = None
+        elif static:
+            fig = {
+                "map": _static_spatial_heatmap(
+                    array, transform,
+                    title or lcz_msg("uhi_persistence_title", lang, thr=persistence_threshold),
+                    colorscale="YlOrRd", zmin=0, zmax=100,
+                    colorbar_title="% of dates", crs=crs, style=style,
+                    dpi=dpi, caption=caption,
+                ),
+                "bar": _static_value_by_lcz_bar(
+                    df, "persistence", lang, inclusive,
+                    lcz_msg("uhi_persistence_label", lang),
+                    title or lcz_msg("uhi_persistence_by_class_title", lang),
+                    style=style, dpi=dpi, caption=caption,
+                ),
+            }
+        else:
             fig = {
                 "map": _plot_spatial_heatmap(
                     array, transform, lcz_msg("uhi_persistence_title", lang, thr=persistence_threshold),
@@ -1154,8 +1660,6 @@ def lcz_uhi_surface(
                     lcz_msg("uhi_persistence_by_class_title", lang),
                 ),
             }
-        else:
-            fig = None
         result = _finalize(name, df, fig, strict)
         result.array = array
         return result

@@ -223,16 +223,27 @@ def test_lcz_cal_area_df_only(lcz_tif):
 
 
 def test_lcz_cal_area_bar(lcz_tif):
+    import matplotlib.figure
     from LCZ4py.general.lcz_cal_area import lcz_cal_area, LCZAreaResult
     result = lcz_cal_area(lcz_tif, plot_type="bar")
     assert isinstance(result, LCZAreaResult)
-    assert isinstance(result.fig, go.Figure)
+    assert result.renderer == "static"
+    assert isinstance(result.fig, matplotlib.figure.Figure)
 
 
 @pytest.mark.parametrize("plot_type", ["pie", "donut", "sunburst", "treemap"])
 def test_lcz_cal_area_plot_types(lcz_tif, plot_type):
-    from LCZ4py.general.lcz_cal_area import lcz_cal_area, LCZAreaResult
+    import matplotlib.figure
+    from LCZ4py.general.lcz_cal_area import lcz_cal_area
     result = lcz_cal_area(lcz_tif, plot_type=plot_type)
+    assert result.renderer == "static"
+    assert isinstance(result.fig, matplotlib.figure.Figure)
+
+
+def test_lcz_cal_area_plotly_opt_in(lcz_tif):
+    from LCZ4py.general.lcz_cal_area import lcz_cal_area
+    result = lcz_cal_area(lcz_tif, plot_type="bar", renderer="plotly")
+    assert result.renderer == "plotly"
     assert isinstance(result.fig, go.Figure)
 
 
@@ -250,17 +261,21 @@ def test_lcz_cal_area_inclusive(lcz_tif):
 
 # ── lcz_plot_map ──────────────────────────────────────────────────────────────
 
-def test_lcz_plot_map_default(lcz_tif):
+def test_lcz_plot_map_default_is_native_static(lcz_tif):
+    import matplotlib.figure
     from LCZ4py.general.lcz_plot_map import lcz_plot_map, LCZPlotResult
     result = lcz_plot_map(lcz_tif)
     assert isinstance(result, LCZPlotResult)
-    assert isinstance(result.fig, go.Figure)
+    assert result.renderer == "static"
+    assert isinstance(result.fig, matplotlib.figure.Figure)
 
 
-def test_lcz_plot_map_no_webgl(lcz_tif):
+def test_lcz_plot_map_plotly_opt_in(lcz_tif):
     from LCZ4py.general.lcz_plot_map import lcz_plot_map, LCZPlotResult
-    result = lcz_plot_map(lcz_tif, use_webgl=False)
+    result = lcz_plot_map(lcz_tif, renderer="plotly", use_webgl=False)
     assert isinstance(result, LCZPlotResult)
+    assert result.renderer == "plotly"
+    assert isinstance(result.fig, go.Figure)
 
 
 def test_finalize_export_missing_kaleido_is_helpful(monkeypatch):
@@ -291,15 +306,22 @@ def test_raster_to_geoarrow(lcz_tif):
 
 def test_lcz_plot_parameters_single(param_tif):
     from LCZ4py.general.lcz_plot_parameters import lcz_plot_parameters
-    fig = lcz_plot_parameters(param_tif, iselect=["SVFmean"])
+    fig = lcz_plot_parameters(param_tif, iselect=["SVFmean"], renderer="plotly")
     assert isinstance(fig, go.Figure)
 
 
 def test_lcz_plot_parameters_multi(param_tif):
     from LCZ4py.general.lcz_plot_parameters import lcz_plot_parameters
-    figs = lcz_plot_parameters(param_tif, iselect=["SVFmean", "AHmean"])
+    figs = lcz_plot_parameters(param_tif, iselect=["SVFmean", "AHmean"], renderer="plotly")
     assert isinstance(figs, list) and len(figs) == 2
     assert all(isinstance(f, go.Figure) for f in figs)
+
+
+def test_lcz_plot_parameters_default_is_static(param_tif):
+    import matplotlib.figure
+    from LCZ4py.general.lcz_plot_parameters import lcz_plot_parameters
+    fig = lcz_plot_parameters(param_tif, iselect=["SVFmean"])
+    assert isinstance(fig, matplotlib.figure.Figure)
 
 
 def test_lcz_plot_parameters_all_params(param_tif):
@@ -317,7 +339,7 @@ def test_lcz_plot_parameters_iselect_resolves_correct_band(param_tif):
     with rasterio.open(param_tif) as src:
         band3 = src.read(3)
 
-    fig = lcz_plot_parameters(param_tif, iselect="BSFmean")
+    fig = lcz_plot_parameters(param_tif, iselect="BSFmean", renderer="plotly")
     z = np.nan_to_num(np.asarray(fig.data[0].z))
     expected = np.nan_to_num(np.flipud(np.where(band3 == 0, np.nan, band3)))
     assert np.allclose(z, expected)
@@ -361,18 +383,22 @@ def test_lcz_plot_parameters_chart_type_delegates_to_lcz_cal_indices(
 
     fig_scatter = lcz_plot_parameters(
         idx.path, lcz_map=lcz_class_tif_matching, chart_type="scatter",
-        index_x="NDVI", index_y="NDBI",
+        index_x="NDVI", index_y="NDBI", renderer="plotly",
     )
     expected_scatter = lcz_cal_indices(
         lcz_class_tif_matching, idx.path, plot_type="scatter", index_x="NDVI", index_y="NDBI",
+        renderer="plotly",
     ).fig
     assert len(fig_scatter.data) == len(expected_scatter.data)
 
-    fig_radar = lcz_plot_parameters(idx.path, lcz_map=lcz_class_tif_matching, chart_type="radar")
+    fig_radar = lcz_plot_parameters(
+        idx.path, lcz_map=lcz_class_tif_matching, chart_type="radar", renderer="plotly",
+    )
     assert len(fig_radar.data) > 0
 
     fig_corr = lcz_plot_parameters(
-        idx.path, lcz_map=lcz_class_tif_matching, chart_type="correlation", iselect=["NDVI", "NDBI"],
+        idx.path, lcz_map=lcz_class_tif_matching, chart_type="correlation",
+        iselect=["NDVI", "NDBI"], renderer="plotly",
     )
     assert np.array(fig_corr.data[0].z).shape == (2, 2)
 
@@ -598,7 +624,7 @@ def test_lcz_cal_indices_stats_and_charts(lcz_class_tif_matching, pc_band_stack_
     stack_path, _ = pc_band_stack_tif
     idx = lcz_get_indices(stack_path, indices=["NDVI", "NDBI"], verbose=False)
 
-    stats = lcz_cal_indices(lcz_class_tif_matching, idx, plot_type="both")
+    stats = lcz_cal_indices(lcz_class_tif_matching, idx, plot_type="both", renderer="plotly")
     assert isinstance(stats.df, pl.DataFrame)
     assert set(stats.df["parameter"].unique().to_list()) == {"NDVI", "NDBI"}
     for col in ("mean", "median", "std", "ci_lower", "ci_upper", "lcz_name"):
@@ -674,7 +700,7 @@ def test_lcz_cal_indices_cohens_d_known_separation(tmp_path):
         dst.write(values, 1)
         dst.set_band_description(1, "SYNTHETIC")
 
-    stats = lcz_cal_indices(str(lcz_path), str(idx_path), plot_type="effect_size")
+    stats = lcz_cal_indices(str(lcz_path), str(idx_path), plot_type="effect_size", renderer="plotly")
     row = stats.cohens_d.filter(pl.col("parameter") == "SYNTHETIC").to_dicts()[0]
     assert row["magnitude"] == "Large"
     assert 3.5 < row["cohens_d"] < 6.5  # true separation mean_diff=5, std=1 -> d~5
@@ -692,18 +718,19 @@ def test_lcz_cal_indices_new_plot_types_smoke(lcz_class_tif_matching, pc_band_st
 
     scatter = lcz_cal_indices(
         lcz_class_tif_matching, idx, plot_type="scatter",
-        index_x="NDVI", index_y="NDBI", size_by="MNDWI",
+        index_x="NDVI", index_y="NDBI", size_by="MNDWI", renderer="plotly",
     )
     assert len(scatter.fig.data) > 0
 
-    radar = lcz_cal_indices(lcz_class_tif_matching, idx, plot_type="radar")
+    radar = lcz_cal_indices(lcz_class_tif_matching, idx, plot_type="radar", renderer="plotly")
     assert len(radar.fig.data) > 0
 
-    corr = lcz_cal_indices(lcz_class_tif_matching, idx, plot_type="correlation")
+    corr = lcz_cal_indices(lcz_class_tif_matching, idx, plot_type="correlation", renderer="plotly")
     assert np.array(corr.fig.data[0].z).shape == (3, 3)
 
     combined = lcz_cal_indices(
         lcz_class_tif_matching, idx, plot_type="all", index_x="NDVI", index_y="NDBI",
+        renderer="plotly",
     )
     assert set(combined.fig) == {"box", "bar", "radar", "correlation", "effect_size", "scatter"}
     assert combined.cohens_d is not None

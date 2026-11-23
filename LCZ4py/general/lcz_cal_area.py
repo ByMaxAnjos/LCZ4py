@@ -5,10 +5,15 @@ LCZ area statistics and publication-quality charts.
 
 - NumPy ``bincount`` aggregation (O(n), no per-pixel Python objects)
 - Optional DuckDB for the final percentage rollup (``HAS_DUCKDB`` guarded)
-- Plotly bar / pie / donut / sunburst / treemap with readable labels,
-  contrast-aware annotation colours and the LCZ palette (or its
-  colour-blind variant via ``inclusive=True``)
-- >=300 dpi static export through ``lcz_theme``
+- **Default** native static matplotlib/Agg renderer (``renderer="static"``):
+  bar / pie / donut / nested-sunburst / treemap drawn with the shared
+  ``_internal/lcz_static`` helpers and the LCZ palette (or its colour-blind
+  variant via ``inclusive=True``). Saves PNG/PDF/SVG/TIFF at >=300 dpi with
+  no Plotly, Kaleido, Chromium or browser involved.
+- Opt-in Plotly renderer (``renderer="plotly"``) with the previous bar / pie /
+  donut / sunburst / treemap figures, readable labels, contrast-aware
+  annotation colours and hover metadata.
+- >=300 dpi static export in both backends
 """
 
 from __future__ import annotations
@@ -61,6 +66,7 @@ from LCZ4py._internal.lcz_parameters_data import (
     get_lcz_names,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal import lcz_static as _st
 from LCZ4py.general.lcz_plot_map import _add_caption, _finalize_publication
 
 logger = logging.getLogger(__name__)
@@ -584,6 +590,490 @@ def _plot_treemap_interactive(df: pl.DataFrame, lang: str = "en") -> go.Figure:
     return fig
 
 
+# ── Native static charts (matplotlib/Agg — no Plotly/Kaleido/browser) ────────
+
+#: Urban / natural / other groups used by the sunburst hierarchy.
+_CATEGORY_LABELS: dict[str, tuple[str, str, str]] = {
+    "en": ("Urban", "Natural", "Other"),
+    "pt": ("Urbano", "Natural", "Outro"),
+    "es": ("Urbano", "Natural", "Otro"),
+    "zh": ("城市", "自然", "其他"),
+}
+
+
+def _category_of(lcz: int, lang: str) -> str:
+    """Vendor-neutral LCZ -> {urban, natural, other} grouping (1-10/11-14/15-17)."""
+    urban, natural, other = _CATEGORY_LABELS.get(lang, _CATEGORY_LABELS["en"])
+    if 1 <= lcz <= 10:
+        return urban
+    if 11 <= lcz <= 14:
+        return natural
+    return other
+
+
+def _legend_handles(df: pl.DataFrame) -> list:
+    """Legend patches in class order, using the palette already in ``df``."""
+    from matplotlib.patches import Patch
+
+    return [
+        Patch(facecolor=color, edgecolor="black", linewidth=0.3, label=label)
+        for color, label in zip(df["color"].to_list(), df["readable"].to_list())
+    ]
+
+
+def _class_legend(
+    fig,
+    df: pl.DataFrame,
+    spec,
+    *,
+    lang: str = "en",
+    ncol: int = 3,
+    y: float = 0.03,
+    title: Optional[str] = None,
+):
+    """Ordered LCZ class legend below the panel (no plot area consumed)."""
+    handles = _legend_handles(df)
+    if not handles:
+        return None
+    fontsize = max(5.5, spec.font_size - 2)
+    return fig.legend(
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, y),
+        ncol=min(int(ncol), max(2, len(handles))),
+        frameon=False,
+        fontsize=fontsize,
+        handlelength=1.2,
+        columnspacing=1.3,
+        handletextpad=0.45,
+        title=title or lcz_msg("lcz_class_legend", lang),
+        title_fontsize=fontsize,
+    )
+
+
+def _worst_ratio(row: list[float], side: float) -> float:
+    """Bruls/Squarify aspect ratio of a row laid along ``side``."""
+    total = float(sum(row))
+    if total <= 0 or side <= 0:
+        return float("inf")
+    worst = 0.0
+    for area in row:
+        if area <= 0:
+            return float("inf")
+        ratio = max((side * side * area) / (total * total),
+                    (total * total) / (side * side * area))
+        worst = max(worst, ratio)
+    return worst
+
+
+def _squarify(values: list[float], x: float, y: float, w: float, h: float) -> list[tuple]:
+    """Squarified treemap layout; returns ``[(x, y, w, h), ...]`` in data units."""
+    total = float(sum(values))
+    if total <= 0 or w <= 0 or h <= 0:
+        return []
+    scale = (w * h) / total
+    remaining = [max(float(v), 0.0) * scale for v in values]
+    rects: list[tuple] = []
+
+    while remaining:
+        side = h if w >= h else w
+        row = [remaining[0]]
+        i = 1
+        while i < len(remaining) and _worst_ratio(row + [remaining[i]], side) <= _worst_ratio(row, side):
+            row.append(remaining[i])
+            i += 1
+
+        row_sum = float(sum(row))
+        if w >= h:
+            strip_w = row_sum / h if h > 0 else 0.0
+            cursor = y
+            for area in row:
+                rh = area / strip_w if strip_w > 0 else 0.0
+                rects.append((x, cursor, strip_w, rh))
+                cursor += rh
+            x += strip_w
+            w -= strip_w
+        else:
+            strip_h = row_sum / w if w > 0 else 0.0
+            cursor = x
+            for area in row:
+                rw = area / strip_h if strip_h > 0 else 0.0
+                rects.append((cursor, y, rw, strip_h))
+                cursor += rw
+            y += strip_h
+            h -= strip_h
+        remaining = remaining[len(row):]
+
+    return rects
+
+
+def _draw_area_bar(
+    df: pl.DataFrame,
+    *,
+    xlab: str,
+    ylab: str,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    style: str,
+    dpi: Optional[int],
+):
+    """Vertical bar chart of area per LCZ class, ordered by class code."""
+    n_bars = max(int(df.height), 1)
+    # 17 percentages on one row need room: widen the panel beyond the preset's
+    # single column so the labels stay legible (and >=5 pt) instead of
+    # overprinting each other.
+    _, single_mm, _ = _st.figure_dims(style, column="single")
+    width_mm = max(float(single_mm), 5.8 * n_bars + 30.0)
+
+    fig, spec, _ = _st.new_figure(
+        style, width_mm=width_mm, aspect=0.66, dpi=dpi,
+    )
+    has_header = bool(title or subtitle)
+    left, right = 0.13, 0.97
+    ax = _st.add_axes(
+        fig, bottom=0.19, top=_st.figure_top(has_header), left=left, right=right,
+    )
+
+    x = np.arange(n_bars, dtype=float)
+    areas = df["area_km2"].to_numpy().astype(float)
+    percentages = df["area_perc"].to_numpy().astype(float)
+    ax.bar(
+        x, areas, width=0.78, color=df["color"].to_list(),
+        edgecolor="black", linewidth=0.45, zorder=2,
+    )
+
+    # Label size derived from the space each bar actually has (points).
+    axes_width_pt = float(fig.get_size_inches()[0]) * 72.0 * (right - left)
+    bar_width_pt = axes_width_pt / n_bars
+    label_font = max(5.0, min(8.0, bar_width_pt * 0.33))
+    for xi, yi, pct in zip(x, areas, percentages):
+        if pct >= 0.1:
+            ax.annotate(
+                f"{pct:.1f}%", (xi, yi), xytext=(0, 2),
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=label_font, zorder=3,
+            )
+
+    top = float(np.nanmax(areas)) if areas.size and np.isfinite(areas).any() else 1.0
+    ax.set_ylim(0.0, top * 1.14 if top > 0 else 1.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(int(v)) for v in df["lcz"].to_list()])
+    ax.set_xlabel(xlab)
+    ax.set_ylabel(ylab)
+    ax.tick_params(axis="both", labelsize=max(6.0, spec.font_size - 2), length=3, width=0.6)
+    ax.grid(axis="y", color="#e8e8e8", linewidth=0.5)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_area_pie(
+    df: pl.DataFrame,
+    *,
+    hole: float,
+    show_legend: bool,
+    center_text: Optional[str],
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Pie (``hole=0``) or donut chart with percentages inside the slices."""
+    fig, spec, _ = _st.new_figure(
+        style, aspect=0.86, extra_height_mm=28.0, column="single", dpi=dpi,
+    )
+    has_header = bool(title or subtitle)
+    ax = _st.add_axes(
+        fig, bottom=0.30, top=_st.figure_top(has_header), left=0.06, right=0.94,
+    )
+    ax.set_aspect("equal")
+
+    values = df["area_km2"].to_numpy().astype(float)
+    colors = df["color"].to_list()
+    fontsize = max(5.5, spec.font_size - 2)
+    total_area = float(np.nansum(values)) or 1.0
+
+    wedges, _texts = ax.pie(
+        values,
+        colors=colors,
+        startangle=90,
+        counterclock=False,
+        wedgeprops=dict(width=max(1.0 - hole, 0.05), edgecolor="white", linewidth=0.9),
+    )
+
+    # Percentages: inside the wedge when it is wide enough, otherwise just
+    # outside with a thin leader line — a fixed pctdistance made neighbouring
+    # small slices overprint each other.
+    inside_r = 0.72 if hole else 0.68
+    for wedge, area, color in zip(wedges, values, colors):
+        share = area / total_area
+        if share <= 0 or not np.isfinite(share):
+            continue
+        mid = np.deg2rad((wedge.theta1 + wedge.theta2) / 2.0)
+        cos, sin = float(np.cos(mid)), float(np.sin(mid))
+        label = f"{share * 100:.1f}%"
+        if share * 100.0 >= 4.0:
+            ax.text(
+                inside_r * cos, inside_r * sin, label,
+                ha="center", va="center", fontsize=fontsize,
+                fontweight="bold", color=_contrast_color(color),
+            )
+        else:
+            ax.annotate(
+                label,
+                xy=(0.98 * cos, 0.98 * sin),
+                xytext=(1.10 * cos, 1.10 * sin),
+                ha="left" if cos >= 0 else "right", va="center",
+                fontsize=max(4.5, spec.font_size - 3), color="#222222",
+                arrowprops=dict(arrowstyle="-", color="#888888", lw=0.4,
+                                shrinkA=0, shrinkB=0),
+            )
+    ax.set_xlim(-1.4, 1.4)
+    ax.set_ylim(-1.4, 1.4)
+    ax.axis("off")
+
+    if center_text:
+        ax.text(
+            0.0, 0.0, center_text, ha="center", va="center",
+            fontsize=max(6.0, spec.font_size - 1), linespacing=1.35,
+        )
+
+    if show_legend:
+        _class_legend(fig, df, spec, lang=lang, ncol=3, y=0.035)
+
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_area_sunburst(
+    df: pl.DataFrame,
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Nested donut (categories inside, LCZ classes outside) — a static sunburst.
+
+    matplotlib has no sunburst primitive; two concentric rings carry the same
+    two-level hierarchy without losing the class labels or the total.
+    """
+    fig, spec, _ = _st.new_figure(
+        style, aspect=0.88, extra_height_mm=26.0, column="single", dpi=dpi,
+    )
+    has_header = bool(title or subtitle)
+    ax = _st.add_axes(
+        fig, bottom=0.30, top=_st.figure_top(has_header), left=0.06, right=0.94,
+    )
+    ax.set_aspect("equal")
+
+    urban, natural, other = _CATEGORY_LABELS.get(lang, _CATEGORY_LABELS["en"])
+    parent_colors = {urban: "#B8B8B8", natural: "#8FBF9F", other: "#9FB8D0"}
+    codes = [int(v) for v in df["lcz"].to_list()]
+    areas_df = df["area_km2"].to_numpy().astype(float)
+    categories = [_category_of(c, lang) for c in codes]
+
+    totals: dict[str, float] = {}
+    for cat, area in zip(categories, areas_df):
+        totals[cat] = totals.get(cat, 0.0) + float(area)
+    cat_order = sorted(totals, key=lambda c: totals[c], reverse=True)
+    cat_values = [totals[c] for c in cat_order]
+    cat_colors = [parent_colors.get(c, "#B8B8B8") for c in cat_order]
+
+    fontsize = max(5.5, spec.font_size - 2)
+    total_area = float(np.nansum(areas_df)) or 1.0
+
+    # Outer ring: LCZ classes, in class order.
+    ax.pie(
+        areas_df, radius=1.0, colors=df["color"].to_list(),
+        startangle=90, counterclock=False,
+        wedgeprops=dict(width=0.30, edgecolor="white", linewidth=0.8),
+    )
+    # Inner ring: urban / natural / other aggregates.
+    inner_wedges, _t = ax.pie(
+        cat_values, radius=0.70, colors=cat_colors,
+        startangle=90, counterclock=False,
+        wedgeprops=dict(width=0.28, edgecolor="white", linewidth=0.8),
+    )
+
+    # Category name + share on the inner ring: the name runs *tangentially*
+    # and the share horizontally, so neither sprawls across the ring band.
+    for wedge, cat, value in zip(inner_wedges, cat_order, cat_values):
+        share = value / total_area
+        if share < 0.04:
+            continue
+        mid = np.deg2rad((wedge.theta1 + wedge.theta2) / 2.0)
+        cos, sin = float(np.cos(mid)), float(np.sin(mid))
+        if share >= 0.09:
+            rot = (wedge.theta1 + wedge.theta2) / 2.0 + 90.0
+            if cos < 0:  # keep the label upright on the left half
+                rot += 180.0
+            ax.text(
+                0.55 * cos, 0.55 * sin, cat,
+                ha="center", va="center", rotation=rot,
+                rotation_mode="anchor", fontsize=max(4.5, fontsize - 1),
+                color="#222222",
+            )
+            ax.text(
+                0.655 * cos, 0.655 * sin, f"{share * 100:.0f}%",
+                ha="center", va="center", fontsize=max(4.5, fontsize - 2),
+                color="#222222", fontweight="bold",
+            )
+        else:
+            ax.text(
+                0.56 * cos, 0.56 * sin, f"{share * 100:.0f}%",
+                ha="center", va="center", fontsize=max(4.0, fontsize - 2),
+                color="#222222",
+            )
+
+    # Class codes on the outer ring, only on slices wide enough to read.
+    outer_wedges = ax.patches[: df.height]
+    text_colors = df["text_color"].to_list()
+    for pos, (wedge, code, area) in enumerate(zip(outer_wedges, codes, areas_df)):
+        if area / total_area < 0.05:
+            continue
+        mid = np.deg2rad((wedge.theta1 + wedge.theta2) / 2.0)
+        ax.text(
+            0.86 * np.cos(mid), 0.86 * np.sin(mid), str(code),
+            ha="center", va="center", rotation=mid * 180 / np.pi,
+            rotation_mode="anchor", fontsize=fontsize,
+            color=text_colors[pos], fontweight="bold",
+        )
+
+    _class_legend(fig, df, spec, lang=lang, ncol=3, y=0.035)
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_area_treemap(
+    df: pl.DataFrame,
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Squarified treemap of class areas (area-proportional rectangles)."""
+    from matplotlib.patches import Rectangle
+
+    fig, spec, _ = _st.new_figure(
+        style, aspect=0.74, extra_height_mm=24.0, column="single", dpi=dpi,
+    )
+    has_header = bool(title or subtitle)
+    ax = _st.add_axes(
+        fig, bottom=0.27, top=_st.figure_top(has_header), left=0.03, right=0.97,
+    )
+
+    values = df["area_km2"].to_numpy().astype(float)
+    colors = df["color"].to_list()
+    codes = [int(v) for v in df["lcz"].to_list()]
+    percentages = df["area_perc"].to_numpy().astype(float)
+    total_area = float(np.nansum(values)) or 1.0
+
+    order = list(np.argsort(-values))
+    rects = _squarify([float(values[i]) for i in order], 0.0, 0.0, 1.0, 1.0)
+
+    body_font = max(5.0, min(9.0, spec.font_size - 2))
+    for (rx, ry, rw, rh), idx in zip(rects, order):
+        ax.add_patch(Rectangle(
+            (rx, ry), rw, rh, facecolor=colors[idx],
+            edgecolor="white", linewidth=0.9,
+        ))
+        if min(rw, rh) < 0.055:
+            continue
+        label = str(codes[idx])
+        if rw * rh >= 0.045 and min(rw, rh) >= 0.10:
+            label += f"\n{percentages[idx]:.1f}%"
+        ax.text(
+            rx + rw / 2.0, ry + rh / 2.0, label,
+            ha="center", va="center", fontsize=body_font,
+            color=_contrast_color(colors[idx]), linespacing=1.15,
+        )
+
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.axis("off")
+
+    _class_legend(fig, df, spec, lang=lang, ncol=4, y=0.025)
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _plot_area_static(
+    df: pl.DataFrame,
+    plot_type: str,
+    *,
+    xlab: str,
+    ylab: str,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    show_legend: bool,
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+    isave: bool,
+    save_extension: str,
+):
+    """Build (and optionally save) the chart with matplotlib/Agg."""
+    total = float(df["area_km2"].sum())
+    base_title = title or lcz_msg("lcz_area_title", lang)
+    base_subtitle = subtitle
+    if base_subtitle is None and plot_type in ("pie", "sunburst", "treemap"):
+        base_subtitle = f"Total: {total:,.0f} km²"
+
+    with _st.style_context(style):
+        if plot_type == "bar":
+            fig = _draw_area_bar(
+                df, xlab=xlab, ylab=ylab, title=base_title,
+                subtitle=base_subtitle, caption=caption, style=style, dpi=dpi,
+            )
+        elif plot_type == "pie":
+            fig = _draw_area_pie(
+                df, hole=0.0, show_legend=show_legend, center_text=None,
+                title=base_title, subtitle=base_subtitle, caption=caption,
+                lang=lang, style=style, dpi=dpi,
+            )
+        elif plot_type == "donut":
+            fig = _draw_area_pie(
+                df, hole=0.45, show_legend=show_legend,
+                center_text=f"Total\n{total:,.0f} km²",
+                title=base_title, subtitle=subtitle, caption=caption,
+                lang=lang, style=style, dpi=dpi,
+            )
+        elif plot_type == "sunburst":
+            fig = _draw_area_sunburst(
+                df, title=base_title, subtitle=base_subtitle, caption=caption,
+                lang=lang, style=style, dpi=dpi,
+            )
+        else:  # treemap
+            fig = _draw_area_treemap(
+                df, title=base_title, subtitle=base_subtitle, caption=caption,
+                lang=lang, style=style, dpi=dpi,
+            )
+
+        _st.save_static(
+            fig, f"lcz4r_area_{plot_type}", isave=isave,
+            save_extension=save_extension, style=style, dpi=dpi, lang=lang,
+        )
+
+    return fig
+
+
 # ── GeoArrow export ───────────────────────────────────────────────────────────
 
 def _to_geoarrow(df: pl.DataFrame, crs: str = "EPSG:4326") -> Optional[pa.Table]:
@@ -612,10 +1102,26 @@ def _to_geoarrow(df: pl.DataFrame, crs: str = "EPSG:4326") -> Optional[pa.Table]
 
 @dataclass
 class LCZAreaResult:
-    """Return type of lcz_cal_area."""
+    """Return type of lcz_cal_area.
+
+    ``fig`` is a matplotlib ``Figure`` for the default static renderer and a
+    Plotly ``go.Figure`` for ``renderer="plotly"``.
+    """
     df: pl.DataFrame
-    fig: Optional[go.Figure] = None
+    fig: Optional[object] = None
     geoarrow_table: Optional[pa.Table] = None
+    renderer: str = "static"
+
+    def show(self) -> None:
+        """Display the figure in the active frontend (matplotlib or Plotly)."""
+        if self.fig is None:
+            return
+        if type(self.fig).__module__.startswith("matplotlib"):
+            import matplotlib.pyplot as plt
+
+            plt.show()
+        else:
+            self.fig.show()
 
 
 def _read_class_band(
@@ -680,6 +1186,7 @@ def lcz_cal_area(
     lang: str = "en",
     band: int = 1,
     dpi: Optional[int] = None,
+    renderer: Optional[str] = "static",
 ) -> Union[LCZAreaResult, pl.DataFrame, go.Figure]:
     """Calculate LCZ areas and render publication-quality charts.
 
@@ -694,8 +1201,10 @@ def lcz_cal_area(
     isave : bool
         Save chart + CSV.
     save_extension : str
-        "html" for interactive, "png"/"pdf"/"svg"/"tiff" for static
-        (static output is rasterised at >=300 dpi).
+        "png" (default for the static renderer), "pdf", "svg", "tiff"/"tif",
+        "jpg"/"jpeg", "webp", or "html" for the interactive Plotly renderer
+        ("html" is coerced to "png" for the static renderer). Static output is
+        rasterised at >=300 dpi.
     style : str
         Publication style preset: "default", "nature", "science", or
         "generic_bw". Controls font, figure size (mm), DPI, and palette
@@ -720,10 +1229,17 @@ def lcz_cal_area(
         1-based band holding the LCZ classes (default 1).
     dpi : int, optional
         Resolution for static exports (default >= 300 dpi).
+    renderer : {"static", "plotly"}, optional
+        "static" (default, also ``None``/``"matplotlib"``/``"agg"``) renders a
+        matplotlib ``Figure`` and saves native PNG/PDF/SVG/TIFF without Plotly,
+        Kaleido, Chromium or a browser. "plotly" returns the previous
+        interactive figure.
 
     Returns
     -------
     LCZAreaResult, pl.DataFrame, or go.Figure
+        ``LCZAreaResult.fig`` is a matplotlib ``Figure`` for the default
+        static renderer (Plotly ``go.Figure`` when ``renderer="plotly"``).
 
     Raises
     ------
@@ -734,6 +1250,8 @@ def lcz_cal_area(
     valid_types = {"bar", "pie", "donut", "sunburst", "treemap"}
     if plot_type not in valid_types:
         raise ValueError(f"plot_type must be one of {valid_types}, got {plot_type!r}")
+    # None / "matplotlib" / "agg" -> the native static renderer (default).
+    renderer = _st.resolve_renderer(renderer)
     if (save_extension or "").lower().lstrip(".") not in (
         "html", "png", "pdf", "svg", "tiff", "jpg", "jpeg", "webp"
     ):
@@ -778,41 +1296,51 @@ def lcz_cal_area(
     if not iplot:
         return df.drop("color", "text_color", "readable")
 
-    # Create interactive plot
-    plot_fns = {
-        "bar": _plot_bar_interactive,
-        "pie": _plot_pie_interactive,
-        "donut": _plot_donut_interactive,
-        "sunburst": _plot_sunburst_interactive,
-        "treemap": _plot_treemap_interactive,
-    }
-
-    if plot_type == "bar":
-        fig = plot_fns[plot_type](df, xlab, ylab, lang=lang)
+    # ── Native static renderer (default): matplotlib/Agg, no browser ────────
+    if renderer == "static":
+        fig = _plot_area_static(
+            df, plot_type,
+            xlab=xlab, ylab=ylab,
+            title=title, subtitle=subtitle, caption=caption,
+            show_legend=show_legend, lang=lang, style=style, dpi=dpi,
+            isave=isave, save_extension=save_extension,
+        )
     else:
-        fig = plot_fns[plot_type](df, lang=lang)
+        # ── Plotly renderer (opt-in): previous interactive figure ───────────
+        plot_fns = {
+            "bar": _plot_bar_interactive,
+            "pie": _plot_pie_interactive,
+            "donut": _plot_donut_interactive,
+            "sunburst": _plot_sunburst_interactive,
+            "treemap": _plot_treemap_interactive,
+        }
 
-    if plot_type in ("pie", "donut") and not show_legend:
-        fig.update_layout(showlegend=False)
+        if plot_type == "bar":
+            fig = plot_fns[plot_type](df, xlab, ylab, lang=lang)
+        else:
+            fig = plot_fns[plot_type](df, lang=lang)
 
-    # Add annotations
-    if title or subtitle:
-        title_text = title or lcz_msg("lcz_area_title", lang)
-        if subtitle:
-            title_text += f"<br><sup>{subtitle}</sup>"
-        fig.update_layout(title=dict(text=title_text))
-    _add_caption(fig, caption)
+        if plot_type in ("pie", "donut") and not show_legend:
+            fig.update_layout(showlegend=False)
+
+        # Add annotations
+        if title or subtitle:
+            title_text = title or lcz_msg("lcz_area_title", lang)
+            if subtitle:
+                title_text += f"<br><sup>{subtitle}</sup>"
+            fig.update_layout(title=dict(text=title_text))
+        _add_caption(fig, caption)
+
+        fig = _finalize_publication(
+            fig, style=style, isave=isave, save_extension=save_extension,
+            filename=f"lcz4r_area_{plot_type}", dpi=dpi, lang=lang,
+        )
 
     # Generate GeoArrow if requested
     geoarrow_table = None
     if use_geoarrow and HAS_GEOARROW:
         geoarrow_table = _to_geoarrow(df, crs or "EPSG:4326")
 
-    # Save outputs
-    fig = _finalize_publication(
-        fig, style=style, isave=isave, save_extension=save_extension,
-        filename=f"lcz4r_area_{plot_type}", dpi=dpi, lang=lang,
-    )
     df_out = df.drop("color", "text_color", "readable")
     if isave:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -825,6 +1353,7 @@ def lcz_cal_area(
         df=df_out,
         fig=fig,
         geoarrow_table=geoarrow_table,
+        renderer=renderer,
     )
 
 

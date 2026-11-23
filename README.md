@@ -22,6 +22,30 @@ from LCZ4py import lcz_get_map, lcz_plot_map, lcz_get_parameters
 map_path = lcz_get_map(city="Berlin", isave_map=True)
 ```
 
+### Plotting
+
+Every figure-producing function defaults to a **native static renderer**
+(matplotlib/Agg). It writes PNG/PDF/SVG/TIFF at ≥300 dpi and never needs
+Plotly, Kaleido, Chromium or a browser:
+
+```python
+from LCZ4py import lcz_plot_map
+
+result = lcz_plot_map("berlin_lcz.tif", isave=True)   # -> LCZ4r_output/lcz_plot_map.png
+result.show()                                          # matplotlib figure
+
+# Opt in to the interactive Plotly renderer:
+interactive = lcz_plot_map("berlin_lcz.tif", renderer="plotly")
+interactive.show()
+```
+
+`renderer=` is accepted by `lcz_plot_map`, `lcz_plot_parameters`,
+`lcz_cal_area`, `lcz_cal_indices`, `lcz_cal_indexes`,
+`plot_lcz_relationship`, `lcz_ts`, `lcz_anomaly`, `lcz_uhi_intensity`,
+`lcz_uhi_surface`, `lcz_dtr`, `lcz_degree_hours`, `lcz_utci`,
+`lcz_anthropogenic_heat`, `lcz_plot_interp` and `lcz_variogram`.
+Aliases `None`, `"matplotlib"` and `"agg"` mean `"static"`.
+
 ## Tutorials
 
 Two Colab notebook series — `general/` (raster-wide LCZ map operations) and `local/` (station/point-based

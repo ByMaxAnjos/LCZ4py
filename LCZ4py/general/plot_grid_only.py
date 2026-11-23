@@ -15,8 +15,11 @@ Cartography
   away from the equator.
 - Colorblind-safe colormaps by default (``viridis``); diverging variables can
   use ``RdBu``/``BrBG``.
-- 300 dpi output with ``style="nature"``/``"science"``/``"generic_bw"`` or
-  ``dpi=300``.
+- Native matplotlib/Agg output only (``renderer="static"``, also ``None``/
+  ``"matplotlib"``/``"agg"``), sized and styled through the shared
+  ``_internal/lcz_static`` helpers. 300 dpi is the export floor for every
+  style preset (``dpi=`` can raise it further); ``save_extension="html"`` is
+  coerced to PNG because matplotlib cannot write HTML.
 """
 
 from __future__ import annotations
@@ -44,9 +47,9 @@ from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import (
     OUTPUT_DIR,
     _nice_scale_length,
-    finalize_export,
     get_style,
 )
+from LCZ4py._internal import lcz_static as _st
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +240,7 @@ def plot_grid_only(
     dpi: Optional[int] = None,
     basemap_zoom: Optional[int] = None,
     save_filename: str = "lcz_plot_grid",
+    renderer: Optional[str] = "static",
 ) -> "plt.Figure":
     """Plot a grid/mesh GeoDataFrame over a contextily basemap.
 
@@ -298,12 +302,16 @@ def plot_grid_only(
         Override the basemap credit line. Defaults to the provider's own
         attribution (e.g. "© OpenStreetMap contributors © CARTO").
     dpi : int, optional
-        Export resolution. Defaults to the ``style`` preset's DPI (150 for
-        'default', 300 for the journal presets). Pass 300 for print.
+        Export resolution. Defaults to 300 dpi — the static floor; the style
+        preset's own DPI is used when higher (300 for the journal presets).
     basemap_zoom : int, optional
         Force a contextily zoom level instead of letting it auto-select.
     save_filename : str
         Base filename (no extension) when ``isave``.
+    renderer : {"static"}, optional
+        This function renders with matplotlib only. "static" (default, also
+        ``None``/``"matplotlib"``/``"agg"``) is the accepted value; any other
+        backend raises ``ValueError``.
 
     Returns
     -------
@@ -316,6 +324,14 @@ def plot_grid_only(
     ...                      units="hab/km²", style="nature", isave=True)
     """
     import geopandas as gpd
+
+    # matplotlib-only function: accept the static aliases, reject other backends.
+    resolved = _st.resolve_renderer(renderer)
+    if resolved != "static":
+        raise ValueError(
+            "plot_grid_only renders with matplotlib only; use renderer='static' "
+            f"(got {renderer!r})."
+        )
 
     if not isinstance(grid, gpd.GeoDataFrame):
         raise TypeError(
@@ -332,6 +348,10 @@ def plot_grid_only(
             "plot_grid_bad_color_by", lang,
             col=color_by, avail=", ".join(map(str, grid.columns)),
         ))
+    if save_extension.lower().lstrip(".") == "html":
+        # matplotlib cannot write HTML; fall back to the static PNG default.
+        logger.info("Static renderer cannot write HTML; saving PNG instead.")
+        save_extension = "png"
     if isave and save_extension.lower() not in _MPL_EXTENSIONS:
         raise ValueError(
             f"save_extension={save_extension!r} is not a matplotlib format. "
@@ -339,7 +359,8 @@ def plot_grid_only(
         )
 
     spec = get_style(style, lang)
-    export_dpi = int(dpi) if dpi else spec.dpi
+    # 300 dpi floor for every style preset (an explicit ``dpi`` can raise it).
+    export_dpi = _st.target_dpi(style, dpi)
 
     if figsize is None:
         figsize = (spec.width_mm["single"] / 25.4, spec.width_mm["single"] / 25.4)
@@ -354,7 +375,7 @@ def plot_grid_only(
 
     cmap_name = _resolve_cmap(cmap, lang)
 
-    with plt.rc_context(spec.mpl_rcparams):
+    with _st.style_context(style):
         fig, ax = plt.subplots(figsize=figsize)
         fig.set_dpi(export_dpi)
         try:
@@ -519,22 +540,19 @@ def plot_grid_only(
         except Exception:  # pragma: no cover - constrained layouts
             pass
 
-        if isave and export_dpi != spec.dpi:
-            # ``finalize_export`` saves at the preset DPI; honour an explicit
-            # override while reusing the same preset styling and output dir.
-            fig = finalize_export(
-                fig, style=style, isave=False, save_extension=save_extension,
-                filename=save_filename, lang=lang,
-            )
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            save_path = os.path.join(OUTPUT_DIR, f"{save_filename}.{save_extension}")
-            fig.savefig(save_path, dpi=export_dpi, bbox_inches="tight")
-            logger.info("Saved: %s", os.path.abspath(save_path))
-        else:
-            fig = finalize_export(
-                fig, style=style, isave=isave, save_extension=save_extension,
-                filename=save_filename, lang=lang,
-            )
+        if isave:
+            ext = save_extension.lower().lstrip(".")
+            if ext in ("ps", "eps"):  # not in lcz_static's validated set
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                save_path = os.path.join(OUTPUT_DIR, f"{save_filename}.{ext}")
+                fig.savefig(save_path, dpi=export_dpi, bbox_inches="tight")
+                logger.info("Saved: %s", os.path.abspath(save_path))
+            else:
+                # Shared static exporter: >=300 dpi, tight bbox, white ground.
+                _st.save_static(
+                    fig, save_filename, isave=True, save_extension=ext,
+                    style=style, dpi=export_dpi, lang=lang,
+                )
 
     return fig
 

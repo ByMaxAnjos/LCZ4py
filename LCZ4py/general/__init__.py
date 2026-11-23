@@ -12,6 +12,7 @@ from .lcz_get_lst import *  # noqa: F401,F403
 from .lcz_get_planetary_computer import *  # noqa: F401,F403
 from .lcz_get_indices import *  # noqa: F401,F403
 from .lcz_cal_indices import *  # noqa: F401,F403
+from .lcz_get_meta_tree import lcz_get_meta_tree
 from .lcz_get_ucp import lcz_get_ucp, UrbanParameterProcessor
 from .lcz_cal_indexes import lcz_cal_indexes, LCZIndexesResult
 from .lcz_grid_chirps import lcz_grid_chirps
@@ -54,6 +55,7 @@ __all__ = [
     "INDEX_FORMULAS",
     "lcz_cal_indices",
     "LCZIndicesStatsResult",
+    "lcz_get_meta_tree",
     "lcz_get_ucp",
     "UrbanParameterProcessor",
     "lcz_cal_indexes",

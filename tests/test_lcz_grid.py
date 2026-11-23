@@ -317,7 +317,9 @@ def test_plot_lcz_relationship_box(tmp_path):
                         dtype="float64", crs="EPSG:4326", transform=transform) as dst:
         dst.write(temp, 1)
 
-    fig = plot_lcz_relationship(lcz_path, temp_path, variable_name="Temp", plot_type="heatmap")
+    fig = plot_lcz_relationship(
+        lcz_path, temp_path, variable_name="Temp", plot_type="heatmap", renderer="plotly",
+    )
     z = fig.data[0].z[0]
     assert list(z) == sorted(z, reverse=True)  # higher LCZ id -> lower temp, by construction
 

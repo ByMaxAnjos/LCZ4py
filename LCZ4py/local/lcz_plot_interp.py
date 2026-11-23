@@ -2,10 +2,14 @@
 lcz_plot_interp.py — publication-ready visualisation for interpolated rasters.
 
 Renders multi-band GeoTIFFs (e.g. from lcz_interp_map, lcz_anomaly_map or
-lcz_interp_map_plus) as interactive Plotly heatmaps on real map coordinates,
-with per-band dropdown menus and a single shared colourbar carrying the
-variable units.  Rasters exceeding 4 M pixels are pre-rendered with Datashader
-when it is installed.
+lcz_interp_map_plus) on real map coordinates, with a single shared colourbar
+carrying the variable units.  On the Plotly path, rasters exceeding 4 M pixels
+are pre-rendered with Datashader when it is installed.
+
+The default renderer is the native static matplotlib/Agg backend
+(``renderer="static"``): one 300 dpi PNG/PDF/SVG/TIFF written directly, with
+no Plotly, Kaleido, Chromium or browser.  ``renderer="plotly"`` keeps the
+original interactive figure with per-band dropdown menus.
 
 Cartography follows :mod:`LCZ4py._internal.lcz_theme`: colourbar-safe palettes,
 300 dpi journal presets (``style=``), and a north arrow + scale bar on
@@ -39,6 +43,8 @@ except Exception:  # ImportError, or a broken datashader install
     HAS_DATASHADER = False
 
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 from LCZ4py._internal.lcz_theme import (
     add_map_furniture, finalize_export, get_style,
 )
@@ -80,6 +86,28 @@ def _resolve_palette(name: str) -> list[str]:
         )
         key = "muted"
     return _PALETTES[key]
+
+
+# Matplotlib's equivalents of the palettes above.  Same perceptual ordering and
+# the same colour-vision-deficiency safety, so static and Plotly output agree.
+_MPL_PALETTES: dict[str, str] = {
+    "muted": "RdBu",
+    "high": "viridis",
+    "viridi": "cividis",
+    "deep": "Blues",
+}
+
+
+def _mpl_palette_name(name: str) -> str:
+    """Map a palette name to the equivalent registered matplotlib colormap."""
+    key = _PALETTE_ALIASES.get(str(name).lower(), str(name))
+    if key not in _MPL_PALETTES:
+        logger.warning(
+            "Unknown palette '%s' — using 'muted'. Valid: %s",
+            name, ", ".join(sorted(list(_MPL_PALETTES) + list(_PALETTE_ALIASES))),
+        )
+        key = "muted"
+    return _MPL_PALETTES[key]
 
 
 def _colorscale(name: str, reverse: bool = False) -> list[tuple[float, str]]:
@@ -164,8 +192,10 @@ def lcz_plot_interp(
     facet: bool = False,
     percentile_clip: Optional[tuple[float, float]] = None,
     max_workers: Optional[int] = None,
-) -> go.Figure:
-    """Render an interpolated raster stack as an interactive Plotly figure.
+    dpi: Optional[int] = None,
+    renderer: Optional[str] = "static",
+) -> object:
+    """Render an interpolated raster stack as a publication-ready figure.
 
     Parameters
     ----------
@@ -181,7 +211,10 @@ def lcz_plot_interp(
     isave : bool
         Save the figure to ``LCZ4r_output/``.
     save_extension : str
-        ``"html"`` (interactive) or ``"png"``/``"pdf"`` (static).
+        Static output format: ``"png"`` (default), ``"pdf"``, ``"svg"``,
+        ``"tiff"``/``"tif"``, ``"jpg"``/``"jpeg"`` or ``"webp"``. ``"html"``
+        is only meaningful for ``renderer="plotly"`` and is coerced to
+        ``"png"`` for the static renderer.
     style : str
         Publication style preset: 'default', 'nature', 'science', or
         'generic_bw'. Controls font, figure size (mm), DPI, and palette
@@ -211,10 +244,20 @@ def lcz_plot_interp(
         outliers from flattening the map.  ``None`` uses the full data range.
     max_workers : int, optional
         Thread workers for per-band preparation (default ``min(8, cpu_count)``).
+    dpi : int, optional
+        Export resolution; never below 300 dpi for static output.
+    renderer : {"static", "plotly"}, optional
+        ``"static"`` (default, also ``None``/``"matplotlib"``/``"agg"``)
+        returns a matplotlib ``Figure`` and writes a native file with no
+        Plotly/Kaleido dependency. ``"plotly"`` returns the original
+        interactive figure with the per-band dropdown menus.
 
     Returns
     -------
+    matplotlib.figure.Figure
+        Static renderer (default).
     go.Figure
+        ``renderer="plotly"``.
     """
     if x is None:
         raise ValueError("x is required.")
@@ -222,6 +265,8 @@ def lcz_plot_interp(
         raise ValueError("direction must be 1 or -1.")
     if percentile_clip is not None and len(percentile_clip) != 2:
         raise ValueError("percentile_clip must be a (low, high) percentile pair.")
+
+    renderer = resolve_renderer(renderer)
 
     bounds = None
     crs = None
@@ -292,6 +337,29 @@ def lcz_plot_interp(
     n_sym = sum(1 for _i, _b, _v0, _v1, sym in prepared if sym)
     if n_sym:
         logger.info("%d band(s) plotted on a symmetric (zero-centred) scale.", n_sym)
+
+    if renderer == "static":
+        return _plot_interp_static(
+            prepared,
+            labels,
+            palette=palette,
+            direction=direction,
+            units=units,
+            title=title,
+            caption=caption,
+            bounds=bounds,
+            crs=crs,
+            style=style,
+            dpi=dpi,
+            isave=isave,
+            save_extension=save_extension,
+            lang=lang,
+            facet=facet,
+            add_scalebar=add_scalebar,
+            add_north_arrow=add_north_arrow,
+            height=height,
+            width=width,
+        )
 
     use_ds = HAS_DATASHADER and not facet and height * width > 4_000_000
     if use_ds:
@@ -438,6 +506,249 @@ def lcz_plot_interp(
 
     fig = finalize_export(fig, style=style, isave=isave, save_extension=save_extension,
                           filename="lcz_interp_map", lang=lang)
+
+    return fig
+
+
+# ── Native static (matplotlib/Agg) renderer ──────────────────────────────────
+
+def _pixel_axes(ax) -> None:
+    """Label a non-georeferenced raster axes in pixel indices."""
+    ax.set_xlabel("Column")
+    ax.set_ylabel("Row")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.tick_params(length=0)
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _static_map_furniture(
+    ax,
+    extent: tuple,
+    crs,
+    *,
+    add_scalebar: bool = True,
+    add_north_arrow: bool = True,
+) -> bool:
+    """Axis labels + scale bar + north arrow for a georeferenced panel.
+
+    Calls the individual :mod:`lcz_static` helpers rather than
+    ``add_map_furniture_mpl``, whose ``add_scalebar``/``add_north_arrow``
+    keyword arguments shadow the module-level functions of the same name
+    (same workaround as ``lcz_plot_map._create_static_map``).
+    """
+    st = lcz_static
+    is_geo = st.apply_map_axes(ax, extent, crs)
+    if add_scalebar:
+        st.add_scalebar(ax, st.metric_width(extent, crs), is_geo)
+    if add_north_arrow and not is_geo:
+        st.add_north_arrow(ax)
+    return is_geo
+
+
+def _plot_interp_static(
+    prepared: list,
+    labels: list[str],
+    *,
+    palette: str,
+    direction: int,
+    units: Optional[str],
+    title: Optional[str],
+    caption: Optional[str],
+    bounds,
+    crs,
+    style: str,
+    dpi: Optional[int],
+    isave: bool,
+    save_extension: str,
+    lang: str,
+    facet: bool,
+    add_scalebar: bool,
+    add_north_arrow: bool,
+    height: int,
+    width: int,
+):
+    """Draw the interpolated stack with matplotlib (no Plotly/Kaleido needed).
+
+    ``facet=False`` draws the first band on its own (the Plotly renderer uses a
+    dropdown for the rest); ``facet=True`` draws every band as a small-multiple
+    grid sharing one colourbar.
+    """
+    st = lcz_static
+
+    n = len(prepared)
+    unit_suffix = f" [{units}]" if units else ""
+    mpl_palette = _mpl_palette_name(palette)
+    colorscale = f"{mpl_palette}_r" if direction == -1 else mpl_palette
+    chart_title = title or lcz_msg("lcz_interp_map_title", lang)
+
+    if bounds is not None:
+        xmin, ymin, xmax, ymax = (float(v) for v in bounds)
+        extent = (xmin, xmax, ymin, ymax)
+    else:
+        extent = (0.0, float(width), 0.0, float(height))
+    aspect = height / max(width, 1)
+    is_geo = bool(getattr(crs, "is_geographic", False)) if crs is not None else False
+
+    with st.style_context(style):
+        if facet:
+            ncols = 2 if n > 1 else 1
+            nrows = int(np.ceil(n / ncols))
+
+            # One colourbar for the whole grid when the per-band limits are
+            # comparable; otherwise keep each panel's own scaling and give it
+            # its own colourbar (a pooled scale would flatten the panels).
+            ranges = [(v0, v1) for _i, _b, v0, v1, _s in prepared]
+            vmin_shared = min(r[0] for r in ranges)
+            vmax_shared = max(r[1] for r in ranges)
+            all_sym = all(bool(s) for _i, _b, _v0, _v1, s in prepared)
+            if all_sym:
+                m = max(abs(vmin_shared), abs(vmax_shared))
+                vmin_shared, vmax_shared = -m, m
+            widest = max((v1 - v0 for v0, v1 in ranges), default=1.0) or 1.0
+            share_scale = (vmax_shared - vmin_shared) <= 1.25 * widest
+            if not share_scale:
+                logger.info(
+                    "Band ranges differ widely — drawing one colourbar per "
+                    "panel instead of a pooled shared scale.",
+                )
+
+            _unused_spec, base_w, _unused_h = st.figure_dims(style)
+            fig, spec, _ = st.new_figure(
+                style,
+                height_mm=(base_w / ncols) * aspect * nrows + 20.0,
+                dpi=dpi,
+            )
+            if share_scale:
+                fig.subplots_adjust(
+                    left=0.09, right=0.85, bottom=0.17,
+                    top=0.84 if nrows > 1 else 0.80,
+                    wspace=0.16, hspace=0.30,
+                )
+            else:
+                # Leave a gutter between panels for their own colourbars.
+                fig.subplots_adjust(
+                    left=0.08, right=0.80, bottom=0.17,
+                    top=0.84 if nrows > 1 else 0.80,
+                    wspace=0.50, hspace=0.34,
+                )
+
+            panel_axes = []
+            panels = []
+            for i, band, v0, v1, _sym in prepared:
+                ax = fig.add_subplot(nrows, ncols, i + 1)
+                image = st.plot_continuous_raster(
+                    ax, band, extent, colorscale=colorscale,
+                )
+                image.set_clim(
+                    vmin_shared if share_scale else v0,
+                    vmax_shared if share_scale else v1,
+                )
+                ax.set_title(
+                    f"{labels[i]}{unit_suffix}",
+                    fontsize=max(6, spec.font_size - 1),
+                    pad=3,
+                )
+                if bounds is not None:
+                    st.apply_map_axes(ax, extent, crs)
+                    if i == 0:
+                        if add_scalebar:
+                            st.add_scalebar(
+                                ax, st.metric_width(extent, crs), is_geo,
+                            )
+                        if add_north_arrow and not is_geo:
+                            st.add_north_arrow(ax)
+                else:
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    ax.tick_params(length=0)
+                panel_axes.append(ax)
+                panels.append(image)
+
+            if share_scale:
+                from matplotlib.cm import ScalarMappable
+                from matplotlib.colors import Normalize
+
+                sm = ScalarMappable(
+                    norm=Normalize(vmin_shared, vmax_shared),
+                    cmap=st.mpl_cmap(colorscale),
+                )
+                sm.set_array(np.array([]))
+                cb = fig.colorbar(
+                    sm, ax=panel_axes, fraction=0.03, pad=0.02, shrink=0.92,
+                )
+                cb.set_label(units or "Value", fontsize=spec.font_size)
+                cb.ax.tick_params(labelsize=max(6, spec.font_size - 1))
+                cb.outline.set_linewidth(0.6)
+            else:
+                for image in panels:
+                    cb = fig.colorbar(
+                        image, fraction=0.035, pad=0.02, shrink=0.85,
+                    )
+                    cb.set_label(units or "Value", fontsize=max(5.5, spec.font_size - 1))
+                    cb.ax.tick_params(labelsize=max(5.5, spec.font_size - 2))
+                    cb.outline.set_linewidth(0.6)
+
+            st.add_header(fig, chart_title, f"{n} panel(s)", spec)
+            st.add_footer(fig, caption, None, spec)
+            st.save_static(
+                fig,
+                "lcz_interp_map",
+                isave=isave,
+                save_extension=save_extension,
+                style=style,
+                dpi=dpi,
+                lang=lang,
+            )
+            return fig
+
+        # ── Single panel ────────────────────────────────────────────────────
+        _i0, band0, vmin0, vmax0, _sym0 = prepared[0]
+        if n > 1:
+            logger.info(
+                "Static renderer draws band 1 of %d ('%s'); use facet=True to "
+                "show every band.", n, labels[0],
+            )
+
+        fig, spec, _ = st.new_figure(
+            style, aspect=aspect, extra_height_mm=18.0, dpi=dpi,
+        )
+        ax = st.add_axes(fig, bottom=0.16, top=st.figure_top(True))
+
+        image = st.plot_continuous_raster(
+            ax, band0, extent, colorscale=colorscale,
+        )
+        image.set_clim(vmin0, vmax0)
+
+        if bounds is not None:
+            _static_map_furniture(
+                ax, extent, crs,
+                add_scalebar=add_scalebar,
+                add_north_arrow=add_north_arrow,
+            )
+        else:
+            _pixel_axes(ax)
+
+        st.add_colorbar(
+            fig, ax, image,
+            units=f"{labels[0]}{unit_suffix}",
+            fontsize=spec.font_size,
+        )
+        st.add_header(
+            fig, chart_title,
+            f"Band 1 of {n}" if n > 1 else None,
+            spec,
+        )
+        st.add_footer(fig, caption, None, spec)
+        st.save_static(
+            fig,
+            "lcz_interp_map",
+            isave=isave,
+            save_extension=save_extension,
+            style=style,
+            dpi=dpi,
+            lang=lang,
+        )
 
     return fig
 

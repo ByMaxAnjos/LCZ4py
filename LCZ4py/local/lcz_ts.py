@@ -1,10 +1,16 @@
 """
 lcz_ts.py — LCZ-stratified time-series visualisation.
 
+Rendering backends
+------------------
+- ``renderer="static"`` *(default)* — native matplotlib/Agg figure saved as a
+  300 dpi PNG/PDF/SVG/TIFF. No Plotly, Kaleido, Chromium or browser needed.
+- ``renderer="plotly"`` — the interactive WebGL (Scattergl) figure.
+
 Handles large datasets efficiently:
 - Polars groupby for time averaging and per-station partitioning (no per-station
   boolean-filter loops)
-- Plotly WebGL (Scattergl) for smooth panning/zooming
+- Plotly WebGL (Scattergl) for smooth panning/zooming (``renderer="plotly"``)
 - Automatic 10× decimation when a single station exceeds 100k points
 - Line breaks at data gaps (never draws a straight line across missing days)
 """
@@ -13,12 +19,16 @@ from __future__ import annotations
 import datetime as _dt_mod
 import logging
 import os
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import polars as pl
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import rasterio
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from matplotlib.figure import Figure
 
 try:
     import datashader as ds  # noqa: F401 - optional, kept for API parity
@@ -37,6 +47,8 @@ from LCZ4py._internal.lcz_ts_utils import (
 from LCZ4py.general.lcz_plot_parameters import _palette_to_plotly_colorscale
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import finalize_export
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +277,334 @@ def _plot_daylight_unified(
     return fig
 
 
+# ── Native static renderer (matplotlib/Agg — no Plotly/Kaleido/Chromium) ─────
+
+def _mpl_color(value: str) -> str:
+    """Convert a Plotly ``rgb()``/``rgba()`` colour to a matplotlib hex string."""
+    text = str(value).strip()
+    if text.lower().startswith("rgb"):
+        try:
+            inside = text[text.index("(") + 1: text.rindex(")")]
+            r, g, b = (float(p) for p in inside.split(",")[:3])
+            return "#{:02x}{:02x}{:02x}".format(
+                max(0, min(255, int(round(r)))),
+                max(0, min(255, int(round(g)))),
+                max(0, min(255, int(round(b)))),
+            )
+        except (TypeError, ValueError):
+            return "#666666"
+    return text
+
+
+def _mpl_date_numbers(values) -> np.ndarray:
+    """datetime64/datetime/None sequence → matplotlib date numbers (NaN gaps)."""
+    import datetime as _dt
+    import matplotlib.dates as mdates
+
+    out = np.full(len(values), np.nan, dtype=float)
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        if isinstance(v, np.datetime64):
+            v = v.astype("datetime64[us]").astype(_dt.datetime)
+        elif isinstance(v, _dt.date) and not isinstance(v, _dt.datetime):
+            v = _dt.datetime(v.year, v.month, v.day)
+        out[i] = mdates.date2num(v)
+    return out
+
+
+def _readable(color: str, min_luminance: float = 0.62) -> str:
+    """Darken a near-white palette colour so a 1 px line stays visible."""
+    hex_ = str(color).lstrip("#")
+    if len(hex_) != 6:
+        return color
+    try:
+        r, g, b = (int(hex_[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return color
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+    if luminance <= min_luminance or luminance <= 0:
+        return color
+    scale = (min_luminance / luminance) * 0.94
+    r, g, b = (max(0, min(255, int(round(channel * scale)))) for channel in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _finite_float(values) -> np.ndarray:
+    """None-tolerant float conversion so gaps become NaN (a broken line)."""
+    return np.array([np.nan if v is None else float(v) for v in values], dtype=float)
+
+
+def _legend_bottom(fig, fontsize: float, rows: int, *, with_title: bool = True,
+                   xlabel: bool = True) -> float:
+    """Fraction of the figure height to reserve below the axes for a legend.
+
+    The legend is anchored at the figure's bottom edge, so the reserved space
+    must cover the legend's own height (rows + optional title) plus the x tick
+    labels/x label. Computed from the actual figure height so large "default"
+    fonts cannot grow into the x label.
+    """
+    fig_h = max(float(fig.get_figheight()), 0.5)
+    line_in = (float(fontsize) * 1.75) / 72.0
+    legend_in = max(int(rows), 0) * line_in + (0.22 if with_title else 0.12)
+    extra_in = 0.55 if xlabel else 0.18
+    return float(min(0.45, max(0.14, (legend_in + extra_in) / fig_h)))
+
+
+def _panel_axes(fig, n: int, *, has_header: bool, has_legend: bool,
+                gap: float = 0.05, right: float = 0.975,
+                bottom: Optional[float] = None, top_trim: float = 0.0):
+    """Stacked full-width axes inside ``fig`` (top panel first)."""
+    st = lcz_static
+    left = 0.115
+    top = st.figure_top(has_header) - float(top_trim)
+    bottom = st.figure_bottom(has_legend) if bottom is None else float(bottom)
+    n = max(int(n), 1)
+    span = max(top - bottom - gap * (n - 1), 0.10)
+    height = span / n
+    axes = []
+    for i in range(n):
+        bottom_i = top - (i + 1) * height - i * gap
+        axes.append(fig.add_axes([left, bottom_i, right - left, height]))
+    return axes
+
+
+def _static_ts_lines(
+    panels: list,
+    *,
+    title: Optional[str],
+    xlab: str,
+    ylab: str,
+    palette_name: str,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    caption: Optional[str] = None,
+    lang: str = "en",
+    isave: bool = False,
+    save_extension: str = "html",
+    filename: str = "lcz4r_ts_plot",
+    daylight: Optional[tuple] = None,
+):
+    """Publication-quality time-series figure (one axes per facet)."""
+    import matplotlib.dates as mdates
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    st = lcz_static
+    panels = list(panels) or [("", pl.DataFrame({"date": [], "var_interp": [], "station": []}))]
+    n = len(panels)
+
+    station_names: list[str] = []
+    for _, sub in panels:
+        for name in _partition_by_station(sub):
+            if name not in station_names:
+                station_names.append(name)
+    colors = dict(zip(
+        station_names,
+        [_readable(_mpl_color(c)) for c in _station_colors(station_names, palette_name)],
+    ))
+
+    ncol = min(max(len(station_names), 1), 4)
+    n_handles = len(station_names) + (1 if daylight is not None else 0)
+    legend_rows = max(1, -(-n_handles // ncol)) if n_handles else 0
+    height_mm = min(62.0 * n + 22.0 + 7.0 * max(legend_rows - 1, 0), 195.0)
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=height_mm, dpi=dpi)
+        axes = _panel_axes(
+            fig, n, has_header=bool(title), has_legend=bool(n_handles),
+            bottom=_legend_bottom(
+                fig, max(5.5, spec.font_size - 2.5), legend_rows,
+                with_title=bool(station_names),
+            ),
+            top_trim=0.03 if any(label for label, _ in panels) else 0.0,
+        )
+        label_size = max(6.0, spec.font_size - 1.5)
+        tick_size = max(5.5, spec.font_size - 2.5)
+
+        for idx, (ax, panel) in enumerate(zip(axes, panels)):
+            label, sub = panel
+            if label:
+                ax.set_title(str(label), fontsize=label_size, loc="left", pad=2.5)
+
+            if daylight is not None and not sub.is_empty():
+                lat, lon = daylight
+                unique_days = sorted({
+                    _dt_mod.date(d.year, d.month, d.day)
+                    for d in sub["date"].to_list() if d is not None
+                })
+                if len(unique_days) > _MAX_DAYLIGHT_RECTS // 2:
+                    logger.warning(
+                        "Daylight shading skipped in the static figure: %d days "
+                        "would need too many spans (limit %d).",
+                        len(unique_days), _MAX_DAYLIGHT_RECTS,
+                    )
+                else:
+                    for day, intervals in zip(
+                        unique_days,
+                        _daylight_intervals_batch(lat, lon, unique_days),
+                    ):
+                        base = _dt_mod.datetime(day.year, day.month, day.day)
+                        for rise_h, set_h in intervals:
+                            ax.axvspan(
+                                mdates.date2num(base + _dt_mod.timedelta(hours=rise_h)),
+                                mdates.date2num(base + _dt_mod.timedelta(hours=set_h)),
+                                color="#FFC832", alpha=0.20, lw=0, zorder=0,
+                            )
+
+            for name in _partition_by_station(sub):
+                part = sub.filter(pl.col("station") == name).sort("date")
+                if part.is_empty():
+                    continue
+                if part.height > _MAX_POINTS_PER_STATION:
+                    part = part.gather_every(_DECIMATION)
+                dates_np = part["date"].to_numpy()
+                vals_np = part["var_interp"].to_numpy()
+                d_plot, v_plot = _break_gaps_numpy(
+                    dates_np, vals_np, gap_threshold_hours(dates_np)
+                )
+                ax.plot(
+                    _mpl_date_numbers(d_plot), _finite_float(v_plot),
+                    color=colors.get(name, "#666666"), lw=0.9, zorder=3,
+                )
+
+            ax.set_ylabel(ylab, fontsize=label_size)
+            ax.grid(True, axis="y", lw=0.35, color="0.88", zorder=0)
+            ax.set_axisbelow(True)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            locator = mdates.AutoDateLocator(minticks=3, maxticks=7)
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            ax.tick_params(axis="both", labelsize=tick_size, length=3, width=0.6)
+            if idx == n - 1:
+                ax.set_xlabel(xlab, fontsize=label_size)
+            else:
+                ax.tick_params(axis="x", labelbottom=False)
+
+        handles = [
+            Line2D([], [], color=colors[name], lw=1.2, label=name)
+            for name in station_names
+        ]
+        if daylight is not None:
+            handles.append(Patch(facecolor="#FFC832", alpha=0.55, label="Daytime"))
+        if handles:
+            fig.legend(
+                handles=handles,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.008),
+                ncol=ncol,
+                frameon=False,
+                fontsize=tick_size,
+                handlelength=1.4,
+                columnspacing=1.1,
+                title=lcz_msg("lcz_class_legend", lang) if station_names else None,
+                title_fontsize=tick_size,
+            )
+
+        st.add_header(fig, title, None, spec)
+        st.add_footer(fig, caption, None, spec)
+        st.save_static(
+            fig, filename, isave=isave, save_extension=save_extension,
+            style=style, dpi=dpi, lang=lang,
+        )
+    return fig
+
+
+def _static_ts_heatmap(
+    df: pl.DataFrame,
+    facet_var: str,
+    *,
+    title: Optional[str],
+    xlab: str,
+    ylab: str,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    caption: Optional[str] = None,
+    lang: str = "en",
+    isave: bool = False,
+    save_extension: str = "html",
+    filename: str = "lcz4r_ts_plot",
+    colorscale: str = "Viridis",
+):
+    """Date × facet heatmap (time on x, one LCZ/facet per row)."""
+    import matplotlib.dates as mdates
+
+    st = lcz_static
+    raw_facets = df[facet_var].unique().to_list()
+
+    def _facet_key(value):
+        text = str(value)
+        try:
+            return (0, float(text), "")
+        except ValueError:
+            return (1, 0.0, text)
+
+    facets = [str(f) for f in sorted(raw_facets, key=_facet_key)]
+    rows = []
+    all_dates: set = set()
+    for facet in facets:
+        sub = df.filter(pl.col(facet_var).cast(pl.String) == facet).sort("date")
+        dates = sub["date"].to_list()
+        rows.append((facet, dates, sub["var_interp"].to_numpy()))
+        all_dates.update(dates)
+
+    dates_sorted = sorted(all_dates)
+    col_of = {d: i for i, d in enumerate(dates_sorted)}
+    matrix = np.full((len(facets), len(dates_sorted)), np.nan, dtype=float)
+    for i, (_, dates, values) in enumerate(rows):
+        for d, v in zip(dates, values):
+            if v is not None:
+                matrix[i, col_of[d]] = float(v)
+
+    xnum = _mpl_date_numbers(dates_sorted)
+    if xnum.size >= 2:
+        edges = np.concatenate([
+            [xnum[0] - (xnum[1] - xnum[0]) / 2.0],
+            (xnum[:-1] + xnum[1:]) / 2.0,
+            [xnum[-1] + (xnum[-1] - xnum[-2]) / 2.0],
+        ])
+    elif xnum.size == 1:
+        edges = np.array([xnum[0] - 0.5, xnum[0] + 0.5])
+    else:  # pragma: no cover - guarded by the caller's non-empty check
+        edges = np.array([0.0, 1.0])
+
+    finite = matrix[np.isfinite(matrix)]
+    vmin, vmax = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
+    if vmin == vmax:
+        vmin, vmax = vmin - 0.5, vmax + 0.5
+
+    height_mm = min(13.0 * max(len(facets), 1) + 45.0, 195.0)
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=height_mm, dpi=dpi)
+        axes = _panel_axes(fig, 1, has_header=bool(title), has_legend=False, right=0.88)
+        ax = axes[0]
+
+        mesh = ax.pcolormesh(
+            edges, np.arange(len(facets) + 1), matrix, shading="flat",
+            cmap=st.mpl_cmap(colorscale), vmin=vmin, vmax=vmax,
+        )
+        ax.set_yticks(np.arange(len(facets)) + 0.5)
+        ax.set_yticklabels(facets, fontsize=max(5.5, spec.font_size - 2.5))
+        ax.invert_yaxis()
+        ax.set_xlabel(xlab, fontsize=max(6.0, spec.font_size - 1.5))
+        locator = mdates.AutoDateLocator(minticks=3, maxticks=7)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2.5),
+                       length=3, width=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+
+        st.add_colorbar(fig, ax, mesh, units=ylab, fontsize=spec.font_size)
+        st.add_header(fig, title, None, spec)
+        st.add_footer(fig, caption, None, spec)
+        st.save_static(
+            fig, filename, isave=isave, save_extension=save_extension,
+            style=style, dpi=dpi, lang=lang,
+        )
+    return fig
+
+
 def _parse_time_freq(time_freq: str) -> str:
     """Translate the public ``time_freq`` value into a Polars duration."""
     freq_map = {
@@ -303,7 +643,9 @@ def lcz_ts(
     caption: Optional[str] = None,
     lang: str = "en",
     year=None, month=None, day=None, hour=None, start=None, end=None,
-) -> Union[go.Figure, pl.DataFrame]:
+    renderer: Optional[str] = "static",
+    dpi: Optional[int] = None,
+) -> Union[go.Figure, pl.DataFrame, "Figure"]:
     """Render LCZ-stratified time-series charts.
 
     Parameters
@@ -354,10 +696,21 @@ def lcz_ts(
         Date/time component filters (validated; out-of-range values raise).
     start, end : str or datetime, optional
         Inclusive date range bounds.
+    renderer : {"static", "plotly"}, optional
+        ``"static"`` (default, also ``None``/``"matplotlib"``/``"agg"``)
+        returns a matplotlib ``Figure`` drawn with the Agg canvas — no Plotly,
+        Kaleido, Chromium or browser needed — and saves a >=300 dpi PNG (or
+        PDF/SVG/TIFF) via ``lcz_static.save_static``. ``"plotly"`` returns the
+        interactive WebGL figure.
+    dpi : int, optional
+        Export resolution for the static renderer (never below 300 dpi).
 
     Returns
     -------
-    go.Figure or pl.DataFrame
+    matplotlib.figure.Figure, go.Figure or pl.DataFrame
+        A matplotlib ``Figure`` for the default static renderer, a Plotly
+        ``go.Figure`` for ``renderer="plotly"``, or the averaged DataFrame
+        when ``iplot=False``.
 
     Raises
     ------
@@ -377,6 +730,8 @@ def lcz_ts(
             f"plot_type={plot_type!r} with by= is not supported; use 'basic_line'."
         )
 
+    renderer = resolve_renderer(renderer)
+    static = renderer == "static"
     freq = _parse_time_freq(time_freq)
 
     df = normalise_input_df(data_frame, var=var, station_id=station_id)
@@ -412,10 +767,19 @@ def lcz_ts(
         )
         if not iplot:
             return avg.sort(["station", "date"])
-        fig = _plot_daylight_unified(
-            avg, palette, chart_title, x_label, y_label,
-            lat=lat_mean, lon=lon_mean, lang=lang,
-        )
+        if static:
+            fig = _static_ts_lines(
+                [("", avg.sort(["station", "date"]))],
+                title=chart_title, xlab=x_label, ylab=y_label,
+                palette_name=palette, style=style, dpi=dpi, caption=caption,
+                lang=lang, isave=isave, save_extension=save_extension,
+                daylight=(lat_mean, lon_mean),
+            )
+        else:
+            fig = _plot_daylight_unified(
+                avg, palette, chart_title, x_label, y_label,
+                lat=lat_mean, lon=lon_mean, lang=lang,
+            )
 
     elif by is not None:
         df = add_by_column(df, by, lat=lat_mean, lon=lon_mean)
@@ -429,9 +793,17 @@ def lcz_ts(
         groups = by_sorted_groups(avg["_by"], by)
         if not groups:
             raise ValueError(f"by={by!r} produced no groups for this dataset.")
-        fig = _faceted_line_fig(
-            avg, groups, palette, chart_title, x_label, y_label, lang
-        )
+        if static:
+            fig = _static_ts_lines(
+                [(g, avg.filter(pl.col("_by") == g)) for g in groups],
+                title=chart_title, xlab=x_label, ylab=y_label,
+                palette_name=palette, style=style, dpi=dpi, caption=caption,
+                lang=lang, isave=isave, save_extension=save_extension,
+            )
+        else:
+            fig = _faceted_line_fig(
+                avg, groups, palette, chart_title, x_label, y_label, lang
+            )
 
     else:
         avg = (
@@ -442,12 +814,38 @@ def lcz_ts(
         if not iplot:
             return avg.sort(["station", "date"])
         if plot_type == "basic_line":
-            fig = _plot_basic_line(avg, palette, chart_title, x_label, y_label, lang)
+            if static:
+                fig = _static_ts_lines(
+                    [("", avg.sort(["station", "date"]))],
+                    title=chart_title, xlab=x_label, ylab=y_label,
+                    palette_name=palette, style=style, dpi=dpi, caption=caption,
+                    lang=lang, isave=isave, save_extension=save_extension,
+                )
+            else:
+                fig = _plot_basic_line(avg, palette, chart_title, x_label, y_label, lang)
         else:
             facet_col = facet_plot.lower() if facet_plot.lower() in avg.columns else facet_plot
-            fig = _plot_heatmap(
-                avg, facet_col, palette, chart_title, x_label, y_label, lang
-            )
+            if facet_col not in avg.columns:
+                raise ValueError(
+                    f"facet_plot={facet_col!r} is not an aggregated column; "
+                    f"choose one of {sorted(avg.columns)}."
+                )
+            if avg.is_empty():
+                raise ValueError("No data to plot as a heatmap.")
+            if static:
+                fig = _static_ts_heatmap(
+                    avg, facet_col, title=chart_title, xlab=x_label, ylab=y_label,
+                    style=style, dpi=dpi, caption=caption, lang=lang,
+                    isave=isave, save_extension=save_extension,
+                )
+            else:
+                fig = _plot_heatmap(
+                    avg, facet_col, palette, chart_title, x_label, y_label, lang
+                )
+
+    if static:
+        # Captions and saving are handled inside the static builders.
+        return fig
 
     if caption:
         fig.add_annotation(

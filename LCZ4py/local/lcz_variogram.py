@@ -4,6 +4,10 @@ lcz_variogram.py — empirical semivariogram computation and theoretical model f
 Computes pairwise semivariances between stations, bins them into lag classes,
 and fits Spherical, Exponential, or Gaussian theoretical variogram models.
 
+The variogram figure is drawn with the native static matplotlib/Agg backend by
+default (``renderer="static"``) and saved at >=300 dpi without Plotly, Kaleido,
+Chromium or a browser; ``renderer="plotly"`` returns the interactive figure.
+
 Per-time-step empirical variograms are independent, so they are computed with
 a bounded ``ThreadPoolExecutor`` (``max_workers``) while results are
 re-assembled in deterministic (date) order.
@@ -34,6 +38,8 @@ from LCZ4py._internal.lcz_ts_utils import (
     normalise_missing, select_by_date, utm_epsg_for,
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 from LCZ4py._internal.lcz_theme import finalize_export, get_style
 
 logger = logging.getLogger(__name__)
@@ -122,13 +128,21 @@ class VariogramResult:
         Fitted model parameters: ``nugget``, ``sill``, ``range``, ``model_type``.
     r2 : float
         Coefficient of determination of the fitted model.
-    plot : go.Figure or None
-        Plotly figure with empirical scatter and fitted curve (if plotly is installed).
+    plot : matplotlib ``Figure`` (default static renderer) or Plotly
+        ``go.Figure`` (``renderer="plotly"``) with the empirical scatter and
+        fitted curve.
+    renderer : Which renderer produced ``plot`` ("static" or "plotly").
     """
     df: pl.DataFrame
     params: dict
     r2: float
     plot: Optional[object] = field(default=None, repr=False)
+    renderer: str = "static"
+
+    @property
+    def fig(self):
+        """Alias for ``plot`` (matches ``LCZPlotResult.fig`` elsewhere)."""
+        return self.plot
 
 
 _EMPTY_SCHEMA = {
@@ -139,9 +153,10 @@ _EMPTY_SCHEMA = {
 }
 
 
-def _empty_result() -> VariogramResult:
+def _empty_result(renderer: str = "static") -> VariogramResult:
     return VariogramResult(
         df=pl.DataFrame(schema=_EMPTY_SCHEMA), params={}, r2=0.0, plot=None,
+        renderer=renderer,
     )
 
 
@@ -301,12 +316,16 @@ def _build_variogram_plot(
     lang: str,
     style: str = "default",
     units: Optional[str] = None,
-) -> "go.Figure":
-    """Build a publication-ready Plotly figure (empirical scatter + fitted model).
+    renderer: str = "static",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
+    """Build a publication-ready figure (empirical scatter + fitted model).
 
     Colours come from the active :class:`~LCZ4py._internal.lcz_theme.StyleSpec`
     preset (no hardcoded LCZ palette), the point size scales with the number of
-    pairs in each bin, and the fitted parameters are reported in the legend.
+    pairs in each bin, and the fitted parameters are reported on the plot.
     """
     spec = get_style(style, lang)
     c_empirical = spec.colorway[1] if len(spec.colorway) > 1 else "#1f4e79"
@@ -319,6 +338,7 @@ def _build_variogram_plot(
 
     model_label = _MODEL_LABELS.get(params["model_type"], params["model_type"])
     var_label = f" [{units}]" if units else ""
+    total_sill = params["nugget"] + params["sill"]
     legend_text = (
         f"{model_label}: nugget={params['nugget']:.2f}{var_label}, "
         f"partial sill={params['sill']:.2f}{var_label}, "
@@ -330,6 +350,14 @@ def _build_variogram_plot(
     scale = np.sqrt(np.maximum(counts, 1.0))
     scale = scale / scale.max() if scale.max() > 0 else np.ones_like(scale)
     marker_sizes = 4.0 + 8.0 * scale
+
+    if resolve_renderer(renderer) == "static":
+        return _build_variogram_plot_static(
+            lag_centers, semivariances, counts, params, r2, x_max, x_fit, y_fit,
+            model_label, var_label, total_sill, marker_sizes, c_empirical,
+            c_fit, lang, style=style, dpi=dpi, isave=isave,
+            save_extension=save_extension,
+        )
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -377,6 +405,94 @@ def _build_variogram_plot(
     return fig
 
 
+def _build_variogram_plot_static(
+    lag_centers: np.ndarray,
+    semivariances: np.ndarray,
+    counts: np.ndarray,
+    params: dict,
+    r2: float,
+    x_max: float,
+    x_fit: np.ndarray,
+    y_fit: np.ndarray,
+    model_label: str,
+    var_label: str,
+    total_sill: float,
+    marker_sizes: np.ndarray,
+    c_empirical: str,
+    c_fit: str,
+    lang: str,
+    style: str = "default",
+    dpi: Optional[int] = None,
+    isave: bool = False,
+    save_extension: str = "png",
+):
+    """Draw the variogram with matplotlib (no Plotly/Kaleido needed)."""
+    st = lcz_static
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, aspect=0.66, extra_height_mm=12.0, dpi=dpi)
+        ax = st.add_axes(fig, bottom=0.22, top=st.figure_top(True), left=0.13)
+
+        # Total sill reference — makes the nugget/sill split readable.
+        ax.axhline(
+            total_sill, linestyle=":", linewidth=0.9, color="gray", zorder=2,
+        )
+        ax.annotate(
+            f"total sill = {total_sill:.2f}{var_label}",
+            xy=(x_max, total_sill), xytext=(-2, 3),
+            textcoords="offset points", ha="right", va="bottom",
+            fontsize=max(5.5, spec.font_size - 2), color="#444444",
+            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8),
+        )
+
+        ax.plot(
+            x_fit, y_fit, linestyle="--", linewidth=1.6, color=c_fit,
+            zorder=4, label=f"{model_label} model (R²={r2:.3f})",
+        )
+        ax.scatter(
+            lag_centers, semivariances,
+            s=np.square(marker_sizes) * 0.6,
+            color=c_empirical, alpha=0.85,
+            edgecolors="white", linewidths=0.8,
+            zorder=3, label="Empirical",
+        )
+
+        ax.set_xlim(0.0, x_max)
+        ax.set_xlabel(_msg("variogram_xlabel", lang))
+        ax.set_ylabel(_msg("variogram_ylabel", lang) + var_label)
+        ax.set_axisbelow(True)
+        ax.grid(True, which="major", linewidth=0.4, color="#dddddd")
+        ax.tick_params(
+            labelsize=max(6, spec.font_size - 2), length=3, width=0.6,
+        )
+        # Lower-right stays empty for a variogram (the curve flattens towards
+        # the sill), so the legend never hides the model.
+        ax.legend(
+            loc="lower right",
+            fontsize=max(5.5, spec.font_size - 2),
+            frameon=True, framealpha=0.9, edgecolor="#cccccc",
+        )
+
+        params_line = (
+            f"nugget = {params['nugget']:.2f}{var_label}   ·   "
+            f"partial sill = {params['sill']:.2f}{var_label}   ·   "
+            f"range = {params['range']:.0f} m   ·   R² = {r2:.3f}"
+        )
+        st.add_header(fig, _msg("variogram_title", lang), None, spec)
+        st.add_footer(fig, params_line, None, spec)
+        st.save_static(
+            fig,
+            "lcz_variogram",
+            isave=isave,
+            save_extension=save_extension,
+            style=style,
+            dpi=dpi,
+            lang=lang,
+        )
+
+    return fig
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def lcz_variogram(
@@ -401,6 +517,8 @@ def lcz_variogram(
     isave: bool = False,
     save_extension: str = "html",
     max_workers: Optional[int] = None,
+    dpi: Optional[int] = None,
+    renderer: Optional[str] = "static",
 ) -> VariogramResult:
     """Compute an empirical semivariogram and fit a theoretical model.
 
@@ -443,7 +561,17 @@ def lcz_variogram(
     isave : bool
         Save the variogram figure to ``LCZ4r_output/lcz_variogram.<ext>``.
     save_extension : str
-        ``"html"`` (interactive) or a static format such as ``"png"``/``"pdf"``.
+        Static format: ``"png"``, ``"pdf"``, ``"svg"``, ``"tiff"``/``"tif"``,
+        ``"jpg"``/``"jpeg"`` or ``"webp"``. ``"html"`` is accepted (and
+        coerced to ``"png"``) for the static renderer; for
+        ``renderer="plotly"`` it writes the interactive HTML.
+    dpi : int, optional
+        Export resolution; never below 300 dpi for static output.
+    renderer : {"static", "plotly"}, optional
+        ``"static"`` (default, also ``None``/``"matplotlib"``/``"agg"``)
+        returns a matplotlib ``Figure`` written by the native Agg canvas — no
+        Plotly, Kaleido, Chromium or browser needed. ``"plotly"`` returns the
+        original interactive figure.
 
     Returns
     -------
@@ -456,6 +584,7 @@ def lcz_variogram(
         raise ValueError("n_lags must be a positive integer.")
     if max_dist is not None and (not np.isfinite(max_dist) or max_dist <= 0):
         raise ValueError("max_dist must be a positive distance in metres.")
+    renderer = resolve_renderer(renderer)
 
     df = normalise_input_df(
         data_frame.to_pandas() if isinstance(data_frame, pl.DataFrame) else data_frame,
@@ -469,7 +598,7 @@ def lcz_variogram(
 
     if len(df) == 0:
         logger.warning(_msg("variogram_no_data", lang))
-        return _empty_result()
+        return _empty_result(renderer)
 
     ds = load_lcz_raster(x)
     stations = df.unique(subset=["latitude", "longitude"])
@@ -495,7 +624,7 @@ def lcz_variogram(
             "Only %d station(s) inside LCZ classes 1–17 — a variogram needs at "
             "least 3.", stations.height,
         )
-        return _empty_result()
+        return _empty_result(renderer)
 
     df = df.join(
         stations.select(["latitude", "longitude", "lcz", "x", "y"]),
@@ -531,7 +660,7 @@ def lcz_variogram(
 
     if not groups:
         logger.warning(_msg("variogram_no_pairs", lang))
-        return _empty_result()
+        return _empty_result(renderer)
 
     workers = DEFAULT_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
     if workers > 1 and len(groups) > 1:
@@ -568,7 +697,7 @@ def lcz_variogram(
 
     if not np.any(counts > 0):
         logger.warning(_msg("variogram_no_pairs", lang))
-        return _empty_result()
+        return _empty_result(renderer)
 
     # Fit model
     params, r2 = _fit_variogram_model(lag_c, gamma, counts, model)
@@ -584,9 +713,16 @@ def lcz_variogram(
 
     # Plot
     fig = None
-    if HAS_PLOTLY:
+    if renderer == "static":
         fig = _build_variogram_plot(
             lag_c, gamma, counts, params, r2, lang, style=style, units=units,
+            renderer="static", dpi=dpi, isave=isave,
+            save_extension=save_extension,
+        )
+    elif HAS_PLOTLY:
+        fig = _build_variogram_plot(
+            lag_c, gamma, counts, params, r2, lang, style=style, units=units,
+            renderer="plotly",
         )
         fig = finalize_export(
             fig, style=style, isave=isave, save_extension=save_extension,
@@ -601,7 +737,9 @@ def lcz_variogram(
                 range=f"{params['range']:.0f}")
     )
 
-    return VariogramResult(df=result_df, params=params, r2=r2, plot=fig)
+    return VariogramResult(
+        df=result_df, params=params, r2=r2, plot=fig, renderer=renderer,
+    )
 
 
 __all__ = [

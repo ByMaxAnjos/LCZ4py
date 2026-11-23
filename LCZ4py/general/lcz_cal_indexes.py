@@ -11,6 +11,14 @@ statistics (n_pixels, mean, std, min, max, median) per LCZ class.
 (box/violin/scatter/heatmap of every valid pixel); this function is the
 aggregated summary-table counterpart, following ``lcz_cal_area``'s
 Polars group-by pattern.
+
+Rendering
+---------
+The **default** renderer is native static matplotlib/Agg
+(``renderer="static"``, also ``None``/``"matplotlib"``/``"agg"``): a
+publication-quality mean ± SD bar chart per LCZ class, saved at >=300 dpi
+without Plotly, Kaleido, Chromium or a browser. ``renderer="plotly"`` keeps
+the previous interactive figure.
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, LCZ_COLORBLIND, get
 from LCZ4py._internal._lcz_grid_raster_base import LCZGridResult
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import finalize_export
+from LCZ4py._internal import lcz_static as _st
 
 OUTPUT_DIR = "LCZ4r_output"
 
@@ -45,9 +54,25 @@ def _resolve_workers(n_items: int, max_workers: Optional[int] = None) -> int:
 
 @dataclass
 class LCZIndexesResult:
-    """Return type of lcz_cal_indexes."""
+    """Return type of lcz_cal_indexes.
+
+    ``fig`` is a matplotlib ``Figure`` for the default static renderer and a
+    Plotly ``go.Figure`` for ``renderer="plotly"``.
+    """
     df: pl.DataFrame
-    fig: Optional[go.Figure] = None
+    fig: Optional[object] = None
+    renderer: str = "static"
+
+    def show(self) -> None:
+        """Display the figure in the active frontend (matplotlib or Plotly)."""
+        if self.fig is None:
+            return
+        if type(self.fig).__module__.startswith("matplotlib"):
+            import matplotlib.pyplot as plt
+
+            plt.show()
+        else:
+            self.fig.show()
 
 
 def _select_band(
@@ -160,6 +185,56 @@ def _plot_bar(
     return fig
 
 
+def _plot_bar_static(
+    df: pl.DataFrame,
+    variable_name: str,
+    lang: str,
+    *,
+    units: Optional[str] = None,
+    title: Optional[str] = None,
+    subtitle: Optional[str] = None,
+    caption: Optional[str] = None,
+    style: str = "default",
+    dpi: Optional[int] = None,
+):
+    """Mean per LCZ class with a ±1 SD whisker, drawn with matplotlib/Agg."""
+    with _st.style_context(style):
+        fig, spec, _ = _st.new_figure(style, aspect=0.62, column="single", dpi=dpi)
+        ax = _st.add_axes(
+            fig, bottom=0.20, top=_st.figure_top(bool(title or subtitle)),
+            left=0.15, right=0.97,
+        )
+
+        x = np.arange(df.height, dtype=float)
+        mean = np.nan_to_num(df["mean"].to_numpy().astype(float), nan=0.0)
+        std = np.nan_to_num(
+            df["std"].fill_null(0.0).to_numpy().astype(float), nan=0.0,
+        )
+        ax.bar(
+            x, mean, yerr=std, width=0.74,
+            color=df["color"].to_list(), edgecolor="black", linewidth=0.45,
+            error_kw=dict(elinewidth=0.6, capsize=1.8, ecolor="#333333"),
+            zorder=2,
+        )
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(int(v)) for v in df["lcz"].to_list()])
+        ax.set_xlabel(lcz_msg("lcz_code_label", lang))
+        ax.set_ylabel(_axis_title(variable_name, units))
+        ax.tick_params(axis="both", labelsize=max(6.0, spec.font_size - 2),
+                       length=3, width=0.6)
+        ax.grid(axis="y", color="#e8e8e8", linewidth=0.5)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+
+        _st.add_header(
+            fig, title or lcz_msg("cal_indexes_title", lang, variable=variable_name),
+            subtitle, spec,
+        )
+        _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
 def _valid_mask_per_band(
     values: np.ndarray, max_workers: Optional[int] = None,
 ) -> np.ndarray:
@@ -195,6 +270,8 @@ def lcz_cal_indexes(
     units: Optional[str] = None,
     style: str = "default",
     max_workers: Optional[int] = None,
+    dpi: Optional[int] = None,
+    renderer: Optional[str] = "static",
 ) -> Union[LCZIndexesResult, pl.DataFrame]:
     """Summarize a gridded variable (already aligned to an LCZ map) by class.
 
@@ -218,7 +295,9 @@ def lcz_cal_indexes(
     isave : bool
         Save the figure + CSV to ``LCZ4r_output/``.
     save_extension : str
-        "html" (default, interactive) or a static image extension.
+        "png" (default for the static renderer), "pdf", "svg", "tiff", or
+        "html" for the interactive Plotly renderer ("html" is coerced to
+        "png" for the static renderer).
     lang : str
         Message language. Default "en".
     units : str, optional
@@ -229,13 +308,24 @@ def lcz_cal_indexes(
     max_workers : int, optional
         Bound on the thread pool used to scan the bands for valid pixels.
         Default ``min(8, cpu_count)``.
+    dpi : int, optional
+        Resolution for static exports. Defaults to 300 dpi (or the style
+        preset's own resolution if higher).
+    renderer : {"static", "plotly"}, optional
+        "static" (default, also ``None``/``"matplotlib"``/``"agg"``) returns a
+        matplotlib ``Figure`` saved as native PNG/PDF/SVG/TIFF with no Plotly,
+        Kaleido, Chromium or browser. "plotly" returns the previous
+        interactive figure.
 
     Returns
     -------
     LCZIndexesResult or pl.DataFrame
         ``df`` has one row per LCZ class present: lcz, lcz_name, color,
-        n_pixels, mean, std, min, max, median.
+        n_pixels, mean, std, min, max, median. ``fig`` is a matplotlib
+        ``Figure`` for the default static renderer (Plotly ``go.Figure`` when
+        ``renderer="plotly"``).
     """
+    renderer = _st.resolve_renderer(renderer)
     lcz_path = Path(x)
     if not lcz_path.exists():
         raise FileNotFoundError(f"LCZ map not found: {lcz_path}")
@@ -276,6 +366,19 @@ def lcz_cal_indexes(
             df.write_csv(os.path.join(OUTPUT_DIR, "lcz_cal_indexes.csv"))
         return df
 
+    if renderer == "static":
+        fig = _plot_bar_static(
+            df, variable_name, lang, units=units, style=style, dpi=dpi,
+        )
+        _st.save_static(
+            fig, "lcz_cal_indexes", isave=isave,
+            save_extension=save_extension, style=style, dpi=dpi, lang=lang,
+        )
+        if isave:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            df.write_csv(os.path.join(OUTPUT_DIR, "lcz_cal_indexes.csv"))
+        return LCZIndexesResult(df=df, fig=fig, renderer=renderer)
+
     fig = _plot_bar(df, variable_name, lang, units=units)
 
     if isave:
@@ -294,7 +397,7 @@ def lcz_cal_indexes(
         # Apply the publication template even when not saving.
         finalize_export(fig, style=style, isave=False, lang=lang)
 
-    return LCZIndexesResult(df=df, fig=fig)
+    return LCZIndexesResult(df=df, fig=fig, renderer=renderer)
 
 
 __all__ = ["lcz_cal_indexes", "LCZIndexesResult"]

@@ -188,8 +188,10 @@ def test_cal_area_returns_figure(synthetic_lcz: str) -> None:
 
     assert isinstance(result, LCZAreaResult)
     assert result.df.height == N_CLASSES
-    assert isinstance(result.fig, go.Figure)
-    assert len(result.fig.data) > 0
+    assert result.renderer == "static"
+    import matplotlib.figure
+    assert isinstance(result.fig, matplotlib.figure.Figure)
+    assert len(result.fig.axes) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +255,7 @@ def test_plot_map_from_raster(synthetic_lcz: str) -> None:
 
     result = lcz_plot_map(
         synthetic_lcz,
+        renderer="plotly",
         use_duckdb=False,
         use_geoarrow=False,
         add_scalebar=False,
@@ -260,8 +263,33 @@ def test_plot_map_from_raster(synthetic_lcz: str) -> None:
     )
 
     assert isinstance(result, LCZPlotResult)
+    assert result.renderer == "plotly"
     assert isinstance(result.fig, go.Figure)
     assert len(result.fig.data) > 0
+
+
+def test_plot_map_static_is_default_and_browser_free(
+    synthetic_lcz: str, tmp_path, monkeypatch
+) -> None:
+    import importlib
+
+    import matplotlib.figure
+
+    plot_module = importlib.import_module("LCZ4py.general.lcz_plot_map")
+
+    # Prove the static path never asks Kaleido/Chromium for a screenshot.
+    def _boom(*args, **kwargs):
+        raise AssertionError("static renderer must not call save_plotly_figure")
+
+    monkeypatch.setattr(plot_module, "save_plotly_figure", _boom)
+    monkeypatch.chdir(tmp_path)
+
+    result = plot_module.lcz_plot_map(synthetic_lcz, isave=True, style="nature")
+
+    assert result.renderer == "static"
+    assert isinstance(result.fig, matplotlib.figure.Figure)
+    out = tmp_path / "LCZ4r_output" / "lcz_plot_map.png"
+    assert out.exists() and out.stat().st_size > 1000
 
 
 def test_plot_parameters_from_array() -> None:
@@ -283,3 +311,11 @@ def test_plot_parameters_from_array() -> None:
 
     assert isinstance(fig, go.Figure)
     assert len(fig.data) > 0
+
+
+def test_meta_tree_quadkeys() -> None:
+    from LCZ4py.general.lcz_get_meta_tree import _quadkeys
+
+    # Tile 1202120103 covers lon 13.008-13.359, lat 52.052-52.268 (from tiles.geojson).
+    assert _quadkeys(13.1, 52.1, 13.2, 52.2) == ["1202120103"]
+    assert len(_quadkeys(13.0, 52.0, 13.4, 52.3)) == 9  # 3x3 tiles

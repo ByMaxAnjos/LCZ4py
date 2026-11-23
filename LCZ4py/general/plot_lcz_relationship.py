@@ -19,7 +19,11 @@ Cartography
   un-jittered class codes (jitter is display-only).
 * Markers use the colorblind-safe LCZ palette (``inclusive=True``) and a
   cycling marker shape, so classes stay distinguishable without colour.
-* Static exports default to 300 dpi.
+* The **default** renderer is native static matplotlib/Agg
+  (``renderer="static"``, also ``None``/``"matplotlib"``/``"agg"``), built
+  with the shared ``_internal/lcz_static`` helpers and exported at >=300 dpi
+  without Plotly, Kaleido, Chromium or a browser. ``renderer="plotly"``
+  keeps the previous interactive figures.
 """
 
 from __future__ import annotations
@@ -28,7 +32,10 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from matplotlib.figure import Figure
 
 import numpy as np
 import pandas as pd
@@ -44,6 +51,7 @@ from LCZ4py._internal.lcz_parameters_data import (
 )
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import get_style, save_plotly_figure
+from LCZ4py._internal import lcz_static as _st
 
 logger = logging.getLogger(__name__)
 
@@ -344,8 +352,9 @@ def _distribution_figure(
     if plot_type == "box":
         kwargs["points"] = "outliers"
     else:
+        # ``pointpos`` was removed from px.violin in Plotly 6; the default
+        # jitter is the correct replacement and works on 5.x too.
         kwargs["box"] = True
-        kwargs["pointpos"] = 0.0
     fig = plot_fn(df, **kwargs)
     fig.update_layout(
         xaxis_title=lcz_msg("lcz_code_label", lang),
@@ -439,6 +448,345 @@ def _finalize(
     return fig
 
 
+# ── Native static charts (matplotlib/Agg — no Plotly/Kaleido/browser) ────────
+
+#: matplotlib equivalents of the Plotly marker names in ``_MARKER_SYMBOLS``.
+_MPL_MARKERS = {
+    "circle": "o", "square": "s", "diamond": "D",
+    "triangle-up": "^", "cross": "x",
+}
+
+
+def _style_axes(ax, spec, *, grid_axis: str = "y") -> None:
+    """Consistent panel styling: small ticks, light grid, open frame."""
+    ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2), length=2.5, width=0.6)
+    ax.grid(axis=grid_axis, color="#e8e8e8", linewidth=0.5)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+
+def _class_legend(fig, present: list[int], palette: list[str], names: list[str],
+                  spec, *, lang: str, y: float = 0.02) -> None:
+    """Marker legend below the panel, one entry per LCZ class."""
+    from matplotlib.lines import Line2D
+
+    if not present:
+        return None
+    fontsize = max(5.0, spec.font_size - 2)
+    handles = [
+        Line2D([], [], linestyle="",
+               marker=_MPL_MARKERS[_MARKER_SYMBOLS[i % len(_MARKER_SYMBOLS)]],
+               markersize=4.5, markerfacecolor=palette[int(c) - 1],
+               markeredgecolor="black", markeredgewidth=0.3,
+               label=f"{int(c)} · {names[int(c) - 1]}")
+        for i, c in enumerate(present)
+    ]
+    return fig.legend(
+        handles=handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, y),
+        ncol=min(3, max(2, len(handles))),
+        frameon=False,
+        fontsize=fontsize,
+        handlelength=0.9,
+        columnspacing=1.1,
+        handletextpad=0.35,
+        title=lcz_msg("lcz_class_legend", lang),
+        title_fontsize=fontsize,
+    )
+
+
+def _draw_scatter_static(
+    df: pd.DataFrame,
+    variable_name: str,
+    palette: list[str],
+    names: list[str],
+    variable_units: Optional[str],
+    add_regression: bool,
+    max_points: int,
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Jittered per-pixel scatter of class code vs value, with OLS overlay."""
+    fig, spec, _ = _st.new_figure(
+        style, aspect=0.72, extra_height_mm=36.0, column="single", dpi=dpi,
+    )
+    ax = _st.add_axes(
+        fig, bottom=0.39, top=_st.figure_top(bool(title or subtitle)),
+        left=0.14, right=0.97,
+    )
+
+    n = len(df)
+    if n > max_points:
+        rng = np.random.default_rng(0)
+        idx = np.sort(rng.choice(n, size=max_points, replace=False))
+        df_plot = df.iloc[idx].reset_index(drop=True)
+    else:
+        df_plot = df.reset_index(drop=True)
+
+    rng = np.random.default_rng(0)
+    x_base = df_plot["lcz_id"].to_numpy(dtype=float)
+    jitter = rng.uniform(-0.22, 0.22, size=len(df_plot))
+    present = sorted(int(v) for v in df_plot["lcz_id"].unique())
+
+    for i, lcz_id in enumerate(present):
+        mask = (df_plot["lcz_id"] == lcz_id).to_numpy()
+        if not mask.any():
+            continue
+        marker = _MPL_MARKERS[_MARKER_SYMBOLS[i % len(_MARKER_SYMBOLS)]]
+        marker_kwargs: dict = dict(s=11.0, alpha=0.85, c=palette[lcz_id - 1])
+        if marker == "x":  # unfilled marker: edgecolour would be ignored
+            marker_kwargs["linewidths"] = 0.6
+        else:
+            marker_kwargs["edgecolors"] = "black"
+            marker_kwargs["linewidths"] = 0.25
+        ax.scatter(
+            x_base[mask] + jitter[mask],
+            df_plot.loc[mask, variable_name].to_numpy(dtype=float),
+            marker=marker, **marker_kwargs,
+        )
+
+    if add_regression:
+        fit = _linear_fit(
+            df["lcz_id"].to_numpy(dtype=float),
+            df[variable_name].to_numpy(dtype=float),
+        )
+        if fit is None:
+            logger.info("Not enough spread/points for a regression line.")
+        else:
+            ax.fill_between(
+                fit.xs, fit.lower, fit.upper, color="#464646", alpha=0.18,
+                linewidth=0, label="95% CI",
+            )
+            ax.plot(fit.xs, fit.yhat, color="#1a1a1a", linewidth=1.4, label="OLS fit")
+            ax.annotate(
+                (
+                    f"{fit.equation()}\n"
+                    f"R² = {fit.r2:.3f}\n"
+                    f"{_format_p(fit.p_value)}\n"
+                    f"n = {fit.n:,}"
+                ),
+                xy=(0.02, 0.98), xycoords="axes fraction",
+                ha="left", va="top", fontsize=max(5.0, spec.font_size - 2),
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor="#888888", linewidth=0.5, alpha=0.9),
+            )
+
+    ax.set_xlim(0.4, 17.6)
+    ax.set_xticks(present)
+    ax.set_xticklabels([str(c) for c in present])
+    ax.set_xlabel(lcz_msg("lcz_code_label", lang))
+    ax.set_ylabel(_axis_title(variable_name, variable_units))
+    _style_axes(ax, spec, grid_axis="both")
+
+    _class_legend(fig, present, palette, names, spec, lang=lang, y=0.02)
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_distribution_static(
+    df: pd.DataFrame,
+    variable_name: str,
+    plot_type: str,
+    palette: list[str],
+    names: list[str],
+    variable_units: Optional[str],
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Box (quartiles/whiskers/outliers) or violin distribution per class."""
+    fig, spec, _ = _st.new_figure(style, aspect=0.68, column="single", dpi=dpi)
+    ax = _st.add_axes(
+        fig, bottom=0.19, top=_st.figure_top(bool(title or subtitle)),
+        left=0.15, right=0.97,
+    )
+
+    present = sorted(int(v) for v in df["lcz_id"].unique())
+    datasets = [
+        df.loc[df["lcz_id"] == c, variable_name].dropna().to_numpy(dtype=float)
+        for c in present
+    ]
+    positions = np.arange(len(present), dtype=float)
+    colors = [palette[c - 1] for c in present]
+
+    if plot_type == "box":
+        result = ax.boxplot(
+            datasets, positions=positions, widths=0.66, patch_artist=True,
+            showmeans=True, manage_ticks=False,
+            boxprops=dict(linewidth=0.5, edgecolor="black"),
+            medianprops=dict(color="black", linewidth=0.8),
+            whiskerprops=dict(linewidth=0.5),
+            capprops=dict(linewidth=0.5),
+            meanprops=dict(marker="o", markersize=2.6, markerfacecolor="white",
+                           markeredgecolor="black", markeredgewidth=0.5),
+            flierprops=dict(marker=".", markersize=1.8, markerfacecolor="#333333",
+                            markeredgecolor="none", alpha=0.5),
+        )
+        for patch, color in zip(result["boxes"], colors):
+            patch.set_facecolor(color)
+    else:
+        result = ax.violinplot(
+            datasets, positions=positions, widths=0.80, showmeans=True,
+            showextrema=False,
+        )
+        for body, color in zip(result["bodies"], colors):
+            body.set_facecolor(color)
+            body.set_edgecolor("black")
+            body.set_linewidth(0.5)
+            body.set_alpha(0.85)
+        if "cmeans" in result:
+            result["cmeans"].set(color="black", linewidth=0.8)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels([str(c) for c in present])
+    ax.set_xlabel(lcz_msg("lcz_code_label", lang))
+    ax.set_ylabel(_axis_title(variable_name, variable_units))
+    _style_axes(ax, spec, grid_axis="y")
+
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _draw_heatmap_static(
+    df: pd.DataFrame,
+    variable_name: str,
+    order: list[str],
+    agg_fun: str,
+    variable_units: Optional[str],
+    names: list[str],
+    palette: list[str],
+    *,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Single-row heatmap of the per-class aggregate (Cividis, colourblind-safe).
+
+    Class **codes** label the axis (17 names never fit a 89-120 mm row) and the
+    full names sit in a legend below; values are printed vertically so they
+    cannot overprint in narrow cells.
+    """
+    from matplotlib.patches import Patch
+
+    summary = df.groupby("lcz_name")[variable_name].agg(agg_fun).reindex(order)
+    present = [name for name in order if name in summary.index and pd.notna(summary[name])]
+    values = summary.loc[present].to_numpy(dtype=float)
+    codes = [names.index(name) + 1 for name in present]
+
+    fig, spec, _ = _st.new_figure(
+        style, aspect=0.60, extra_height_mm=26.0, column="single", dpi=dpi,
+    )
+    ax = _st.add_axes(
+        fig, bottom=0.40, top=_st.figure_top(bool(title or subtitle)),
+        left=0.11, right=0.86,
+    )
+
+    image = ax.imshow(
+        values[None, :], cmap=_st.mpl_cmap("cividis"), aspect="auto",
+    )
+    ax.set_xticks(np.arange(len(present)))
+    ax.set_xticklabels([str(c) for c in codes])
+    ax.set_yticks([])
+    ax.set_xlabel(lcz_msg("lcz_code_label", lang))
+    ax.tick_params(axis="x", labelsize=max(5.0, spec.font_size - 2),
+                   length=2.0, width=0.5)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.6)
+
+    # Value labels, rotated 90° so narrow cells stay legible.
+    vmin, vmax = float(np.nanmin(values)), float(np.nanmax(values))
+    span = (vmax - vmin) or 1.0
+    for i, value in enumerate(values):
+        if not np.isfinite(value):
+            continue
+        ax.text(
+            i, 0, f"{value:.2f}", ha="center", va="center", rotation=90,
+            fontsize=max(4.5, spec.font_size - 2),
+            color="white" if (value - vmin) / span > 0.55 else "black",
+        )
+
+    _st.add_colorbar(
+        fig, ax, image, units=_axis_title(variable_name, variable_units),
+        fontsize=max(5.5, spec.font_size - 2),
+    )
+
+    fontsize = max(5.0, spec.font_size - 2)
+    fig.legend(
+        handles=[
+            Patch(facecolor=palette[c - 1], edgecolor="black", linewidth=0.3,
+                  label=f"{c}: {names[c - 1]}")
+            for c in codes
+        ],
+        loc="lower center", bbox_to_anchor=(0.5, 0.02),
+        ncol=min(3, max(2, len(codes))), frameon=False, fontsize=fontsize,
+        handlelength=1.1, columnspacing=1.1, handletextpad=0.4,
+        title=lcz_msg("lcz_class_legend", lang), title_fontsize=fontsize,
+    )
+    _st.add_header(fig, title, subtitle, spec)
+    _st.add_footer(fig, caption, None, spec)
+    return fig
+
+
+def _relationship_static(
+    df: pd.DataFrame,
+    plot_type: str,
+    *,
+    variable_name: str,
+    palette: list[str],
+    names: list[str],
+    order: list[str],
+    agg_fun: str,
+    variable_units: Optional[str],
+    add_regression: bool,
+    max_points: int,
+    title: Optional[str],
+    subtitle: Optional[str],
+    caption: Optional[str],
+    lang: str,
+    style: str,
+    dpi: Optional[int],
+):
+    """Build the requested relationship chart with matplotlib/Agg."""
+    with _st.style_context(style):
+        if plot_type in ("box", "violin"):
+            fig = _draw_distribution_static(
+                df, variable_name, plot_type, palette, names, variable_units,
+                title=title, subtitle=subtitle, caption=caption,
+                lang=lang, style=style, dpi=dpi,
+            )
+        elif plot_type == "scatter":
+            fig = _draw_scatter_static(
+                df, variable_name, palette, names, variable_units,
+                add_regression, max_points,
+                title=title, subtitle=subtitle, caption=caption,
+                lang=lang, style=style, dpi=dpi,
+            )
+        else:
+            fig = _draw_heatmap_static(
+                df, variable_name, order, agg_fun, variable_units,
+                names, palette,
+                title=title, subtitle=subtitle, caption=caption,
+                lang=lang, style=style, dpi=dpi,
+            )
+    return fig
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def plot_lcz_relationship(
@@ -457,7 +805,8 @@ def plot_lcz_relationship(
     resampling: str = "average",
     max_points: int = 20_000,
     dpi: int = 300,
-) -> go.Figure:
+    renderer: Optional[str] = "static",
+) -> Union[go.Figure, "Figure"]:
     """Plot the distribution of a gridded variable across LCZ classes.
 
     Parameters
@@ -483,7 +832,8 @@ def plot_lcz_relationship(
     isave : bool
         Save the figure to ``LCZ4r_output/``. Default False.
     save_extension : str
-        File extension when ``isave``. Default "html".
+        File extension when ``isave``. Default "html" (Plotly renderer);
+        "html" is coerced to "png" for the static renderer.
     style : str
         Publication style preset: 'default', 'nature', 'science', or
         'generic_bw'. Controls font, figure size (mm), DPI, and palette
@@ -507,15 +857,24 @@ def plot_lcz_relationship(
         regression always uses every valid pixel).
     dpi : int
         Resolution used for static exports. Default 300 (publication grade).
+    renderer : {"static", "plotly"}, optional
+        "static" (default, also ``None``/``"matplotlib"``/``"agg"``) returns a
+        matplotlib ``Figure`` saved as native PNG/PDF/SVG/TIFF at >=300 dpi
+        with no Plotly, Kaleido, Chromium or browser. "plotly" returns the
+        previous interactive figure.
 
     Returns
     -------
-    go.Figure
+    matplotlib.figure.Figure or plotly.graph_objects.Figure
+        matplotlib ``Figure`` for the default static renderer, Plotly
+        ``go.Figure`` when ``renderer="plotly"``.
     """
     if plot_type not in ("box", "violin", "scatter", "heatmap"):
         raise ValueError(lcz_msg(
             "plot_lcz_rel_invalid_type", lang, valid="box, violin, scatter, heatmap",
         ))
+    # None / "matplotlib" / "agg" -> the native static renderer (default).
+    renderer = _st.resolve_renderer(renderer)
     if agg_fun not in _AGG_FUNS:
         raise ValueError(
             f"agg_fun must be one of {_AGG_FUNS}, got {agg_fun!r}."
@@ -542,7 +901,26 @@ def plot_lcz_relationship(
     palette = _palette(inclusive)
     color_map = {names[i]: palette[i] for i in range(len(names))}
     order = [n for n in names if n in set(df["lcz_name"])]
+    base_title = lcz_msg("cal_indexes_title", lang, variable=variable_name)
+    filename = f"lcz_relationship_{plot_type}"
 
+    # ── Native static renderer (default): matplotlib/Agg, no browser ────────
+    if renderer == "static":
+        fig = _relationship_static(
+            df, plot_type,
+            variable_name=variable_name, palette=palette, names=names,
+            order=order, agg_fun=agg_fun, variable_units=variable_units,
+            add_regression=add_regression, max_points=max_points,
+            title=base_title, subtitle=None, caption=None,
+            lang=lang, style=style, dpi=dpi,
+        )
+        _st.save_static(
+            fig, filename, isave=isave, save_extension=save_extension,
+            style=style, dpi=dpi, lang=lang,
+        )
+        return fig
+
+    # ── Plotly renderer (opt-in): previous interactive figure ───────────────
     if plot_type in ("box", "violin"):
         fig = _distribution_figure(
             df, variable_name, plot_type, color_map, order, variable_units, lang,
@@ -559,14 +937,14 @@ def plot_lcz_relationship(
 
     fig.update_layout(
         title=dict(
-            text=f"{variable_name} by LCZ class",
+            text=base_title,
             x=0.5, xanchor="center",
         ),
     )
 
     return _finalize(
         fig, style, isave, save_extension,
-        filename=f"lcz_relationship_{plot_type}", dpi=dpi, lang=lang,
+        filename=filename, dpi=dpi, lang=lang,
     )
 
 

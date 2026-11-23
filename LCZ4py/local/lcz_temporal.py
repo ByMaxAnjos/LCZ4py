@@ -9,6 +9,13 @@ Provides:
 
 Both functions optionally facet by a temporal grouping (``by=``), matching the
 ``by=`` semantics of :mod:`lcz_ts` and :mod:`lcz_anomaly`.
+
+Rendering backends
+------------------
+- ``renderer="static"`` *(default)* — native matplotlib/Agg figure (box plot of
+  DTR, or bar chart of degree hours) with LCZ colours and the urban/natural
+  divider. No Plotly, Kaleido, Chromium or browser needed.
+- ``renderer="plotly"`` — the interactive figure.
 """
 
 from __future__ import annotations
@@ -37,6 +44,8 @@ from LCZ4py._internal.lcz_ts_utils import (
 from LCZ4py._internal.lcz_parameters_data import LCZ_COLORS, get_lcz_names
 from LCZ4py._internal.i18n_messages import lcz_msg
 from LCZ4py._internal.lcz_theme import finalize_export
+from LCZ4py._internal import lcz_static
+from LCZ4py._internal.lcz_static import resolve_renderer
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +62,28 @@ class DTRResult:
     df : pl.DataFrame
         Per-station daily DTR with columns
         ``station, lcz, date, dtr, t_max, t_min, n_obs, lcz_name``.
-    plot : go.Figure
-        Box plot of DTR by LCZ class (faceted when ``by=`` is used).
+    plot : matplotlib.figure.Figure or go.Figure
+        Box plot of DTR by LCZ class (faceted when ``by=`` is used). A
+        matplotlib ``Figure`` for the default static renderer, a Plotly
+        ``go.Figure`` for ``renderer="plotly"``.
+    renderer : str
+        Which backend produced ``plot`` — ``"static"`` or ``"plotly"``.
     """
 
     df: pl.DataFrame
-    plot: go.Figure
+    plot: object
+    renderer: str = "static"
+
+    def show(self) -> None:
+        """Display the figure in the active frontend (matplotlib or Plotly)."""
+        if self.plot is None:
+            return
+        if type(self.plot).__module__.startswith("matplotlib"):
+            import matplotlib.pyplot as plt
+
+            plt.show()
+        else:
+            self.plot.show()
 
 
 @dataclass
@@ -73,13 +98,29 @@ class DegreeHoursResult:
     total : pl.DataFrame
         Aggregated per LCZ class with columns
         ``lcz, mean, std, total, n, lcz_name``.
-    plot : go.Figure
+    plot : matplotlib.figure.Figure or go.Figure
         Bar chart of total degree hours per LCZ class (faceted when ``by=``).
+        A matplotlib ``Figure`` for the default static renderer, a Plotly
+        ``go.Figure`` for ``renderer="plotly"``.
+    renderer : str
+        Which backend produced ``plot`` — ``"static"`` or ``"plotly"``.
     """
 
     df: pl.DataFrame
     total: pl.DataFrame
-    plot: go.Figure
+    plot: object
+    renderer: str = "static"
+
+    def show(self) -> None:
+        """Display the figure in the active frontend (matplotlib or Plotly)."""
+        if self.plot is None:
+            return
+        if type(self.plot).__module__.startswith("matplotlib"):
+            import matplotlib.pyplot as plt
+
+            plt.show()
+        else:
+            self.plot.show()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -330,7 +371,200 @@ def _bar_traces(
     ), row=row, col=col)
 
 
-# ── lcz_dtr ───────────────────────────────────────────────────────────────────
+# ── Native static renderer (matplotlib/Agg — no Plotly/Kaleido/Chromium) ─────
+
+def _panel_axes(fig, n: int, *, has_header: bool, gap: float = 0.07,
+                left: float = 0.115, right: float = 0.975):
+    """Stacked full-width axes inside ``fig`` (top panel first).
+
+    The top margin is pulled down a little further than ``figure_top`` so the
+    Urban/Natural group labels drawn above the x axis stay clear of the
+    figure title.
+    """
+    top = lcz_static.figure_top(has_header) - 0.05
+    bottom = lcz_static.figure_bottom(False) - 0.02
+    n = max(int(n), 1)
+    span = max(top - bottom - gap * (n - 1), 0.10)
+    height = span / n
+    axes = []
+    for i in range(n):
+        bottom_i = top - (i + 1) * height - i * gap
+        axes.append(fig.add_axes([left, bottom_i, right - left, height]))
+    return axes
+
+
+def _style_axis(ax, spec, grid_axis: str = "y") -> None:
+    """Shared tick/spine styling for the static temporal charts."""
+    ax.grid(True, axis=grid_axis, lw=0.35, color="0.88", zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="both", labelsize=max(5.5, spec.font_size - 2.5),
+                   length=3, width=0.6)
+
+
+def _static_urban_natural_divider(ax, classes: list, lang: str, spec) -> None:
+    """Dashed divider plus Urban/Natural group labels above the x axis."""
+    urban = [c for c in classes if c in _URBAN_IDS]
+    natural = [c for c in classes if c in _NATURAL_IDS]
+    if not urban or not natural:
+        return
+    k = sum(1 for c in classes if c in _URBAN_IDS)
+    total = len(classes)
+    fontsize = max(5.5, spec.font_size - 2.0)
+    ax.axvline(k + 0.5, color="#cccccc", lw=0.8, ls="--", zorder=1)
+    trans = ax.get_xaxis_transform()
+    ax.text((1 + k) / 2.0, 1.015, _xmsg("urban_label", lang), transform=trans,
+            ha="center", va="bottom", fontsize=fontsize, color="#555555",
+            fontweight="bold")
+    ax.text((k + 1 + total) / 2.0, 1.015, _xmsg("natural_label", lang),
+            transform=trans, ha="center", va="bottom", fontsize=fontsize,
+            color="#555555", fontweight="bold")
+
+
+def _static_dtr_figure(
+    panels: list,
+    *,
+    title: Optional[str],
+    ylab: str,
+    xlab: str,
+    lang: str = "en",
+    inclusive: bool = False,
+    style: str = "default",
+    dpi: Optional[int] = None,
+):
+    """Box plot of DTR by LCZ class (mean ± sd), one axes per ``by=`` facet."""
+    from matplotlib.colors import to_rgba
+
+    from LCZ4py._internal.lcz_parameters_data import LCZ_COLORBLIND
+
+    st = lcz_static
+    panels = list(panels) or [("", pl.DataFrame({"lcz": [], "dtr": []}))]
+    n = len(panels)
+    height_mm = float(min(max(70.0 * n + 26.0, 80.0), 195.0))
+    palette = LCZ_COLORBLIND if inclusive else LCZ_COLORS
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=height_mm, dpi=dpi)
+        label_size = max(6.0, spec.font_size - 1.5)
+        axes = _panel_axes(fig, n, has_header=bool(title))
+
+        for idx, (ax, panel) in enumerate(zip(axes, panels)):
+            label, sub = panel
+            if label:
+                ax.set_title(str(label), fontsize=label_size, loc="left", pad=2.5)
+            if sub.is_empty():
+                continue
+
+            classes = [int(v) for v in sub["lcz"].unique().sort().to_list()]
+            partitions = sub.partition_by("lcz", as_dict=True, maintain_order=True)
+            data, means, stds, positions, facecolors = [], [], [], [], []
+            for pos, lcz_val in enumerate(classes, start=1):
+                if (lcz_val,) in partitions:
+                    part = partitions[(lcz_val,)]
+                else:
+                    part = partitions.get(lcz_val)
+                if part is None or part.is_empty():
+                    continue
+                values = np.asarray(part["dtr"].to_numpy(), dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size == 0:
+                    continue
+                data.append(values)
+                means.append(float(values.mean()))
+                stds.append(float(values.std(ddof=1)) if values.size > 1 else 0.0)
+                positions.append(float(pos))
+                facecolors.append(palette[(lcz_val - 1) % len(palette)])
+
+            if not data:
+                continue
+
+            box = ax.boxplot(
+                data, positions=positions, widths=0.62, patch_artist=True,
+                showfliers=True, whis=1.5,
+                medianprops=dict(color="black", lw=0.9),
+                whiskerprops=dict(color="0.35", lw=0.7),
+                capprops=dict(color="0.35", lw=0.7),
+                flierprops=dict(marker=".", markersize=1.8, markerfacecolor="0.4",
+                                markeredgecolor="0.4", alpha=0.7),
+                boxprops=dict(edgecolor="black", linewidth=0.5),
+            )
+            for patch, color in zip(box["boxes"], facecolors):
+                patch.set_facecolor(to_rgba(color, 0.85))
+
+            ax.errorbar(positions, means, yerr=stds, fmt="D", ms=3.2,
+                        color="white", ecolor="0.25", elinewidth=0.7,
+                        capsize=1.8, markeredgecolor="black",
+                        markeredgewidth=0.5, zorder=6)
+
+            ax.set_xticks(positions)
+            ax.set_xticklabels([f"LCZ {c}" for c in classes],
+                               fontsize=max(5.5, spec.font_size - 2.5))
+            ax.set_xlim(0.4, len(classes) + 0.6)
+            ax.set_ylabel(ylab, fontsize=label_size)
+            if idx == n - 1:
+                ax.set_xlabel(xlab, fontsize=label_size)
+            _style_axis(ax, spec)
+            _static_urban_natural_divider(ax, classes, lang, spec)
+
+        st.add_header(fig, title, None, spec)
+    return fig
+
+
+def _static_degree_hours_figure(
+    panels: list,
+    *,
+    title: Optional[str],
+    ylab: str,
+    xlab: str,
+    lang: str = "en",
+    inclusive: bool = False,
+    style: str = "default",
+    dpi: Optional[int] = None,
+):
+    """Bar chart of total degree hours per LCZ class (± sd), one axes per facet."""
+    st = lcz_static
+    panels = list(panels) or [("", pl.DataFrame({"lcz": [], "total": []}))]
+    n = len(panels)
+    height_mm = float(min(max(68.0 * n + 26.0, 80.0), 195.0))
+    colors = _lcz_color_map(inclusive=inclusive)
+
+    with st.style_context(style):
+        fig, spec, _ = st.new_figure(style, height_mm=height_mm, dpi=dpi)
+        label_size = max(6.0, spec.font_size - 1.5)
+        axes = _panel_axes(fig, n, has_header=bool(title))
+
+        for idx, (ax, panel) in enumerate(zip(axes, panels)):
+            label, totals = panel
+            if label:
+                ax.set_title(str(label), fontsize=label_size, loc="left", pad=2.5)
+            if totals.is_empty():
+                continue
+
+            classes = [int(v) for v in totals["lcz"].to_list()]
+            positions = np.arange(1, len(classes) + 1, dtype=float)
+            values = np.asarray(totals["total"].to_numpy(), dtype=float)
+            errors = np.asarray(totals["std"].fill_null(0.0).to_numpy(), dtype=float)
+            ax.bar(
+                positions, values, width=0.72,
+                color=[colors.get(str(c), "#888888") for c in classes],
+                edgecolor="black", linewidth=0.45, zorder=3,
+            )
+            ax.errorbar(positions, values, yerr=errors, fmt="none",
+                        ecolor="0.25", elinewidth=0.7, capsize=1.8, zorder=4)
+            ax.axhline(0, color="0.45", lw=0.7, zorder=2)
+            ax.set_xticks(positions)
+            ax.set_xticklabels([f"LCZ {c}" for c in classes],
+                               fontsize=max(5.5, spec.font_size - 2.5))
+            ax.set_xlim(0.4, len(classes) + 0.6)
+            ax.set_ylabel(ylab, fontsize=label_size)
+            if idx == n - 1:
+                ax.set_xlabel(xlab, fontsize=label_size)
+            _style_axis(ax, spec)
+            _static_urban_natural_divider(ax, classes, lang, spec)
+
+        st.add_header(fig, title, None, spec)
+    return fig
 
 
 def lcz_dtr(
@@ -351,14 +585,16 @@ def lcz_dtr(
     start=None,
     end=None,
     inclusive: bool = False,
+    renderer: Optional[str] = "static",
+    dpi: Optional[int] = None,
 ) -> DTRResult:
     """Compute Diurnal Temperature Range (DTR) per station and aggregate by
     LCZ class.
 
     DTR is defined as ``max(T) − min(T)`` for each station on each calendar
     day.  The result DataFrame contains one row per station per day, and the
-    Plotly figure shows a box plot of DTR values grouped by LCZ class with
-    urban (1–10) and natural (11–17) distinguished.
+    figure shows a box plot of DTR values grouped by LCZ class with urban
+    (1–10) and natural (11–17) distinguished.
 
     Parameters
     ----------
@@ -391,11 +627,20 @@ def lcz_dtr(
     inclusive : bool
         Use the colorblind-friendly LCZ palette. Added at the end of the
         signature for backward compatibility.
+    renderer : {"static", "plotly"}, optional
+        ``"static"`` (default, also ``None``/``"matplotlib"``/``"agg"``)
+        returns a matplotlib ``Figure`` (Agg canvas — no Plotly, Kaleido,
+        Chromium or browser needed). ``"plotly"`` returns the interactive
+        figure.
+    dpi : int, optional
+        Figure resolution for the static renderer (defaults to the style
+        preset's dpi, 150 for ``"default"``).
 
     Returns
     -------
     DTRResult
-        Dataclass with ``df`` (Polars DataFrame) and ``plot`` (Plotly Figure).
+        Dataclass with ``df`` (Polars DataFrame), ``plot`` (matplotlib or
+        Plotly figure, see ``renderer``) and ``renderer``.
 
     Raises
     ------
@@ -405,6 +650,9 @@ def lcz_dtr(
     """
     if data_frame is None:
         raise ValueError("data_frame is required.")
+
+    renderer = resolve_renderer(renderer)
+    static = renderer == "static"
 
     df = normalise_input_df(data_frame, var=var, station_id=station_id)
     df = select_by_date(
@@ -444,13 +692,32 @@ def lcz_dtr(
             "meaningful DTR.", n_single,
         )
 
-    # ── Plotly box plot ────────────────────────────────────────────────────
+    # ── Figure (static matplotlib by default, Plotly on request) ───────────
     chart_title = _xmsg("dtr_title", lang)
     ylab = _xmsg("dtr_ylabel", lang)
     xlab = _xmsg("dtr_xlabel", lang)
     colors = _lcz_color_map(inclusive=inclusive)
 
-    if by is None:
+    if by is not None:
+        lat_mean = float(df["latitude"].mean())
+        lon_mean = float(df["longitude"].mean())
+        daily = add_by_column(daily, by, lat=lat_mean, lon=lon_mean)
+        groups = by_sorted_groups(daily["_by"], by)
+        if not groups:
+            raise ValueError(f"by={by!r} produced no groups for this dataset.")
+    else:
+        groups = None
+
+    if static:
+        panels = (
+            [("", daily)] if groups is None
+            else [(g, daily.filter(pl.col("_by") == g)) for g in groups]
+        )
+        fig = _static_dtr_figure(
+            panels, title=chart_title, ylab=ylab, xlab=xlab, lang=lang,
+            inclusive=inclusive, style=style, dpi=dpi,
+        )
+    elif groups is None:
         fig = go.Figure()
         classes = _box_traces(fig, daily, "dtr", colors, ylab, lang)
         fig.update_layout(**_base_layout(
@@ -470,12 +737,6 @@ def lcz_dtr(
         ))
         _add_urban_natural_separator(fig, classes, lang)
     else:
-        lat_mean = float(df["latitude"].mean())
-        lon_mean = float(df["longitude"].mean())
-        daily = add_by_column(daily, by, lat=lat_mean, lon=lon_mean)
-        groups = by_sorted_groups(daily["_by"], by)
-        if not groups:
-            raise ValueError(f"by={by!r} produced no groups for this dataset.")
         fig = make_subplots(
             rows=len(groups), cols=1,
             subplot_titles=groups,
@@ -498,9 +759,10 @@ def lcz_dtr(
             showlegend=False,
         ))
 
-    fig = finalize_export(fig, style=style, lang=lang)
+    if not static:
+        fig = finalize_export(fig, style=style, lang=lang)
 
-    return DTRResult(df=daily, plot=fig)
+    return DTRResult(df=daily, plot=fig, renderer=renderer)
 
 
 # ── lcz_degree_hours ──────────────────────────────────────────────────────────
@@ -525,6 +787,8 @@ def lcz_degree_hours(
     start=None,
     end=None,
     inclusive: bool = False,
+    renderer: Optional[str] = "static",
+    dpi: Optional[int] = None,
 ) -> DegreeHoursResult:
     """Compute Cooling Degree Hours (CDH) or Heating Degree Hours (HDH)
     per station and aggregate by LCZ class.
@@ -570,11 +834,20 @@ def lcz_degree_hours(
     inclusive : bool
         Use the colorblind-friendly LCZ palette. Added at the end of the
         signature for backward compatibility.
+    renderer : {"static", "plotly"}, optional
+        ``"static"`` (default, also ``None``/``"matplotlib"``/``"agg"``)
+        returns a matplotlib ``Figure`` (Agg canvas — no Plotly, Kaleido,
+        Chromium or browser needed). ``"plotly"`` returns the interactive
+        figure.
+    dpi : int, optional
+        Figure resolution for the static renderer (defaults to the style
+        preset's dpi, 150 for ``"default"``).
 
     Returns
     -------
     DegreeHoursResult
-        Dataclass with ``df``, ``total``, and ``plot``.
+        Dataclass with ``df``, ``total``, ``plot`` (matplotlib or Plotly
+        figure, see ``renderer``) and ``renderer``.
 
     Raises
     ------
@@ -584,6 +857,9 @@ def lcz_degree_hours(
     """
     if data_frame is None:
         raise ValueError("data_frame is required.")
+
+    renderer = resolve_renderer(renderer)
+    static = renderer == "static"
 
     if degree_type not in ("cooling", "heating"):
         raise ValueError(f"degree_type must be 'cooling' or 'heating', got {degree_type!r}")
@@ -634,15 +910,44 @@ def lcz_degree_hours(
           .sort(["station", "date"])
     )
 
-    # ── Plotly bar chart ───────────────────────────────────────────────────
+    # ── Figure (static matplotlib by default, Plotly on request) ───────────
     title_key = "degree_hours_title_cooling" if degree_type == "cooling" else "degree_hours_title_heating"
     chart_title = _xmsg(title_key, lang)
     ylab = _xmsg("degree_hours_ylabel", lang)
     xlab = _xmsg("degree_hours_xlabel", lang)
     colors = _lcz_color_map(inclusive=inclusive)
 
-    if by is None:
+    if by is not None:
+        lat_mean = float(df["latitude"].mean())
+        lon_mean = float(df["longitude"].mean())
+        daily = add_by_column(daily, by, lat=lat_mean, lon=lon_mean)
+        groups = by_sorted_groups(daily["_by"], by)
+        if not groups:
+            raise ValueError(f"by={by!r} produced no groups for this dataset.")
+        totals = [
+            _class_totals(daily.filter(pl.col("_by") == g)).join(name_frame, on="lcz", how="left")
+                .with_columns(pl.lit(g).alias("_by"))
+            for g in groups
+        ]
+        total = (
+            pl.concat([t for t in totals if not t.is_empty()], how="vertical")
+            if any(not t.is_empty() for t in totals)
+            else _class_totals(daily).join(name_frame, on="lcz", how="left")
+        )
+    else:
+        groups = None
         total = _class_totals(daily).join(name_frame, on="lcz", how="left")
+
+    if static:
+        panels = (
+            [("", total)] if groups is None
+            else [(g, t) for g, t in zip(groups, totals)]
+        )
+        fig = _static_degree_hours_figure(
+            panels, title=chart_title, ylab=ylab, xlab=xlab, lang=lang,
+            inclusive=inclusive, style=style, dpi=dpi,
+        )
+    elif groups is None:
         fig = go.Figure()
         _bar_traces(fig, total, colors, ylab, lang)
         fig.update_layout(**_base_layout(
@@ -661,22 +966,6 @@ def lcz_degree_hours(
         ))
         _add_urban_natural_separator(fig, [int(v) for v in total["lcz"].to_list()], lang)
     else:
-        lat_mean = float(df["latitude"].mean())
-        lon_mean = float(df["longitude"].mean())
-        daily = add_by_column(daily, by, lat=lat_mean, lon=lon_mean)
-        groups = by_sorted_groups(daily["_by"], by)
-        if not groups:
-            raise ValueError(f"by={by!r} produced no groups for this dataset.")
-        totals = [
-            _class_totals(daily.filter(pl.col("_by") == g)).join(name_frame, on="lcz", how="left")
-                .with_columns(pl.lit(g).alias("_by"))
-            for g in groups
-        ]
-        total = (
-            pl.concat([t for t in totals if not t.is_empty()], how="vertical")
-            if any(not t.is_empty() for t in totals)
-            else _class_totals(daily).join(name_frame, on="lcz", how="left")
-        )
         fig = make_subplots(
             rows=len(groups), cols=1,
             subplot_titles=groups,
@@ -697,9 +986,10 @@ def lcz_degree_hours(
             showlegend=False,
         ))
 
-    fig = finalize_export(fig, style=style, lang=lang)
+    if not static:
+        fig = finalize_export(fig, style=style, lang=lang)
 
-    return DegreeHoursResult(df=daily, total=total, plot=fig)
+    return DegreeHoursResult(df=daily, total=total, plot=fig, renderer=renderer)
 
 
 __all__ = ["lcz_dtr", "lcz_degree_hours", "DTRResult", "DegreeHoursResult"]

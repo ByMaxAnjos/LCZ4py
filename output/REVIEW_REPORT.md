@@ -388,3 +388,123 @@ All agents finished and the tree was re-verified end-to-end.
 3. **`~/.lcz4r_cache` has no eviction policy** (pre-existing).
 4. **Python 3.13 only** tested; `requires-python >=3.10` remains unverified on 3.10/3.11.
 5. **Kaleido/Chromium** static export works through the guarded exporter; on machines without Chromium, the package raises a clear i18n error instead of crashing.
+
+---
+
+## 10. Native static rendering is now the default (all figure functions)
+
+### 10.1 Backend
+
+New shared module `LCZ4py/_internal/lcz_static.py` (matplotlib/Agg):
+
+- `new_figure`, `style_context`, `save_static` — journal-sized figures and
+  `>=300 dpi` PNG/PDF/SVG/TIFF output; `"html"` is coerced to `"png"`.
+- `plot_lcz_raster`, `plot_continuous_raster` — class/continuous rasters.
+- `apply_map_axes`, `add_map_furniture_mpl` — metric labels, two-tone scale
+  bar, north arrow (skipped for geographic CRS).
+- `class_legend`, `add_colorbar`, `add_header`, `add_footer`.
+- `resolve_renderer` — `"static"` (default; aliases `None`, `"matplotlib"`,
+  `"agg"`) or opt-in `"plotly"`/`"maplibre"`.
+
+It does **not** import Plotly, Kaleido, Chromium or a browser. Verified by
+blocking `kaleido` in a subprocess and rendering/saving successfully.
+
+### 10.2 Coverage
+
+| Function | Default return | Opt-in |
+|---|---|---|
+| `lcz_plot_map` | matplotlib `Figure` (`LCZPlotResult.fig`) | `renderer="plotly"` / `"maplibre"` |
+| `lcz_plot_parameters` | `Figure` / `list[Figure]` / faceted `Figure` | `renderer="plotly"` |
+| `lcz_cal_area` | matplotlib `Figure` in `LCZAreaResult.fig` | `renderer="plotly"` |
+| `lcz_cal_indices` | `Figure` / `dict[str, Figure]` | `renderer="plotly"` |
+| `lcz_cal_indexes` | matplotlib `Figure` | `renderer="plotly"` |
+| `plot_lcz_relationship` | matplotlib `Figure` | `renderer="plotly"` |
+| `plot_grid_only` | matplotlib `Figure` (300 dpi floor) | static only |
+| `lcz_ts`, `lcz_anomaly`, `lcz_uhi_intensity` | matplotlib `Figure` | `renderer="plotly"` |
+| `lcz_uhi_surface` | `Figure` / `dict[str, Figure]` | `renderer="plotly"` |
+| `lcz_dtr`, `lcz_degree_hours` | matplotlib `Figure` | `renderer="plotly"` |
+| `lcz_utci`, `lcz_anthropogenic_heat` | matplotlib `Figure` | `renderer="plotly"` |
+| `lcz_plot_interp` | matplotlib `Figure` (single/facet) | `renderer="plotly"` |
+| `lcz_variogram` | matplotlib `Figure` | `renderer="plotly"` |
+
+Result dataclasses (`LCZPlotResult`, `LCZAreaResult`,
+`LCZIndicesStatsResult`, `LCZIndexesResult`, `LCZUHISurfaceResult`,
+`UTCIResult`, `AnthropogenicHeatResult`, `VariogramResult`, `DTRResult`,
+`DegreeHoursResult`) expose `renderer="static"` and a `.show()` that
+dispatches matplotlib vs Plotly.
+
+### 10.3 Bugs fixed during the rollout
+
+- `lcz_static.add_map_furniture_mpl`: boolean kwargs shadowed the
+  same-named functions → `TypeError`; refactored to `_draw_scalebar` /
+  `_draw_north_arrow`.
+- `plot_lcz_relationship(plot_type="violin", renderer="plotly")` passed
+  `pointpos` to `px.violin`, removed in Plotly 6 → removed.
+- `lcz_plot_parameters(chart_type=...)` now forwards `renderer`/`dpi` to
+  `lcz_cal_indices` instead of silently forcing its default.
+
+### 10.4 Verification
+
+| Gate | Result |
+|---|---|
+| `python -m pytest tests/ -m "not network" -q` | **PASS — 152 passed, 9 deselected** |
+| `python -m compileall -q LCZ4py` | **PASS** |
+| Core-only import with 22 optional deps blocked | **PASS** |
+| Static render/save with `kaleido` blocked | **PASS** — `lcz_plot_map`, `lcz_cal_area`, `lcz_plot_parameters` wrote PNGs |
+| `renderer="plotly"` smoke for every covered function | **PASS** (agents' 30/30, 66/67, 69/69, 21/21 harnesses) |
+
+### 10.5 Behaviour change (intentional)
+
+The default return type of every figure-producing function is now a
+matplotlib `Figure` (or a result object whose `.fig` is one), not a Plotly
+`Figure`. Pass `renderer="plotly"` to keep the previous interactive output.
+`save_extension` still defaults to `"html"` on Plotly paths; the static path
+writes `"png"` and coerces `"html"` to `"png"`.
+
+---
+
+## 11. Notebooks updated for the matplotlib default
+
+All **37 notebooks** were updated (30 tutorial notebooks under `notebooks/`,
+`notebooks/tutorial_lcz_grid_integration.ipynb`, and the 6 root reference
+notebooks).
+
+### 11.1 Conventions
+
+- Plotting calls keep the default `renderer` (static matplotlib).
+- `.fig.show()` / `.plot.show()` were replaced with `display(...)` (or the
+  Figure as the last expression); list/dict returns are displayed in a loop.
+- Every notebook gained a one-line "plotting defaults" note and an
+  `from IPython.display import display` import.
+- Cells that explicitly teach interactivity keep `renderer="plotly"` or
+  `renderer="maplibre"` and `.show()`.
+- Markdown claims of "interactive/Plotly by default" were rewritten.
+- Outputs and `execution_count` were cleared only on cells whose source
+  changed, so stale Plotly outputs do not contradict the new code.
+
+### 11.2 Run-blocking fixes applied while updating
+
+- Bare `pip install LCZ4py` → `%pip install LCZ4py` (invalid Python cell).
+- `06_urban_canopy_parameters`: `iselect=["BSF","BH","SVF"]` did not match the
+  UCP stack; now `iselect=result_stack["variable_list"][:3]`.
+- `07_gridded_climate_environment`: `color_by="value"` → `color_by="precip_mm"`.
+- `06_temporal_climate_metrics`: `lcz_lcz_map_path` → `lcz_map_path`.
+- `03_morphological_parameters`: undefined `result_stack` → `stack_result`.
+- Root notebooks: legacy flat imports (`from lcz_get_map import ...`) migrated
+  to `from LCZ4py import ...`; private interp helpers use
+  `LCZ4py.local.lcz_interp_map_plus`.
+- `lcz_get_lst_tutorial`: Plotly-only `fig.data[0].colorbar.title.text`
+  replaced with `lst.units` + `display(fig)`.
+- `tutorial_lcz_grid_integration`: removed forced `matplotlib.use("Agg")` and
+  replaced `write_html` with a 300 dpi `savefig`.
+
+### 11.3 Verification
+
+| Gate | Result |
+|---|---|
+| `pytest tests/test_notebooks_integrity.py` | **PASS — 75 tests** (37 × validity + 37 × AST + discovery) |
+| Root-notebook import cells executed | **PASS — 6/6** |
+| Residual default-static `.fig.show()`/`.plot.show()` | **0** |
+| Residual bare `pip install` cells | **0** |
+| Residual "interactive by default" markdown | **0** |
+| Full suite `pytest tests/ -m "not network"` | **PASS — 227 passed** |
